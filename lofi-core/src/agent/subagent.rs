@@ -2344,7 +2344,14 @@ async fn run_turn_with_timeout(
             .filter(|&budget| spent > budget)
             .map(|budget| (spent, budget))
     };
-    let (status, error) = classify_outcome(outcome, budget_over, &cancel, timeout);
+    // Read before the close below rewrites the history: a resume replays the
+    // whole history this entry keeps, so the terminal text must only promise
+    // one when the history holds a reply or a tool exchange to continue from.
+    // Earlier runs on a resumed entry count: their work is kept too.
+    let kept = messages
+        .iter()
+        .any(|message| matches!(message.role, Role::Assistant | Role::Tool));
+    let (status, error) = classify_outcome(outcome, budget_over, &cancel, timeout, &id, kept);
     if status == Status::TimedOut {
         // A timeout keeps what the run reached, so a resume continues
         // instead of paying for the work again. The abort may leave a tool
@@ -2416,13 +2423,19 @@ fn classify_outcome(
     budget_over: Option<(u64, u64)>,
     cancel: &Arc<AtomicBool>,
     timeout: Duration,
+    id: &str,
+    kept: bool,
 ) -> (Status, Option<String>) {
     match outcome {
         Ok(Ok(outcome)) => {
             if let Some((spent, budget)) = budget_over {
                 (
                     Status::Failed,
-                    Some(format!("token budget exceeded ({spent} > {budget})")),
+                    Some(resume_hint(
+                        &format!("token budget exceeded ({spent} > {budget})"),
+                        id,
+                        kept,
+                    )),
                 )
             } else {
                 match outcome {
@@ -2452,9 +2465,26 @@ fn classify_outcome(
             // the work already done instead of rerunning the task.
             (
                 Status::TimedOut,
-                Some(format!("timed out after {} ms", timeout.as_millis())),
+                Some(resume_hint(
+                    &format!("timed out after {} ms", timeout.as_millis()),
+                    id,
+                    kept,
+                )),
             )
         }
+    }
+}
+
+/// Append the resume path to a terminal error. The parent reads the first
+/// line of the error inside `NOTICE_DETAIL_CAP` bytes, so the hint shares
+/// that line with the reason instead of following it. A resume of a run that
+/// kept nothing replays only its task prompt, which the parent would write
+/// again anyway, so say that instead of promising work.
+fn resume_hint(reason: &str, id: &str, kept: bool) -> String {
+    if kept {
+        format!("{reason}; resume with id {id} to continue from the work so far")
+    } else {
+        format!("{reason}; the run kept no work, so a resume would start over")
     }
 }
 

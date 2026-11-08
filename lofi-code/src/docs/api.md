@@ -451,10 +451,17 @@ log reads, mechanical edits).
   over the parent's level, so `off` runs the child with no thinking.
 - `system` (string, optional) — system prompt override.
 - `timeout_ms` (number, optional) — wall-clock limit for the whole run.
+  A run that expires keeps the history it reached, and its error names the
+  `id` that resumes it when that history holds a reply or a tool exchange.
+  For work that may outlive one call, start it with `lofi.subagentSpawn`
+  and take the result with `lofi.subagentWait`, whose wait timeout never
+  cancels the run.
 - `output_limit` (number, optional) — cap on the returned result bytes.
 - `token_budget` (number, optional) — total token budget, counting every
   token category the provider reports (input, output, cache). The run is
-  cancelled and fails once its spend crosses the budget.
+  cancelled and fails once its spend crosses the budget; like a timeout, it
+  keeps the history it reached, and its error names the resuming `id` or
+  says that nothing was kept.
 
 **Returns:** `{ ok, id, status, result?, error?, session_id?, truncated?, full_bytes?, usage? }`.
 `status` is one of `completed`, `failed`, `cancelled`, `timed_out` —
@@ -474,8 +481,10 @@ error are capped at 32768 bytes regardless of `output_limit`, so a status
 or wait after the fact may report a shorter, marked-truncated text than
 the original return. `usage` reports the run's token totals and cost when
 the provider reported them. A timed-out run keeps the history it reached,
-so a resume continues that work instead of rerunning it. A tool call the
-run left without a result is closed with an interrupted result, so no
+so a resume continues that work instead of rerunning it, and its `error`
+says so with the `id` to pass back; a run that kept nothing says that
+instead, so the hint never promises work that does not exist. A tool call
+the run left without a result is closed with an interrupted result, so no
 request carries half a call. Argument problems — a missing `prompt`, an empty
 or unknown `id`, a bad override, a value with the wrong type — resolve
 with `ok: false` and `status: "failed"` instead of throwing.

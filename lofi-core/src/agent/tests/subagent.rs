@@ -335,6 +335,15 @@ async fn timeout_keeps_the_partial_history() {
     .await;
     assert_eq!(out["status"], json!("timed_out"), "{out}");
     let id = out["id"].as_str().unwrap().to_string();
+    // The parent reads the error, not the docs: it must name the resume path
+    // so the work already paid for is continued instead of rerun.
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("resume with id {id}")),
+        "{out}"
+    );
 
     let out = hook(
         SubagentOp::Run,
@@ -505,6 +514,111 @@ async fn timeout_inside_a_tool_call_stays_resumable() {
         texts,
         vec!["a".to_string(), "b".to_string(), "c".to_string()],
         "{texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn timeout_before_any_work_promises_no_resume() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(NeverProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    // The provider never answers, so the history holds only the task prompt
+    // the run was handed: a resume would replay that prompt and nothing else.
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a", "timeout_ms": 100 })).await;
+    assert_eq!(out["status"], json!("timed_out"), "{out}");
+    assert_eq!(
+        out["error"],
+        json!("timed out after 100 ms; the run kept no work, so a resume would start over"),
+        "{out}"
+    );
+}
+
+// Answers the first prompt with plain text and hangs on every request after
+// it, so a resumed run can be stopped before it writes anything of its own.
+struct FirstTextThenStallProvider;
+
+#[async_trait]
+impl Provider for FirstTextThenStallProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        match messages.last() {
+            Some(message) if message.role == Role::User && first_text(message) == "a" => Ok(
+                Box::pin(stream::iter(text_round("first").into_iter().map(Ok))),
+            ),
+            _ => std::future::pending().await,
+        }
+    }
+}
+
+#[tokio::test]
+async fn resume_without_progress_still_names_the_resume() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(FirstTextThenStallProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a" })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    // This leg appends only its prompt before the deadline fires, but the
+    // history it would replay still holds the first run's answer, so the
+    // entry kept work and the hint must name it.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "id": id, "prompt": "b", "timeout_ms": 100 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("timed_out"), "{out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("resume with id {id}")),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn timeout_notice_names_the_resume_path() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(TimeoutResumeProvider {
+        requests: std::sync::Mutex::new(Vec::new()),
+        tool_round: exec_round("return 1"),
+        text_round: text_round("resumed"),
+    });
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = provider;
+    let hook = agent.subagent_hook().unwrap();
+    let mut notices = agent.subagents().subscribe_notices();
+
+    let out = hook(
+        SubagentOp::Spawn,
+        json!({ "prompt": "a", "timeout_ms": 2000 }),
+    )
+    .await;
+    let id = out["id"].as_str().unwrap().to_string();
+    let done = hook(SubagentOp::Wait, json!({ "id": id, "timeout_ms": 30_000 })).await;
+    assert_eq!(done["status"], json!("timed_out"), "{done}");
+
+    // The parent reads this notice as its prompt, so the hint must survive
+    // both the first-line rule and the 200-byte detail cap.
+    let notice = notices.try_recv().unwrap();
+    assert!(
+        notice.text.contains(&format!("resume with id {id}")),
+        "{notice:?}"
     );
 }
 
@@ -1130,9 +1244,13 @@ async fn token_budget_exceeded_fails_the_run() {
 
     let done = hook(SubagentOp::Wait, json!({ "id": id, "timeout_ms": 30_000 })).await;
     assert_eq!(done["status"], json!("failed"), "{done}");
+    // The budget stop keeps the history too, so its error names the resume
+    // path for the same reason a timeout does.
     assert_eq!(
         done["error"],
-        json!("token budget exceeded (150 > 10)"),
+        json!(format!(
+            "token budget exceeded (150 > 10); resume with id {id} to continue from the work so far"
+        )),
         "{done}"
     );
 }
