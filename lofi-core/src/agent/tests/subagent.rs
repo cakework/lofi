@@ -404,6 +404,137 @@ async fn timeout_keeps_the_partial_history() {
     );
 }
 
+// A panic in the provider stream unwinds the run's task, so SettleOnDrop —
+// not the normal settle — records the run. The history the guard keeps has
+// to reach the next resume: the run already paid for that tool call.
+struct PanicAfterToolProvider {
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    tool_round: Vec<StreamingEvent>,
+    text_round: Vec<StreamingEvent>,
+}
+
+#[async_trait]
+impl Provider for PanicAfterToolProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        let last = messages.last();
+        let round = match last {
+            // The tool result is in: die before the round that answers it.
+            Some(m) if m.role == Role::Tool => panic!("provider stream failed"),
+            Some(m) if m.role == Role::User && first_text(m) == "a" => self.tool_round.clone(),
+            _ => self.text_round.clone(),
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+fn panic_after_tool_provider() -> Arc<PanicAfterToolProvider> {
+    Arc::new(PanicAfterToolProvider {
+        requests: std::sync::Mutex::new(Vec::new()),
+        tool_round: exec_round("return 1"),
+        text_round: text_round("resumed"),
+    })
+}
+
+/// A resumed request continues the aborted run: the prompt that run was
+/// given, the tool call it made, and the result of that call.
+fn assert_resumed_tool_exchange(request: &[Message]) {
+    let roles: Vec<_> = request.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            Role::System,
+            Role::User,
+            Role::Assistant,
+            Role::Tool,
+            Role::User
+        ],
+        "{roles:?}"
+    );
+    assert_tool_calls_are_answered(request);
+    let calls = request
+        .iter()
+        .flat_map(|m| m.blocks.iter())
+        .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        .count();
+    assert_eq!(
+        calls, 1,
+        "the aborted run's one tool call survives: {request:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_panicked_run_keeps_the_history_it_reached() {
+    let _env = env_lock();
+    let (_state, state_path) = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let provider = panic_after_tool_provider();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = provider.clone();
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a" })).await;
+    assert_eq!(out["status"], json!("failed"), "{out}");
+    assert_eq!(
+        out["error"],
+        json!("subagent task ended unexpectedly"),
+        "{out}"
+    );
+    let id = out["id"].as_str().unwrap().to_string();
+
+    let out = hook(SubagentOp::Run, json!({ "id": id, "prompt": "b" })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["result"], json!("resumed"), "{out}");
+    assert_resumed_tool_exchange(provider.requests.lock().unwrap().last().unwrap());
+
+    // The aborted run stays on the lineage up to its own settle marker, so a
+    // replay after a restart resumes from the same point.
+    let files = find_jsonl(&state_path);
+    assert_eq!(files.len(), 1, "{files:?}");
+    let (_cursor, snapshot) =
+        crate::session::store::SessionCursor::open_snapshot(files[0].clone()).unwrap();
+    let kinds: Vec<_> = snapshot.index.iter().map(|e| e.kind).collect();
+    let first_settle = kinds
+        .iter()
+        .position(|kind| *kind == IndexKind::RunSettled)
+        .expect("the aborted run leaves a settle marker");
+    assert!(
+        kinds[..first_settle].contains(&IndexKind::ToolResult),
+        "the aborted run's tool exchange is off its lineage: {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_panicked_run_keeps_the_history_without_a_transcript() {
+    let _env = env_lock();
+    let (_state, state_path) = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let provider = panic_after_tool_provider();
+    let mut agent = agent_with(vec![], dir.path())
+        .with_subagent_support(support(dir.path()).with_persistence(false));
+    agent.provider = provider.clone();
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a" })).await;
+    assert_eq!(out["status"], json!("failed"), "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    // No transcript holds the run, so the resume reads the entry's copy.
+    let out = hook(SubagentOp::Run, json!({ "id": id, "prompt": "b" })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_resumed_tool_exchange(provider.requests.lock().unwrap().last().unwrap());
+    assert!(
+        find_jsonl(&state_path).is_empty(),
+        "transcript written under {}",
+        state_path.display()
+    );
+}
+
 /// Every tool call in a request must be answered before the next message of
 /// another role: a provider rejects an orphaned call.
 fn assert_tool_calls_are_answered(request: &[Message]) {

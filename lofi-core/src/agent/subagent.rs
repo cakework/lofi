@@ -988,13 +988,16 @@ impl Drop for CancelOnDrop {
 
 /// Finalizes an entry when its task ends unwatched: a panic, or an abort
 /// from `subagentKill`'s backstop or `clear()`. Normal completion disarms
-/// it; on the kill path the guard is what settles the entry and reports
-/// its spend. All work is synchronous: Drop cannot await.
+/// it; on the kill path the guard is what settles the entry, keeps the
+/// history the run reached, and reports its spend. All work is
+/// synchronous: Drop cannot await.
 struct SettleOnDrop {
     registry: SubagentRegistry,
     id: String,
     cursor: Option<SessionCursor>,
-    pre_run_leaf: Option<String>,
+    // The run's history. The turn borrows this vector, so an abort that
+    // drops the turn future leaves it here instead of destroying it.
+    messages: Vec<Message>,
     cancel: Arc<AtomicBool>,
     // Spend collected by the event drain. An aborted run never reaches the
     // report at the end of `run_turn_with_timeout`, so the guard folds in
@@ -1032,16 +1035,9 @@ impl Drop for SettleOnDrop {
         } else {
             Status::Failed
         };
-        // Rollback and spend reporting happen while the entry is still
-        // running — a resume is rejected in that state, so no new run can
-        // claim the transcript head this rollback is about to rewind. Both
-        // do blocking store I/O, so they stay outside the entries lock.
-        if let Some(cursor) = self.cursor.as_ref() {
-            if let Err(e) = cursor.restore_branch(self.pre_run_leaf.clone()) {
-                tracing::debug!(error = %e, "subagent transcript rollback failed");
-            }
-        }
-        record_settled(
+        // The marker and the spend report do blocking store I/O, so they
+        // stay outside the entries lock.
+        let persisted = record_settled(
             self.cursor.as_ref(),
             status,
             None,
@@ -1067,7 +1063,12 @@ impl Drop for SettleOnDrop {
         // from Drop — so the figure can be short by one round.
         let usage = lock(&self.totals).json();
         let mut entries = lock(&self.registry.entries);
-        // clear() may have removed the entry during the unlocked section.
+        // clear() may have run during the unlocked section, and the next
+        // session's rehydrate reinserts this id from the parent's transcripts.
+        // That entry belongs to the new session, so the generation decides.
+        if self.registry.generation() != self.generation {
+            return;
+        }
         let Some(entry) = entries.get_mut(&self.id) else {
             return;
         };
@@ -1094,11 +1095,15 @@ impl Drop for SettleOnDrop {
             .backend
             .with_tool_executor(entry.backend.tool_executor().reset_exec_worker());
         entry.outcome = Some(outcome);
-        if entry.cursor.is_some() {
-            // The claim moved the history into the run, which died with it;
-            // the rolled-back transcript still holds it.
+        if persisted {
+            // The transcript holds what the run reached, and the resume
+            // replays it; the replay closes the call the abort left open.
             entry.messages = Vec::new();
             entry.history_loaded = false;
+        } else {
+            close_unanswered_tool_uses(&mut self.messages);
+            entry.messages = std::mem::take(&mut self.messages);
+            entry.history_loaded = true;
         }
         entry
             .events
@@ -1833,10 +1838,6 @@ async fn start(
     // History length before this run: the result text considers only what
     // this run appended.
     let base_len = messages.len();
-    // Transcript head before this run: an unwatched end moves it back so the
-    // transcript and the in-memory history stay in sync. A timeout keeps the
-    // head where the run reached.
-    let pre_run_leaf = cursor.as_ref().and_then(SessionCursor::leaf_id);
     // Capture the generation at admission, not in the task: a clear()
     // between the two would let the task publish into the new session.
     let generation = registry.generation();
@@ -1862,7 +1863,6 @@ async fn start(
                 registry,
                 id,
                 base_len,
-                pre_run_leaf,
                 timeout,
                 prompt,
                 output_limit,
@@ -1896,7 +1896,6 @@ async fn run_task(
     registry: SubagentRegistry,
     id: String,
     base_len: usize,
-    pre_run_leaf: Option<String>,
     timeout: Duration,
     prompt: String,
     output_limit: usize,
@@ -1912,11 +1911,11 @@ async fn run_task(
         entry.totals = Some(totals.clone());
         entry.model = Some(model.clone());
     }
-    let guard = SettleOnDrop {
+    let mut guard = SettleOnDrop {
         registry: registry.clone(),
         id: id.clone(),
         cursor: cursor.clone(),
-        pre_run_leaf: pre_run_leaf.clone(),
+        messages,
         cancel: cancel.clone(),
         totals: totals.clone(),
         generation,
@@ -1925,7 +1924,7 @@ async fn run_task(
     };
     let outcome = run_turn_with_timeout(
         backend,
-        messages,
+        &mut guard.messages,
         cursor.clone(),
         cancel,
         registry.clone(),
@@ -1972,26 +1971,35 @@ async fn run_task(
         // either a live recipient or a rejected one, a child blocked in
         // receive wakes with the closed result, and a resume claimed the
         // moment the terminal status is visible finds the inbox already shut.
-        registry.mailbox.close(&id, status.as_str());
+        // A clear() during the marker write removed this entry and let the
+        // next session's rehydrate reinsert the id: that entry is not ours.
+        let same_session = registry.generation() == generation;
+        if same_session {
+            registry.mailbox.close(&id, status.as_str());
+        }
         match entries.get_mut(&id) {
-            Some(entry) => {
+            Some(entry) if same_session => {
                 entry.status = status;
                 entry.outcome = Some(out);
                 entry
                     .events
                     .push("state", json!({ "status": status.as_str() }));
                 entry.state_tx.send_replace(status);
-                if persisted && entry.cursor.is_some() {
+                if persisted {
                     // The transcript holds the full history; an idle entry
                     // retains only the outcome. The next resume replays
                     // from the transcript.
                     entry.messages = Vec::new();
                     entry.history_loaded = false;
+                } else {
+                    entry.messages = std::mem::take(&mut guard.messages);
+                    entry.history_loaded = true;
                 }
                 entry.notify_terminal
             }
-            // clear() removed the entry: nothing to record, nothing to say.
-            None => false,
+            // clear() removed the entry, or the next session reinserted the
+            // id: nothing to record, nothing to say.
+            _ => false,
         }
     };
     if notify && registry.generation() == generation {
@@ -2068,8 +2076,8 @@ struct RunOutcome {
 
 /// Append the run's terminal record as the leaf of the transcript so a
 /// rehydrate after a restart restores this exact status and outcome instead
-/// of inferring them from the transcript tail. Runs after any rollback, so
-/// the marker is the physical last line of the file: the rehydration tail
+/// of inferring them from the transcript tail. Appended last, so the marker
+/// is the physical last line of the file: the rehydration tail
 /// scan relies on that. The serialized line is bounded by
 /// [`SETTLED_MARKER_LIMIT`] so the tail window always contains it whole.
 /// Returns whether the marker was persisted; an idle entry keeps its history
@@ -2282,13 +2290,14 @@ fn cap_event_text(text: &str) -> String {
     cap_at_boundary(text, EVENT_TEXT_CAP)
 }
 
-/// Run one turn to completion and finalize the registry entry: status,
-/// stored history, the open tool call a timeout closes, and the sandbox
-/// thread of an idle entry.
+/// Run one turn to completion and finalize the registry entry: the open
+/// tool call a timeout closes, the restamp, and the sandbox thread of an
+/// idle entry. The caller owns `messages`, so the history outlives an
+/// abort of this future.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_with_timeout(
     backend: BackendRef,
-    mut messages: Vec<Message>,
+    messages: &mut Vec<Message>,
     cursor: Option<SessionCursor>,
     cancel: Arc<AtomicBool>,
     registry: SubagentRegistry,
@@ -2318,7 +2327,7 @@ async fn run_turn_with_timeout(
         id.clone(),
     );
     let turn = backend.run_turn(
-        &mut messages,
+        messages,
         // The task is parent-written, so it must not read as user
         // authorization in the child's auto-mode context.
         TurnRequest::prompt(prompt, PromptKind::Task),
@@ -2358,7 +2367,7 @@ async fn run_turn_with_timeout(
         // call open, which providers reject, so close it with the interrupted
         // result. The transcript keeps the open call, and a replay repairs it
         // the same way.
-        close_unanswered_tool_uses(&mut messages);
+        close_unanswered_tool_uses(messages);
     }
     let (result, full_bytes) = if status == Status::Completed {
         last_text(&messages[base_len..], output_limit)
@@ -2384,7 +2393,6 @@ async fn run_turn_with_timeout(
         // Restamp at settle: the stamp orders eviction, and a long run that
         // finishes last must not become the oldest victim.
         entry.used = registry.stamp();
-        entry.messages = messages;
         // Idle entries must not hold a sandbox thread: it restarts
         // lazily on the first exec of the next resume.
         entry.backend = entry
@@ -3129,9 +3137,9 @@ fn prepare_resume(
         registry.mailbox.open(&id);
         let transcript_backed = entry.cursor.is_some() || entry.transcript_path.is_some();
         // The run owns the history while it runs: a transcript-backed entry
-        // gets it back at settle or reloads it from the transcript after an
-        // abort, so nothing retains two copies. An entry without a
-        // transcript keeps its only copy in the registry.
+        // gets it back at settle, normal or guard, or reloads it from the
+        // transcript when the settle marker persisted, so nothing retains two
+        // copies. An entry without a transcript keeps its only copy here.
         let history = match (entry.history_loaded, transcript_backed) {
             (true, true) => std::mem::take(&mut entry.messages),
             (true, false) => entry.messages.clone(),

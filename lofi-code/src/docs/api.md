@@ -600,7 +600,8 @@ evicted; afterwards use the transcript (`session_id`) instead.
 ## lofi.subagentKill({ id, reason? })
 
 Cancel a running subagent and the jobs it spawned. Idempotent: killing a
-terminal run returns its current status.
+terminal run returns its current status. A killed run keeps the history it
+reached, so a later resume continues from it instead of starting over.
 
 **Parameters:**
 - `id` (string, required) — the run id.
