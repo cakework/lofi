@@ -560,7 +560,6 @@ mod tests {
             redirects: lofi_types::RedirectPolicy::default(),
             heredocs: lofi_types::HeredocPolicy::default(),
             yolo: true,
-            allow_by_default: true,
         };
         BuiltinTools::with_tool_cb(root, None, tmp_dir, BashEnv::default(), policy, None)
     }

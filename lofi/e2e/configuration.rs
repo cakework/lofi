@@ -15,9 +15,7 @@ fn automatic_policy_approval_uses_the_configured_model_and_skips_the_modal() {
     let fixture = Fixture::new(&server);
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "confirm"
-
-[auto_mode]
+        r#"[auto_mode]
 enable = true
 model = "mock/alt"
 max_tokens = 128
@@ -42,6 +40,53 @@ max_tokens = 128
 }
 
 #[test]
+fn an_explicit_ask_rule_keeps_automatic_approval_out() {
+    let server = MockServer::start(vec![
+        tool_response(
+            "explicit-ask-call",
+            r#"return await lofi.bash({ cmd: "printf explicit-rule-file > explicit-rule.txt" });"#,
+        ),
+        text_response("explicit rule final answer"),
+    ]);
+    let fixture = Fixture::new(&server);
+    std::fs::write(
+        fixture.config.parent().unwrap().join("policy.toml"),
+        r#"[[ask]]
+match = "printf explicit-rule-file"
+mode = "prefix"
+
+[auto_mode]
+enable = true
+model = "mock/alt"
+max_tokens = 128
+"#,
+    )
+    .unwrap();
+    let mut tui = fixture.spawn(&[]);
+
+    tui.submit("use the explicit rule");
+    tui.wait_for("Permission Required", WAIT);
+    assert!(
+        !fixture.workspace.join("explicit-rule.txt").exists(),
+        "the evaluator must not run the command"
+    );
+    tui.send(b"a");
+    tui.wait_for("explicit rule final answer", WAIT);
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("explicit-rule.txt")).unwrap(),
+        "explicit-rule-file"
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "the evaluator must never be asked");
+    assert!(
+        !requests[1].body.contains("risk evaluator"),
+        "{}",
+        requests[1].body
+    );
+}
+
+#[test]
 fn automatic_policy_approval_accepts_a_provider_and_model_pair() {
     let server = MockServer::start(vec![
         tool_response(
@@ -54,9 +99,7 @@ fn automatic_policy_approval_accepts_a_provider_and_model_pair() {
     let fixture = Fixture::new(&server);
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "confirm"
-
-[auto_mode]
+        r#"[auto_mode]
 enable = true
 provider = "mock"
 model = "alt"
@@ -102,7 +145,7 @@ fn bash_env_file_values_are_available_to_commands_and_redacted_from_context() {
     .unwrap();
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        "mode = \"unrestricted\"\n",
+        "yolo = true\n",
     )
     .unwrap();
     let mut tui = fixture.spawn(&[]);
@@ -281,9 +324,7 @@ ttl_seconds = 3600
     .unwrap();
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "confirm"
-
-[auto_mode]
+        r#"[auto_mode]
 enable = true
 max_tokens = 4096
 model = "remote-evaluator"
@@ -315,9 +356,7 @@ fn policy_explain_covers_custom_rules_wrappers_redirects_and_heredocs() {
     let fixture = Fixture::new(&server);
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "workspace_write"
-
-[[allow]]
+        r#"[[allow]]
 match = "fixture-tool"
 mode = "prefix"
 
@@ -366,16 +405,30 @@ action = "deny"
         );
     }
     assert_eq!(server.request_count(), 0);
+
+    // A configured rule names itself, so the user can read why the decision
+    // was reserved.
+    let output = fixture.output(&[
+        "policy",
+        "explain",
+        "printf before; fixture-ask --confirm now",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .contains("reason: requires confirmation by a configured rule: fixture-ask --confirm"),
+        "stdout={stdout}"
+    );
 }
 
 #[test]
-fn policy_modes_and_yolo_have_process_level_wire_behavior() {
+fn a_deny_rule_and_yolo_have_process_level_wire_behavior() {
     let server = MockServer::start(vec![
         tool_response(
-            "readonly-call",
+            "denied-call",
             r#"return await lofi.bash({ cmd: "cargo build" });"#,
         ),
-        text_response("readonly policy answer"),
+        text_response("denied policy answer"),
         tool_response(
             "yolo-call",
             r#"return await lofi.bash({ cmd: "printf yolo-ran > yolo.txt" });"#,
@@ -386,19 +439,19 @@ fn policy_modes_and_yolo_have_process_level_wire_behavior() {
 
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        "mode = \"read_only\"\n",
+        "[[deny]]\nmatch = \"cargo\"\nmode = \"prefix\"\n",
     )
     .unwrap();
-    let mut readonly = fixture.spawn(&[]);
-    readonly.submit("run a read-only policy command");
-    readonly.wait_for("readonly policy answer", WAIT);
+    let mut denied = fixture.spawn(&[]);
+    denied.submit("run a denied policy command");
+    denied.wait_for("denied policy answer", WAIT);
     assert!(!fixture.workspace.join("target").exists());
     let requests = server.requests();
     assert!(requests[1].body.contains("denied"));
 
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        "mode = \"workspace_write\"\nyolo = true\n",
+        "yolo = true\n",
     )
     .unwrap();
     let mut yolo = fixture.spawn(&[]);
@@ -409,6 +462,22 @@ fn policy_modes_and_yolo_have_process_level_wire_behavior() {
         "yolo-ran"
     );
     assert_eq!(server.request_count(), 4);
+}
+
+#[test]
+fn a_removed_policy_mode_fails_to_load() {
+    let server = MockServer::start(Vec::new());
+    let fixture = Fixture::new(&server);
+    std::fs::write(
+        fixture.config.parent().unwrap().join("policy.toml"),
+        "mode = \"workspace_write\"\n",
+    )
+    .unwrap();
+    let output = fixture.output(&["policy", "explain", "ls"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mode` was removed"), "stderr={stderr}");
+    assert_eq!(server.request_count(), 0);
 }
 
 #[test]

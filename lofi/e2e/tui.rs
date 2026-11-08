@@ -635,7 +635,7 @@ fn topmost_policy_confirmation_handles_input_before_tree_picker() {
         ),
         text_response("overlap policy denied answer"),
     ]);
-    let fixture = Fixture::with_policy(&server, "confirm");
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("overlap seed prompt");
@@ -670,7 +670,7 @@ fn policy_dialog_deny_all_blocks_exec_without_prompting() {
         ),
         text_response("policy deny all answer"),
     ]);
-    let fixture = Fixture::with_policy(&server, "confirm");
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("/policy");
@@ -703,7 +703,7 @@ fn policy_dialog_allow_all_runs_exec_without_prompting() {
         ),
         text_response("policy allow all answer"),
     ]);
-    let fixture = Fixture::with_policy(&server, "confirm");
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("/policy");
@@ -1108,7 +1108,7 @@ fn program_status_reports_each_turn_transition() {
         ),
         text_response("status done answer"),
     ]);
-    let fixture = Fixture::with_policy(&server, "confirm");
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
     tui.clear_output();
 
@@ -1513,9 +1513,7 @@ fn accepting_auto_mode_dialog_keeps_the_draft_in_the_input_box() {
     let fixture = Fixture::new(&server);
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "confirm"
-
-[auto_mode]
+        r#"[auto_mode]
 enable = true
 model = "mock/alt"
 max_tokens = 128

@@ -43,7 +43,7 @@ fn ctx(root: &Path) -> ExecCtx {
 fn trusted_ctx(root: &Path) -> ExecCtx {
     let mut ctx = ctx(root);
     ctx.shell_policy = lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        mode: lofi_types::ShellPolicyMode::Unrestricted,
+        yolo: true,
         ..lofi_types::ShellPolicyConfig::default()
     });
     ctx
@@ -416,7 +416,7 @@ async fn exec_bash_policy_deny_beats_steering() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
     cx.shell_policy = lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        mode: lofi_types::ShellPolicyMode::Unrestricted,
+        yolo: true,
         deny: vec![lofi_types::CommandEntry {
             match_str: "sleep".into(),
             mode: lofi_types::MatchMode::Prefix,

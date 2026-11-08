@@ -64,7 +64,7 @@ fn ctx(root: &std::path::Path) -> ExecCtx {
 fn trusted_ctx(root: &std::path::Path) -> ExecCtx {
     let mut ctx = ctx(root);
     ctx.shell_policy = crate::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        mode: lofi_types::ShellPolicyMode::Unrestricted,
+        yolo: true,
         ..lofi_types::ShellPolicyConfig::default()
     });
     ctx

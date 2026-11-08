@@ -875,29 +875,15 @@ Shell policy lives in `policy.toml`, alongside `config.toml` by default. Every `
 
 `lofi.bash` runs through host `sh -c`. The policy controls approval; it is not a filesystem or network sandbox. A command approved by the user can read or modify anything available to that user. The default therefore requires confirmation for every model-generated shell command. Filesystem tools such as `lofi.read`, `lofi.write`, and `lofi.edit` remain confined to the workspace root, registered roots, and directories the user approved.
 
-### Modes
-
-| Mode | Behaviour |
-| --- | --- |
-| `confirm` | Requires confirmation for every command except universal denials. This is the default. |
-| `read_only` | Automatically approves a command-classification allowlist such as `ls`, `cat`, `grep`, and `git status`. It does not confine paths. |
-| `workspace_write` | Adds builds, interpreters, package managers, and mutation commands to the automatic-approval allowlist. It does not confine writes to the workspace. |
-| `unrestricted` | Allows everything unless an explicit rule denies it. |
-
-```toml
-mode = "confirm"
-yolo = false
-```
-
-Network clients are not automatically approved by the built-in restricted modes. Output redirects require confirmation by default. Both can be opted into with custom rules and redirect settings.
-
 `yolo = true` skips confirmation for `ask` and unmatched commands, but does not bypass explicit deny rules.
+
+A `policy.toml` that still sets `mode` fails to load with an error naming the key, because a preset's automatic approvals would otherwise vanish without a word.
 
 `lofi policy explain <COMMAND>` evaluates a command against the policy and prints the action, the reason, and the matched rule, without running it.
 
 ### Custom rules
 
-Custom rules are merged on top of the selected mode's defaults:
+Custom rules are merged on top of the universal denials:
 
 ```toml
 [[allow]]
@@ -921,6 +907,8 @@ Each rule has a required `match` string and one of these matching modes:
 | `prefix` | Match the beginning of the command at a word boundary. |
 | `substring` | Match a contiguous token sequence anywhere in the command. |
 | `args` | Match a command prefix and required argument tokens. |
+
+A custom `[[ask]]` rule reserves the decision for the user: automatic approval never answers it, whatever the request says. `lofi policy explain`, the confirmation prompt, and the denial text all name the rule that matched, even when a redirect or heredoc asks at the same time. The prompt still counts down to `approval_timeout_ms` whenever `[auto_mode]` is enabled, `120000` unless the key says otherwise, so an explicit rule cannot hang an unattended run. The asks that a redirect or heredoc action, an unparseable command, or an unmatched command produce do go to automatic approval.
 
 ### Command wrappers
 
@@ -962,7 +950,7 @@ action = "ask"
 
 ### Automatic approval
 
-Automatic mode asks a small model to pre-approve commands that would otherwise require confirmation. The evaluator answers with one risk level:
+Automatic mode asks a small model to pre-approve commands that would otherwise require confirmation, except the ones a custom `[[ask]]` rule reserves. The evaluator answers with one risk level:
 - `low` runs the command without a prompt.
 - `confirm` shows the normal confirmation prompt.
 - `block` shows the normal confirmation prompt with the evaluator's reason.
@@ -1005,7 +993,7 @@ lofi policy calibrate --probe corpus.txt --out records.jsonl
 lofi policy calibrate --records records.jsonl --sweep
 ```
 
-`model` is a model query: a provider key or a backend key, then a model, as everywhere else in the configuration. A config that still names `provider` and a bare `model` keeps working; the two fields join into one query. `model` is optional when `decision_model` is set; one of the two is required. A backend name runs the evaluation on that CLI backend, so a session on a CLI backend evaluates commands exactly like an HTTP one. When the evaluator runs on a provider, it uses that provider's `response_start_timeout_ms` as a hard ceiling; this applies to the chat evaluator, whose replies stream. `max_tokens` defaults to the selected model's output limit. `timeout_ms` caps one evaluation, because a stalled evaluator holds the command and the turn with it. A timeout is a failure, so the command falls back to the normal prompt. `approval_timeout_ms` caps the wait once auto mode escalates to the ask: a prompt the user does not answer within that time is denied on auto mode's own authority with `approval timed out` as the reason, so an unattended session does not hang on it. The clock runs from the escalation, so a prompt queued behind an earlier one loses part of its wait. `0` disables the auto-deny; unset picks `120000` (120s). The deny button counts down to it while the prompt is up. The timer covers the auto-mode ask prompts only; grant and credential prompts wait without limit, and a prompt without auto mode does too.
+`model` is a model query: a provider key or a backend key, then a model, as everywhere else in the configuration. A config that still names `provider` and a bare `model` keeps working; the two fields join into one query. `model` is optional when `decision_model` is set; one of the two is required. A backend name runs the evaluation on that CLI backend, so a session on a CLI backend evaluates commands exactly like an HTTP one. When the evaluator runs on a provider, it uses that provider's `response_start_timeout_ms` as a hard ceiling; this applies to the chat evaluator, whose replies stream. `max_tokens` defaults to the selected model's output limit. `timeout_ms` caps one evaluation, because a stalled evaluator holds the command and the turn with it. A timeout is a failure, so the command falls back to the normal prompt. `approval_timeout_ms` caps the wait on a prompt that auto mode escalates or that a custom `[[ask]]` rule forces: a prompt the user does not answer within that time is denied on the tool's own authority with `approval timed out` as the reason, so an unattended session does not hang on it. The clock runs from the escalation for an auto-mode prompt and from the request for one a custom `[[ask]]` rule forces, not from when the prompt reaches the screen, so a prompt queued behind an earlier one loses part of its wait. `0` disables the auto-deny; unset picks `120000` (120s). The deny button counts down to it while the prompt is up. The timer covers the auto-mode ask prompts and the prompts a custom `[[ask]]` rule forces; grant and credential prompts wait without limit, and a manual-mode prompt for any other ask does too.
 
 `model` names the chat evaluator. A model on a provider whose `api = "systemone"` is a decision model: the gate asks that endpoint typed questions about the command (its scope, its destructiveness, whether it exposes a credential or runs downloaded code, whether the user's request covers it, and whether it knows the command's tools at all) instead of running the chat rubric. Name it in `decision_model`, never in `model`: a decision model in `model`, or a chat model in `decision_model`, is a configuration error. The decision query has no thinking level or service tier. The gates resolve once at startup, so a bad query is a configuration error, not a silent fallback. A decision model never appears as a selectable chat model. A decision model takes no `max_tokens`; a set value applies to the chat stage only. Every failure mode of a decision call (timeout, transport error, malformed answer) falls back to the normal approval prompt. `timeout_ms` caps one evaluation; unset, it defaults to `30000` for either stage. For a decision call the cap includes its rate-limit retry.
 

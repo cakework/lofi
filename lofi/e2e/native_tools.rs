@@ -589,7 +589,7 @@ fn tui_shutdown_kills_a_live_background_job_process_group() {
         ),
         text_response("shutdown job answer"),
     ]);
-    let fixture = Fixture::new(&server);
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("start a job before shutdown");

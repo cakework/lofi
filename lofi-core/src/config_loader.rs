@@ -65,13 +65,17 @@ pub fn load_policy_or_default(path: &Path) -> Result<lofi_types::ShellPolicyConf
                 .map_err(|e| Error::Config(format!("failed to read {}: {e}", path.display())))?;
             let mut doc: toml::Value = toml::from_str(&content)
                 .map_err(|e| Error::Config(format!("parse error in {}: {e}", path.display())))?;
+            reject_removed_keys(&doc, &path.display().to_string())?;
             apply_env_overrides(&mut doc)?;
+            // Only an override can set `mode` once the file is clean.
+            reject_removed_keys(&doc, "policy env override")?;
             doc.try_into()
                 .map_err(|e| Error::Config(format!("parse error in {}: {e}", path.display())))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut doc = toml::Value::Table(toml::Table::new());
             apply_env_overrides(&mut doc)?;
+            reject_removed_keys(&doc, "policy env override")?;
             doc.try_into()
                 .map_err(|e| Error::Config(format!("env override: {e}")))
         }
@@ -80,6 +84,23 @@ pub fn load_policy_or_default(path: &Path) -> Result<lofi_types::ShellPolicyConf
             path.display()
         ))),
     }
+}
+
+/// A file or an env override that still sets `mode` fails to load, because a
+/// preset's automatic approvals would otherwise vanish without a word.
+///
+/// # Errors
+/// [`Error::Config`] naming the source and the removed key.
+fn reject_removed_keys(doc: &toml::Value, source: &str) -> Result<()> {
+    if doc
+        .as_table()
+        .is_some_and(|table| table.contains_key("mode"))
+    {
+        return Err(Error::Config(format!(
+            "{source}: `mode` was removed; add `[[allow]]` rules for the commands that should run without a prompt, or set `yolo = true`"
+        )));
+    }
+    Ok(())
 }
 
 /// # Errors
@@ -557,6 +578,19 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn a_removed_policy_mode_names_the_file_and_the_key() {
+        let dir = std::env::temp_dir().join("lofi-policy-removed-mode-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "mode = \"workspace_write\"\n").unwrap();
+        let text = load_policy_or_default(&path).unwrap_err().to_string();
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("`mode` was removed"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

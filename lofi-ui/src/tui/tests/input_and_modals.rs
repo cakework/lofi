@@ -736,6 +736,32 @@ fn a_read_grant_on_the_root_offers_widening_it() {
 }
 
 #[test]
+fn permission_dialog_names_the_rule_that_reserved_the_answer() {
+    let mut a = app();
+    let (req, _response) = confirm_request("git push origin main");
+    *req.reason
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = lofi_core::ConfirmReason::Policy {
+        reason: "requires confirmation by a configured rule: git push".to_string(),
+    };
+    a.pending_confirms.push(req);
+    // Wrapping splits the sentence across rows; compare the flattened screen
+    // without the panel's box-drawing characters.
+    let screen = screen_of(&mut a);
+    let flat = screen
+        .replace(['│', '╭', '╮', '╰', '╯', '─'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains(
+            "Shell wants to run this command: requires confirmation by a configured rule: git push"
+        ),
+        "{screen}"
+    );
+}
+
+#[test]
 fn permission_dialog_renders_command_and_selectable_actions() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

@@ -8,6 +8,11 @@ pub struct Decision {
     pub action: PolicyAction,
     pub reason: String,
     pub matched_command: Option<String>,
+    /// An `[[ask]]` rule from `policy.toml` matched. Such a rule reserves
+    /// the decision for the user, so the tool layer prompts and never
+    /// consults auto mode. A redirect or heredoc action, an unparseable
+    /// command, and a fail-closed miss leave it false.
+    pub ask_rule: bool,
     /// The steering suggestion folded into `reason` after `"; "`. Only the
     /// backgrounding deny sets it; callers drop it when steering does not
     /// apply (`jobSpawn`, and the bash tool for `steer: false`).
@@ -29,15 +34,14 @@ impl Decision {
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
     pub allow: Vec<CommandEntry>,
+    /// The `[[ask]]` rules from `policy.toml`. A match marks the decision
+    /// `ask_rule`, which keeps auto mode out of it.
     pub ask: Vec<CommandEntry>,
     pub deny: Vec<CommandEntry>,
     pub wrappers: WrapperRuleMap,
     pub redirects: RedirectPolicy,
     pub heredocs: HeredocPolicy,
     pub yolo: bool,
-    /// When true (unrestricted mode), unmatched commands are allowed
-    /// instead of failing closed to ask.
-    pub allow_by_default: bool,
 }
 
 impl ResolvedPolicy {
@@ -50,6 +54,7 @@ impl ResolvedPolicy {
                     action: PolicyAction::Ask,
                     reason: format!("unparseable: {e}"),
                     matched_command: Some(command.to_string()),
+                    ask_rule: false,
                     steer: None,
                 };
             }
@@ -63,6 +68,7 @@ impl ResolvedPolicy {
                 action: PolicyAction::Deny,
                 reason: format!("{base}; {suggestion}"),
                 matched_command: Some(command.to_string()),
+                ask_rule: false,
                 steer: Some(suggestion),
             };
         }
@@ -73,6 +79,7 @@ impl ResolvedPolicy {
                 action: PolicyAction::Ask,
                 reason: "empty or unrecognized command".into(),
                 matched_command: Some(command.to_string()),
+                ask_rule: false,
                 steer: None,
             };
         }
@@ -97,6 +104,8 @@ impl ResolvedPolicy {
             .max_by_key(|d| action_rank(d.action))
             .unwrap_or(&cmd_decision);
 
+        // `yolo` skips an explicit ask rule too: it is a session-wide
+        // choice to run without prompts, and it still never bypasses a deny.
         let action = if winner.action == PolicyAction::Allow
             || (self.yolo && winner.action != PolicyAction::Deny)
         {
@@ -105,14 +114,27 @@ impl ResolvedPolicy {
             PolicyAction::Ask
         };
 
+        // A rule that reserves the answer names itself, even when a redirect
+        // or heredoc asks as well: the user answers the rule, not the
+        // redirect, and a tie would otherwise hand the decision to the last
+        // source in the merge order.
+        let named = if action == PolicyAction::Ask && cmd_decision.ask_rule {
+            &cmd_decision
+        } else {
+            winner
+        };
+
         Decision {
             action,
-            reason: if action == PolicyAction::Ask && winner.reason.is_empty() {
+            reason: if action == PolicyAction::Ask && named.reason.is_empty() {
                 "no policy match".into()
             } else {
-                winner.reason.clone()
+                named.reason.clone()
             },
-            matched_command: winner.matched_command.clone(),
+            matched_command: named.matched_command.clone(),
+            // The rule that matched the command itself decides whether the
+            // user answers this prompt, whatever source merged the action.
+            ask_rule: cmd_decision.ask_rule,
             // Only the backgrounding deny (an early return above) carries a
             // steering suggestion, so a merged winner never does.
             steer: None,
@@ -123,6 +145,7 @@ impl ResolvedPolicy {
         let mut result = PolicyAction::Allow;
         let mut reason = String::new();
         let mut matched = None;
+        let mut explicit = false;
         let mut saw_direct_unmatched = false;
 
         for cmd in cmds {
@@ -132,15 +155,22 @@ impl ResolvedPolicy {
                     action: PolicyAction::Deny,
                     reason: format!("denied: {}", cmd.name),
                     matched_command: Some(cmd.full_text.clone()),
+                    ask_rule: false,
                     steer: None,
                 };
             }
 
-            let ask_match = self.ask.iter().find(|e| match_entry(cmd, e));
-            if ask_match.is_some() && result != PolicyAction::Deny {
+            // A configured rule reserves the answer for the user: auto
+            // mode never answers it.
+            let rule_match = self.ask.iter().find(|e| match_entry(cmd, e));
+            if let Some(rule) = rule_match {
                 result = PolicyAction::Ask;
-                reason = format!("requires confirmation: {}", cmd.name);
+                reason = format!(
+                    "requires confirmation by a configured rule: {}",
+                    rule.match_str
+                );
                 matched = Some(cmd.full_text.clone());
+                explicit = true;
             }
 
             let allow_match = self.allow.iter().find(|e| match_entry(cmd, e));
@@ -151,7 +181,7 @@ impl ResolvedPolicy {
                     reason = format!("allowed: {}", cmd.name);
                     matched = Some(cmd.full_text.clone());
                 }
-            } else if ask_match.is_none() {
+            } else if rule_match.is_none() {
                 if cmd.source == CommandSource::Direct {
                     saw_direct_unmatched = true;
                 }
@@ -160,7 +190,7 @@ impl ResolvedPolicy {
                 // name is not another unmatched command that can veto it.
                 let is_wrapper = cmd.source == CommandSource::Direct
                     && self.wrappers.contains_key(&cmd.name.to_ascii_lowercase());
-                if result == PolicyAction::Allow && !self.allow_by_default && !is_wrapper {
+                if result == PolicyAction::Allow && !is_wrapper {
                     result = PolicyAction::Ask;
                     reason = format!("no policy match: {}", cmd.name);
                     matched = Some(cmd.full_text.clone());
@@ -172,6 +202,7 @@ impl ResolvedPolicy {
             action: result,
             reason,
             matched_command: matched,
+            ask_rule: explicit,
             steer: None,
         }
     }
@@ -194,6 +225,7 @@ impl ResolvedPolicy {
                         action: self.redirects.action,
                         reason: format!("redirect {op} {target}"),
                         matched_command: Some(cmd.full_text.clone()),
+                        ask_rule: false,
                         steer: None,
                     };
                 }
@@ -203,6 +235,7 @@ impl ResolvedPolicy {
             action: PolicyAction::Allow,
             reason: String::new(),
             matched_command: None,
+            ask_rule: false,
             steer: None,
         }
     }
@@ -219,6 +252,7 @@ impl ResolvedPolicy {
                     action: self.heredocs.action,
                     reason: "heredoc detected".into(),
                     matched_command: Some(cmd.full_text.clone()),
+                    ask_rule: false,
                     steer: None,
                 };
             }
@@ -227,6 +261,7 @@ impl ResolvedPolicy {
             action: PolicyAction::Allow,
             reason: String::new(),
             matched_command: None,
+            ask_rule: false,
             steer: None,
         }
     }
@@ -347,21 +382,35 @@ mod tests {
     use super::*;
     use lofi_types::*;
 
-    fn policy_for(mode: ShellPolicyMode) -> ResolvedPolicy {
-        defaults::resolve(&ShellPolicyConfig {
-            mode,
+    fn default_policy() -> ResolvedPolicy {
+        defaults::resolve(&ShellPolicyConfig::default())
+    }
+
+    /// A config that allows the listed commands by prefix.
+    fn allowing(entries: &[&str]) -> ShellPolicyConfig {
+        ShellPolicyConfig {
+            allow: entries
+                .iter()
+                .map(|match_str| CommandEntry {
+                    match_str: (*match_str).into(),
+                    mode: MatchMode::Prefix,
+                })
+                .collect(),
             ..Default::default()
-        })
+        }
     }
 
     #[test]
-    fn confirm_mode_asks_for_every_non_denied_command() {
-        let p = policy_for(ShellPolicyMode::Confirm);
+    fn the_default_policy_asks_for_every_non_denied_command() {
+        let p = default_policy();
         for command in [
             "ls",
             "cargo build",
             "cat ~/.ssh/id_rsa",
             "curl https://example.com",
+            "rm file.txt",
+            "git commit -m test",
+            "totally-unknown-binary --flag",
         ] {
             assert_eq!(p.evaluate(command).action, PolicyAction::Ask, "{command}");
         }
@@ -369,15 +418,17 @@ mod tests {
     }
 
     #[test]
-    fn redirects_ask_by_default() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+    fn a_redirect_asks_even_when_the_command_is_allowed() {
+        let p = defaults::resolve(&allowing(&["echo"]));
         let d = p.evaluate("echo x > /tmp/outside-workspace");
         assert_eq!(d.action, PolicyAction::Ask);
+        // A redirect asks on its own, without a rule reserving the answer.
+        assert!(!d.ask_rule);
     }
 
     #[test]
-    fn network_clients_are_not_preset_allows() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+    fn network_clients_are_not_builtin_allows() {
+        let p = default_policy();
         assert_eq!(
             p.evaluate("curl https://example.com").action,
             PolicyAction::Ask
@@ -389,43 +440,48 @@ mod tests {
     }
 
     #[test]
-    fn allow_ls() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
-        let d = p.evaluate("ls -la");
-        assert_eq!(d.action, PolicyAction::Allow);
-    }
-
-    #[test]
-    fn allow_cargo() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
-        let d = p.evaluate("cargo build");
-        assert_eq!(d.action, PolicyAction::Allow);
+    fn an_allow_rule_allows_the_commands_it_names() {
+        let p = defaults::resolve(&allowing(&["ls", "cargo"]));
+        assert_eq!(p.evaluate("ls -la").action, PolicyAction::Allow);
+        assert_eq!(p.evaluate("cargo build").action, PolicyAction::Allow);
     }
 
     #[test]
     fn deny_sudo() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("sudo rm -rf /");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
-    fn ask_rm() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
-        let d = p.evaluate("rm file.txt");
+    fn an_ask_rule_is_reserved() {
+        let p = defaults::resolve(&ShellPolicyConfig {
+            ask: vec![CommandEntry {
+                match_str: "git push".into(),
+                mode: MatchMode::Prefix,
+            }],
+            ..Default::default()
+        });
+        let d = p.evaluate("git push origin main");
         assert_eq!(d.action, PolicyAction::Ask);
+        assert!(d.ask_rule);
+        assert_eq!(
+            d.reason,
+            "requires confirmation by a configured rule: git push"
+        );
     }
 
     #[test]
-    fn ask_git_commit() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
-        let d = p.evaluate("git commit -m test");
+    fn a_fail_closed_ask_is_not_reserved() {
+        let p = default_policy();
+        let d = p.evaluate("special-cmd");
         assert_eq!(d.action, PolicyAction::Ask);
+        assert!(!d.ask_rule);
     }
 
     #[test]
     fn deny_bare_ampersand_backgrounds() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("sleep 30 &");
         assert_eq!(d.action, PolicyAction::Deny);
         assert!(d.reason.contains("jobSpawn"), "reason: {}", d.reason);
@@ -442,7 +498,7 @@ mod tests {
 
     #[test]
     fn deny_ampersand_after_otherwise_allowed_command() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = defaults::resolve(&allowing(&["cargo"]));
         // Even when every segment is allowed, the bare "&" is a hard deny.
         let d = p.evaluate("cargo build & cargo test");
         assert_eq!(d.action, PolicyAction::Deny);
@@ -450,7 +506,7 @@ mod tests {
 
     #[test]
     fn deny_nohup_setsid_disown() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         for cmd in ["nohup sleep 5", "setsid cargo watch", "disown %1"] {
             let d = p.evaluate(cmd);
             assert_eq!(d.action, PolicyAction::Deny, "cmd: {cmd}");
@@ -466,7 +522,7 @@ mod tests {
 
     #[test]
     fn deny_backgrounding_inside_subshell_and_substitution() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         for cmd in ["(sleep 5 &)", "echo $(sleep 5 &)", "echo `sleep 5 &`"] {
             let d = p.evaluate(cmd);
             assert_eq!(d.action, PolicyAction::Deny, "cmd: {cmd}");
@@ -475,7 +531,7 @@ mod tests {
 
     #[test]
     fn allow_double_ampersand_and_pipeline() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = defaults::resolve(&allowing(&["cargo", "tail"]));
         // "&&" and "|" are sequencing, not backgrounding.
         let d = p.evaluate("cargo build && cargo test");
         assert_eq!(d.action, PolicyAction::Allow);
@@ -485,183 +541,169 @@ mod tests {
 
     #[test]
     fn deny_find_root() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("find / -name foo");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
-    #[test]
-    fn readonly_denies_cargo() {
-        let p = policy_for(ShellPolicyMode::ReadOnly);
-        let d = p.evaluate("cargo build");
-        assert_eq!(d.action, PolicyAction::Deny);
-    }
-
-    #[test]
-    fn readonly_allows_ls() {
-        let p = policy_for(ShellPolicyMode::ReadOnly);
-        let d = p.evaluate("ls");
-        assert_eq!(d.action, PolicyAction::Allow);
-    }
-
-    #[test]
-    fn unrestricted_allows_cargo() {
-        let p = policy_for(ShellPolicyMode::Unrestricted);
-        let d = p.evaluate("cargo build");
-        assert_eq!(d.action, PolicyAction::Allow);
-    }
-
-    #[test]
-    fn unrestricted_denies_sudo() {
-        let p = policy_for(ShellPolicyMode::Unrestricted);
-        let d = p.evaluate("sudo ls");
-        assert_eq!(d.action, PolicyAction::Deny);
-    }
-
-    #[test]
-    fn yolo_allows_ask() {
-        let p = defaults::resolve(&ShellPolicyConfig {
-            mode: ShellPolicyMode::WorkspaceWrite,
+    fn yolo_policy(config: ShellPolicyConfig) -> ResolvedPolicy {
+        defaults::resolve(&ShellPolicyConfig {
             yolo: true,
-            ..Default::default()
-        });
+            ..config
+        })
+    }
+
+    #[test]
+    fn yolo_allows_a_fail_closed_ask() {
+        let p = yolo_policy(ShellPolicyConfig::default());
         let d = p.evaluate("rm file.txt");
         assert_eq!(d.action, PolicyAction::Allow);
     }
 
     #[test]
     fn yolo_still_denies_sudo() {
-        let p = defaults::resolve(&ShellPolicyConfig {
-            mode: ShellPolicyMode::WorkspaceWrite,
-            yolo: true,
-            ..Default::default()
-        });
+        let p = yolo_policy(ShellPolicyConfig::default());
         let d = p.evaluate("sudo rm -rf /");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn pipeline_both_checked() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        // `ls` alone is allowed, so only the second segment can ask.
+        let p = defaults::resolve(&allowing(&["ls"]));
         let d = p.evaluate("ls | rm -rf /tmp");
         assert_eq!(d.action, PolicyAction::Ask);
     }
 
     #[test]
     fn pipeline_deny_dominates() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("ls | sudo rm /etc/passwd");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn wrapper_bash_c_unwrapped() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("bash -c 'sudo rm -rf /'");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn wrapper_sudo_unwrapped() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("sudo ls");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn subshell_checked() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("(sudo rm /etc/passwd)");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn cmd_substitution_checked() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("echo $(sudo ls)");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn unparseable_fails_closed() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("echo 'unclosed");
         assert_eq!(d.action, PolicyAction::Ask);
     }
 
     #[test]
     fn unmatched_fails_closed() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("totally-unknown-binary --flag");
         assert_eq!(d.action, PolicyAction::Ask);
     }
 
     #[test]
     fn custom_allow_rule() {
-        let p = defaults::resolve(&ShellPolicyConfig {
-            mode: ShellPolicyMode::ReadOnly,
-            allow: vec![CommandEntry {
-                match_str: "my-tool".into(),
-                mode: MatchMode::Prefix,
-            }],
-            ..Default::default()
-        });
+        let p = defaults::resolve(&allowing(&["my-tool"]));
         let d = p.evaluate("my-tool --check");
         assert_eq!(d.action, PolicyAction::Allow);
     }
 
     #[test]
-    fn custom_deny_overrides_mode_allow() {
+    fn a_deny_rule_beats_an_allow_rule() {
         let p = defaults::resolve(&ShellPolicyConfig {
-            mode: ShellPolicyMode::WorkspaceWrite,
             deny: vec![CommandEntry {
                 match_str: "cargo".into(),
                 mode: MatchMode::Prefix,
             }],
-            ..Default::default()
+            ..allowing(&["cargo"])
         });
         let d = p.evaluate("cargo build");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
+    fn an_ask_rule_names_itself_over_a_redirect() {
+        let p = defaults::resolve(&ShellPolicyConfig {
+            ask: vec![CommandEntry {
+                match_str: "printf".into(),
+                mode: MatchMode::Prefix,
+            }],
+            ..allowing(&["printf"])
+        });
+        let d = p.evaluate("printf x > out.txt");
+        assert_eq!(d.action, PolicyAction::Ask);
+        assert!(d.ask_rule);
+        assert_eq!(
+            d.reason,
+            "requires confirmation by a configured rule: printf"
+        );
+    }
+
+    #[test]
     fn args_mode_match() {
         let p = defaults::resolve(&ShellPolicyConfig {
-            mode: ShellPolicyMode::Unrestricted,
             ask: vec![CommandEntry {
                 match_str: "*:-X POST".into(),
                 mode: MatchMode::Args,
             }],
-            ..Default::default()
+            ..allowing(&["curl"])
         });
         let d = p.evaluate("curl -X POST http://example.com");
         assert_eq!(d.action, PolicyAction::Ask);
+        assert!(d.ask_rule);
+        assert_eq!(
+            d.reason,
+            "requires confirmation by a configured rule: *:-X POST"
+        );
     }
 
     #[test]
     fn heredoc_ask_by_default() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = defaults::resolve(&allowing(&["cat"]));
         let d = p.evaluate("cat <<EOF\nhello\nEOF");
         assert_eq!(d.action, PolicyAction::Ask);
     }
 
     #[test]
     fn env_wrapper_unwrapped() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("env FOO=bar sudo rm /etc");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn process_substitution_checked() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("diff <(sudo rm /etc/passwd) <(ls)");
         assert_eq!(d.action, PolicyAction::Deny);
     }
 
     #[test]
     fn quoted_cmd_substitution_checked() {
-        let p = policy_for(ShellPolicyMode::WorkspaceWrite);
+        let p = default_policy();
         let d = p.evaluate("echo \"$(sudo rm -rf /)\"");
         assert_eq!(d.action, PolicyAction::Deny);
     }

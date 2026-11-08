@@ -696,7 +696,7 @@ fn permission_allow_executes_the_requested_shell_command() {
         ),
         text_response("permission allow answer marker"),
     ]);
-    let fixture = Fixture::with_policy(&server, "confirm");
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("permission allow prompt marker");
@@ -720,7 +720,7 @@ fn permission_deny_returns_an_error_without_running_the_command() {
         ),
         text_response("permission deny answer marker"),
     ]);
-    let fixture = Fixture::with_policy(&server, "confirm");
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("permission deny prompt marker");
@@ -740,7 +740,7 @@ fn cancelling_a_running_tool_kills_its_process_and_records_cancellation() {
         "cancel-tool",
         "return await lofi.bash({ cmd: \"echo $$ > foreground.pid; exec sleep 60\" });",
     )]);
-    let fixture = Fixture::new(&server);
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("cancel tool prompt marker");

@@ -848,7 +848,14 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let explanation = match &reason {
-        lofi_core::ConfirmReason::Policy => "Shell wants to run this command".to_string(),
+        lofi_core::ConfirmReason::Policy { reason } => {
+            let reason = reason.trim();
+            if reason.is_empty() {
+                "Shell wants to run this command".to_string()
+            } else {
+                format!("Shell wants to run this command: {reason}")
+            }
+        }
         lofi_core::ConfirmReason::OutsideRoot {
             dir,
             narrow,

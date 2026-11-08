@@ -1023,11 +1023,22 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// Commands run without a prompt (`yolo = true`); a `[[deny]]` rule
+    /// still applies.
     pub fn new(server: &MockServer) -> Self {
-        Self::with_policy(server, "unrestricted")
+        Self::with_policy(
+            server,
+            "yolo = true
+",
+        )
     }
 
-    pub fn with_policy(server: &MockServer, mode: &str) -> Self {
+    /// Every unmatched command asks.
+    pub fn asking(server: &MockServer) -> Self {
+        Self::with_policy(server, "")
+    }
+
+    pub fn with_policy(server: &MockServer, policy_text: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let state = root.path().join("state");
@@ -1035,14 +1046,7 @@ impl Fixture {
         let config = root.path().join("config.toml");
         let policy = root.path().join("policy.toml");
         std::fs::write(&config, config_text(&server.url())).unwrap();
-        std::fs::write(
-            &policy,
-            format!(
-                "mode = \"{mode}\"
-"
-            ),
-        )
-        .unwrap();
+        std::fs::write(&policy, policy_text).unwrap();
         Self {
             _root: root,
             workspace,
@@ -1065,12 +1069,7 @@ impl Fixture {
 ",
         )
         .unwrap();
-        std::fs::write(
-            &policy,
-            "mode = \"confirm\"
-",
-        )
-        .unwrap();
+        std::fs::write(&policy, "").unwrap();
         Self {
             _root: root,
             workspace,

@@ -202,7 +202,7 @@ async fn run_once_exec_reports_unawaited_bash_failure() {
     let dir = tempdir().unwrap();
     let agent = Agent {
         shell_policy: lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-            mode: lofi_types::ShellPolicyMode::Unrestricted,
+            yolo: true,
             ..lofi_types::ShellPolicyConfig::default()
         }),
         ..agent_with(vec![exec_round("lofi.bash({ cmd: 'exit 7' })")], dir.path())

@@ -701,8 +701,7 @@ api_key = "!touch unused-credential; exit 1"
     .unwrap();
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "confirm"
-[auto_mode]
+        r#"[auto_mode]
 enable = true
 model = "evaluator/judge"
 max_tokens = 128
@@ -757,8 +756,7 @@ api_key = "$EVAL_KEY"
     .unwrap();
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "confirm"
-[auto_mode]
+        r#"[auto_mode]
 enable = true
 model = "evaluator/judge"
 max_tokens = 128
@@ -790,8 +788,7 @@ fn external_auto_mode_runs_the_evaluator_on_the_cli_backend() {
     let fixture = claude_fixture();
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        r#"mode = "confirm"
-[auto_mode]
+        r#"[auto_mode]
 enable = true
 model = "claude/test-model"
 max_tokens = 128

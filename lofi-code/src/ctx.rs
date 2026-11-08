@@ -80,7 +80,12 @@ pub type JobAcquireFn = Arc<dyn Fn(u64, &str) -> Option<JobReleaseFn> + Send + S
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmReason {
-    Policy,
+    /// The shell policy asked. `reason` is the decision's own, so the prompt
+    /// names the rule that reserved the answer instead of only saying a
+    /// prompt is up.
+    Policy {
+        reason: String,
+    },
     /// A tool path outside the workspace root wants one directory granted.
     /// `requested` is the access the failing operation needs; `current` is
     /// the strongest grant that already covers the requested directory, so a

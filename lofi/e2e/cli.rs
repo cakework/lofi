@@ -800,7 +800,7 @@ thinking_levels = ["low", "medium", "high"]
     .unwrap();
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),
-        "mode = \"unrestricted\"\n",
+        "yolo = true\n",
     )
     .unwrap();
 

@@ -2,7 +2,7 @@
 
 Lofi's process-level test target is defined in `lofi/Cargo.toml` and implemented in `lofi/e2e/`. It runs the Cargo-built `lofi` binary in print mode or through a pseudo-terminal. Tests use temporary configuration, policy, state, and workspace directories plus a local mock model server. They do not need API keys or external network access.
 
-The current target contains 186 tests.
+The current target contains 291 tests.
 
 ## Run the suite
 
@@ -47,15 +47,16 @@ The counts below come from the current Cargo test target.
 
 | Module | Tests | Main coverage |
 | --- | ---: | --- |
-| `agent` | 24 | System prompts and skills, thinking controls, loop recovery, retries, permissions, tool failure, cancellation, and durable partial rounds. |
-| `cli` | 13 | Help and version, print mode, informational commands, environment injection, startup failures, session listing, model errors, signals, and reasoning replay. |
-| `configuration` | 7 | Automatic approval, resolved and redacted environment values, model discovery and cache fallback, recovery policy, shell-policy modes, and filesystem secret boundaries. |
-| `native_tools` | 16 | File, search, docs, skill, recall, result, image, and background-job APIs, including interactive terminal jobs, typed input, key sequences, signals, EOF, dimensions, and idle reporting. |
-| `providers` | 13 | All four provider transports, fragmented SSE, custom headers, no-auth requests, premature EOF, silent long-running response bodies, lifecycle events, retry reset after progress, stream errors, tiers, images, and signed reasoning. |
-| `sessions` | 58 | Creation, resume, branches, job ownership, failed and cancelled turns, compaction, truncation recovery, transcript repair, state permissions, temporary leases, large transcripts, and restored navigation. |
+| `agent` | 25 | System prompts and skills, thinking controls, loop recovery, retries, permissions, tool failure, cancellation, and durable partial rounds. |
+| `backends` | 59 | A fake Claude CLI child: protocol initialization and failure, reported and aliased models, effort flags, resume by id, compaction and hard caps, cost deltas, jobs, subagents, backend switching, and an external evaluator on a CLI backend. |
+| `cli` | 28 | Help and version, print mode, informational commands, environment injection, startup failures, session listing, model errors, signals, and reasoning replay. |
+| `configuration` | 11 | Automatic approval and the ask rules that reserve it, the rejected `mode` key, resolved and redacted environment values, model discovery and cache fallback, recovery policy, and filesystem secret boundaries. |
+| `native_tools` | 22 | File, search, docs, skill, recall, result, image, and background-job APIs, including interactive terminal jobs, typed input, key sequences, signals, EOF, dimensions, and idle reporting. |
+| `providers` | 18 | All four provider transports, fragmented SSE, custom headers, no-auth requests, premature EOF, silent long-running response bodies, lifecycle events, retry reset after progress, stream errors, tiers, images, and signed reasoning. |
+| `sessions` | 65 | Creation, resume, branches, job ownership, failed and cancelled turns, compaction, truncation recovery, transcript repair, state permissions, temporary leases, large transcripts, and restored navigation. |
 | `tools` | 14 | Native tool cycles for all providers, parallel and interleaved calls, malformed arguments, thinking signatures, cache breakpoints, compaction, and resume. |
-| `tui` | 41 | Transcript details, slash commands, pickers, policy dialogs, queued prompts, user-shell streaming and cancellation, selection and copy, mixed Markdown resize and replay, shutdown, and terminal restoration. |
-| **Total** | **186** | Real-binary behavior in print mode and pseudo-terminals. |
+| `tui` | 49 | Transcript details, slash commands, pickers, policy dialogs, queued prompts, user-shell streaming and cancellation, selection and copy, mixed Markdown resize and replay, shutdown, and terminal restoration. |
+| **Total** | **291** | Real-binary behavior in print mode and pseudo-terminals. |
 
 ### Provider and stream coverage
 

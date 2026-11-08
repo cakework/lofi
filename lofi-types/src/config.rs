@@ -266,16 +266,6 @@ fn default_image_max_bytes() -> usize {
     1024 * 1024
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ShellPolicyMode {
-    #[default]
-    Confirm,
-    ReadOnly,
-    WorkspaceWrite,
-    Unrestricted,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchMode {
@@ -406,10 +396,11 @@ pub struct AutoModeConfig {
     /// model alike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
-    /// How long an auto-mode ask prompt waits for the user before auto mode
-    /// denies it on its own, so an unattended session does not hang on the
-    /// prompt. `0` disables the auto-deny; unset picks
-    /// [`Self::DEFAULT_APPROVAL_TIMEOUT_MS`].
+    /// How long an ask prompt waits for the user before the tool denies it on
+    /// its own, so an unattended session does not hang on the prompt: the
+    /// prompts auto mode escalates, and the ones a custom `[[ask]]` rule
+    /// forces while auto mode is enabled. `0` disables the auto-deny; unset
+    /// picks [`Self::DEFAULT_APPROVAL_TIMEOUT_MS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_timeout_ms: Option<u64>,
     /// Thresholds for the decision-model gate, under
@@ -481,8 +472,6 @@ impl AutoModeConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ShellPolicyConfig {
-    #[serde(default)]
-    pub mode: ShellPolicyMode,
     #[serde(default)]
     pub yolo: bool,
     #[serde(default)]

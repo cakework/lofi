@@ -22,7 +22,7 @@ type RaceInner = std::result::Result<
 type RaceOutcome = std::result::Result<RaceInner, tokio::time::error::Elapsed>;
 
 /// What an ask prompt came to. `TimedOut` carries its own message because
-/// the user never answered: the denial is auto mode's, not the user's.
+/// the user never answered: the denial is the tool's, not the user's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AskVerdict {
     Approved,
@@ -43,7 +43,9 @@ impl From<bool> for AskVerdict {
 impl BuiltinTools {
     /// Evaluate the command against the configured and session shell policy.
     /// Auto-mode emits an evaluating confirmation request immediately and
-    /// races its decision against a manual response. Presentation and timing
+    /// races its decision against a manual response. A configured `[[ask]]`
+    /// rule skips auto mode and shows the plain policy prompt, under the
+    /// auto-mode approval deadline when one is set. Presentation and timing
     /// policy belong to consumers of that event. With `steer` off (also used
     /// by `jobSpawn`), a deny keeps its refusal but drops the steering
     /// suggestion, and no steering refusal applies.
@@ -87,33 +89,55 @@ impl BuiltinTools {
                 if mode == lofi_types::BashApprovalMode::AllowAll {
                     return None;
                 }
-                // An explicit `ask (manual)` pick bypasses an available auto
-                // mode; `ask (auto)` falls back to the manual prompt when no
-                // auto mode is configured.
-                let use_auto =
-                    mode == lofi_types::BashApprovalMode::AskAuto && self.auto_mode.is_some();
-                let verdict = match (use_auto, &self.auto_mode) {
-                    (true, Some(auto_mode)) => self.auto_mode_decision(cmd, auto_mode).await,
-                    _ => self
-                        .confirm_decision(cmd, crate::ConfirmReason::Policy)
-                        .await
-                        .into(),
+                let verdict = if decision.ask_rule {
+                    // A configured `[[ask]]` rule reserves the answer for
+                    // the user: auto mode never sees the command, though the
+                    // prompt still counts down like the auto-mode one.
+                    self.confirm_decision(
+                        cmd,
+                        crate::ConfirmReason::Policy {
+                            reason: decision.reason.clone(),
+                        },
+                        self.approval_timeout,
+                    )
+                    .await
+                } else {
+                    // An explicit `ask (manual)` pick bypasses an available
+                    // auto mode; `ask (auto)` falls back to the manual
+                    // prompt when no auto mode is configured.
+                    let use_auto =
+                        mode == lofi_types::BashApprovalMode::AskAuto && self.auto_mode.is_some();
+                    match (use_auto, &self.auto_mode) {
+                        (true, Some(auto_mode)) => self.auto_mode_decision(cmd, auto_mode).await,
+                        _ => {
+                            self.confirm_decision(
+                                cmd,
+                                crate::ConfirmReason::Policy {
+                                    reason: decision.reason.clone(),
+                                },
+                                None,
+                            )
+                            .await
+                        }
+                    }
                 };
                 match verdict {
                     AskVerdict::Approved => None,
-                    AskVerdict::Denied => Some(self.blocked_result(
-                        cmd,
-                        &format!("requires confirmation: {}{}", decision.reason, suffix),
-                        "needs_confirmation",
-                    )),
+                    AskVerdict::Denied => {
+                        // A rule's reason names the reservation itself; an
+                        // unmatched command's says nothing about approval.
+                        let reason = if decision.ask_rule {
+                            format!("{}{}", decision.reason, suffix)
+                        } else {
+                            format!("requires confirmation: {}{}", decision.reason, suffix)
+                        };
+                        Some(self.blocked_result(cmd, &reason, "needs_confirmation"))
+                    }
                     // The user never came back, so the command is refused on
-                    // auto mode's own authority rather than left waiting.
+                    // the tool's own authority rather than left waiting.
                     AskVerdict::TimedOut => Some(self.blocked_result(
                         cmd,
-                        &format!(
-                            "approval timed out; requires confirmation: {}{}",
-                            decision.reason, suffix
-                        ),
+                        &format!("approval timed out: {}{}", decision.reason, suffix),
                         "denied",
                     )),
                 }
@@ -219,20 +243,42 @@ impl BuiltinTools {
         }
     }
 
-    async fn confirm_decision(&self, cmd: &str, reason: crate::ConfirmReason) -> bool {
+    /// Ask the user. `timeout` puts a deadline on the wait: the prompt
+    /// carries it in `deny_at`, so the deny button counts down to the
+    /// denial the tool makes on its own authority.
+    async fn confirm_decision(
+        &self,
+        cmd: &str,
+        reason: crate::ConfirmReason,
+        timeout: Option<Duration>,
+    ) -> AskVerdict {
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let Some(confirm) = &self.confirm else {
-            return false;
+            return AskVerdict::Denied;
         };
-        let approved = confirm(crate::ConfirmPrompt {
+        // A wait too large to represent is no deadline, not a panic when the
+        // ask is decided.
+        let deadline = timeout.and_then(|wait| Instant::now().checked_add(wait));
+        let mut response = confirm(crate::ConfirmPrompt {
             command: cmd.to_string(),
             reason: std::sync::Arc::new(std::sync::Mutex::new(reason)),
             active: active.clone(),
-            deny_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        })
-        .await;
+            deny_at: std::sync::Arc::new(std::sync::Mutex::new(deadline)),
+        });
+        let approved = if let Some(deadline) = deadline {
+            let Ok(approved) =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut response)
+                    .await
+            else {
+                active.store(false, std::sync::atomic::Ordering::Relaxed);
+                return AskVerdict::TimedOut;
+            };
+            approved
+        } else {
+            response.await
+        };
         active.store(false, std::sync::atomic::Ordering::Relaxed);
-        approved
+        approved.into()
     }
 
     /// Build the host-level `sh -c` invocation: stdin null (the TUI reader
@@ -576,7 +622,6 @@ mod tests {
             redirects: lofi_types::RedirectPolicy::default(),
             heredocs: lofi_types::HeredocPolicy::default(),
             yolo: false,
-            allow_by_default: false,
         };
         let tmp = dir.path().join("lofi-tmp");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1071,6 +1116,127 @@ mod tests {
         assert!(!temp_path_escapes("rm -rf target"));
         assert!(!temp_path_escapes("cat /tmp/notes"));
         assert!(!temp_path_escapes("echo rm /tmp/x"));
+    }
+
+    fn ask_rule_config(cmd: &str) -> lofi_types::ShellPolicyConfig {
+        lofi_types::ShellPolicyConfig {
+            ask: vec![command_entry(cmd, lofi_types::MatchMode::Prefix)],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_keeps_auto_mode_out_of_the_decision() {
+        let auto_called = Arc::new(AtomicBool::new(false));
+        let auto: crate::AutoModeFn = {
+            let auto_called = auto_called.clone();
+            Arc::new(move |_| {
+                auto_called.store(true, Ordering::Relaxed);
+                Box::pin(async { allow("safe") })
+            })
+        };
+        let (seen, confirm) = deny_at_recorder(Duration::from_millis(10), true);
+        let (_dir, tools) =
+            tools_for_policy(&ask_rule_config("git push"), Some(confirm), Some(auto));
+        let tools = tools
+            .with_policy_override(mode_override(lofi_types::BashApprovalMode::AskAuto))
+            .with_approval_timeout(Some(Duration::from_secs(5)));
+
+        assert!(tools
+            .check_policy("git push origin main", true)
+            .await
+            .is_none());
+        assert!(
+            !auto_called.load(Ordering::Relaxed),
+            "a configured ask rule must never reach the evaluator"
+        );
+        let prompt_deny_at = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap();
+        // The countdown runs on the explicit ask too.
+        assert!(prompt_deny_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_ask_rule_is_denied_after_the_timeout() {
+        let auto: crate::AutoModeFn = Arc::new(|_| Box::pin(async { allow("safe") }));
+        let confirm: crate::ConfirmFn = Arc::new(|_| Box::pin(future::pending()));
+        let (_dir, tools) =
+            tools_for_policy(&ask_rule_config("git push"), Some(confirm), Some(auto));
+        let tools = tools
+            .with_policy_override(mode_override(lofi_types::BashApprovalMode::AskAuto))
+            .with_approval_timeout(Some(Duration::from_millis(50)));
+
+        let res = tools
+            .check_policy("git push origin main", true)
+            .await
+            .unwrap();
+        assert_eq!(res["status"], json!("denied"));
+        let output = res["output"].as_str().unwrap();
+        assert!(
+            output.starts_with(
+                "approval timed out: requires confirmation by a configured rule: git push"
+            ),
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("requires confirmation").count(),
+            1,
+            "the reason must not repeat its own prefix: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_ask_still_reaches_auto_mode() {
+        let auto_called = Arc::new(AtomicBool::new(false));
+        let auto: crate::AutoModeFn = {
+            let auto_called = auto_called.clone();
+            Arc::new(move |_| {
+                auto_called.store(true, Ordering::Relaxed);
+                Box::pin(async { allow("safe") })
+            })
+        };
+        let confirm: crate::ConfirmFn = Arc::new(|_| Box::pin(async { false }));
+        let (_dir, tools) = tools_for_policy(
+            &lofi_types::ShellPolicyConfig::default(),
+            Some(confirm),
+            Some(auto),
+        );
+        let tools =
+            tools.with_policy_override(mode_override(lofi_types::BashApprovalMode::AskAuto));
+
+        assert!(tools.check_policy("special-cmd", true).await.is_none());
+        assert!(auto_called.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_manual_prompt_has_no_deadline() {
+        let (seen, confirm) = deny_at_recorder(Duration::from_millis(10), true);
+        let (_dir, tools) = tools_for_policy(
+            &lofi_types::ShellPolicyConfig::default(),
+            Some(confirm),
+            None,
+        );
+        // The approval timeout is configured: a manual prompt must ignore it.
+        let tools = tools
+            .with_policy_override(mode_override(lofi_types::BashApprovalMode::AskManual))
+            .with_approval_timeout(Some(Duration::from_secs(5)));
+
+        assert!(tools.check_policy("special-cmd", true).await.is_none());
+        let prompt_deny_at = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap();
+        assert!(prompt_deny_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
     }
 
     #[test]

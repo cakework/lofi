@@ -194,7 +194,9 @@ pub(super) fn confirm_request(
         lofi_core::ConfirmRequest {
             id: 1,
             command: command.to_string(),
-            reason: std::sync::Arc::new(std::sync::Mutex::new(lofi_core::ConfirmReason::Policy)),
+            reason: std::sync::Arc::new(std::sync::Mutex::new(lofi_core::ConfirmReason::Policy {
+                reason: String::new(),
+            })),
             active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             deny_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             respond,

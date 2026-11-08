@@ -594,21 +594,8 @@ fn bash_config_serde_defaults() {
 #[test]
 fn shell_policy_defaults_require_confirmation() {
     let cfg: ShellPolicyConfig = serde_json::from_str("{}").unwrap();
-    assert_eq!(cfg.mode, ShellPolicyMode::Confirm);
+    assert!(!cfg.yolo);
     assert_eq!(cfg.redirects.action, PolicyAction::Ask);
-}
-
-#[test]
-fn shell_policy_presets_remain_deserializable() {
-    for (raw, expected) in [
-        ("read_only", ShellPolicyMode::ReadOnly),
-        ("workspace_write", ShellPolicyMode::WorkspaceWrite),
-        ("unrestricted", ShellPolicyMode::Unrestricted),
-    ] {
-        let json = format!(r#"{{"mode":"{raw}"}}"#);
-        let cfg: ShellPolicyConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg.mode, expected);
-    }
 }
 
 #[test]

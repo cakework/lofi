@@ -1011,7 +1011,7 @@ fn cancelled_tool_turn_replays_as_a_closed_cycle_after_restart() {
         ),
         text_response("cancelled lifecycle recovery answer"),
     ]);
-    let fixture = Fixture::new(&server);
+    let fixture = Fixture::asking(&server);
     let mut first = fixture.spawn(&[]);
 
     first.submit("cancelled lifecycle prompt");
@@ -1077,7 +1077,7 @@ fn cancelled_parallel_tool_calls_replay_as_closed_cycles_after_restart() {
         ]),
         text_response("cancelled parallel recovery answer"),
     ]);
-    let fixture = Fixture::new(&server);
+    let fixture = Fixture::asking(&server);
     let mut first = fixture.spawn(&[]);
 
     first.submit("cancelled parallel prompt");
@@ -1165,7 +1165,7 @@ fn cancelled_parallel_responses_calls_replay_as_closed_cycles_after_restart() {
             "cancelled responses recovery answer",
         ),
     ]);
-    let fixture = Fixture::new(&server);
+    let fixture = Fixture::asking(&server);
     let mut first = fixture.spawn(&["--model", "responses/reasoning"]);
 
     first.submit("cancelled responses prompt");
@@ -1774,7 +1774,7 @@ fn resume_picker_kills_current_session_jobs_and_drops_their_notices() {
         text_response("resume current job started"),
         text_response("resume job clean answer"),
     ]);
-    let fixture = Fixture::new(&server);
+    let fixture = Fixture::asking(&server);
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("resume job saved prompt");
@@ -1977,7 +1977,31 @@ return { job, foreground };"#,
         ),
         text_response("queued job notice handled after cancellation"),
     ]);
-    let fixture = Fixture::new(&server);
+    // The job's loop commands must run without a prompt so the completion
+    // queues while the foreground redirect waits for its answer.
+    let fixture = Fixture::with_policy(
+        &server,
+        r#"[[allow]]
+match = "sleep"
+mode = "prefix"
+
+[[allow]]
+match = "printf"
+mode = "prefix"
+
+[[allow]]
+match = "["
+mode = "prefix"
+
+[[allow]]
+match = "echo"
+mode = "prefix"
+
+[[allow]]
+match = "exec"
+mode = "prefix"
+"#,
+    );
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("start a background job and then run a long foreground command");
