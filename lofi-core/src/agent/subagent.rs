@@ -172,6 +172,9 @@ struct Entry {
     // Spend of the current run, shared with the settle guard: the event
     // drain adds every `RoundUsage` here while the run is live.
     totals: Option<Arc<std::sync::Mutex<ChildUsage>>>,
+    // Spend of the runs this entry already paid for. A resume replaces the
+    // run's own totals, so the fold of a child session adds these back.
+    carried: Rollup,
 }
 
 /// What a running child is doing, for the one-line row its parent shows.
@@ -297,7 +300,7 @@ pub struct SubagentRunning {
     pub activity: String,
     /// The run's resolved model; `None` before the entry is claimed.
     pub model: Option<String>,
-    /// The run's spend so far; `None` until the provider reports usage.
+    /// The child session's spend so far; `None` until a run reports usage.
     pub cost: Option<f64>,
 }
 
@@ -310,7 +313,7 @@ pub struct SubagentLive {
     pub model: Option<String>,
     /// Elapsed milliseconds while the run is live; 0 once it settles.
     pub elapsed_ms: u64,
-    /// The run's spend; after settle it is the terminal cost.
+    /// The child session's spend; after settle it is the terminal cost.
     pub cost: Option<f64>,
     /// The one-line task the run was given. Empty once a resume restores the
     /// entry: the prompt lives in the child transcript, not in this process.
@@ -339,10 +342,15 @@ struct EventLog {
 }
 
 impl Entry {
+    /// The child session's spend so far: what its earlier runs billed plus
+    /// what its record or live totals report for the current one. A
+    /// rehydrated entry holds the last run in its record, not in totals.
     fn spend(&self) -> Option<f64> {
-        let totals = self.totals.as_ref()?;
-        let totals = lock(totals);
-        totals.seen.then_some(totals.cost)
+        let run = entry_usage(self).and_then(|usage| usage.get("cost").and_then(Value::as_f64));
+        if run.is_none() && self.carried.is_empty() {
+            return None;
+        }
+        Some(self.carried.cost + run.unwrap_or(0.0))
     }
 }
 
@@ -1035,6 +1043,9 @@ impl Drop for SettleOnDrop {
         } else {
             Status::Failed
         };
+        // Read the entry's earlier runs before taking the run's own lock:
+        // readers take the entries lock first and then this one.
+        let carried = carried_spend(&self.registry, &self.id);
         // The marker and the spend report do blocking store I/O, so they
         // stay outside the entries lock.
         let persisted = record_settled(
@@ -1047,6 +1058,7 @@ impl Drop for SettleOnDrop {
                 "subagent task ended unexpectedly"
             }),
             &lock(&self.totals),
+            &carried,
         );
         // The ended run never reached the report at the end of
         // run_turn_with_timeout; fold in what the drain saw. The generation
@@ -1457,8 +1469,10 @@ fn list_op(registry: &SubagentRegistry, args: &Value) -> Value {
 /// `subagentUsage`: fold the spend of this session's runs into one record.
 /// `ids` narrows the fold to the named runs; without it every entry and
 /// every evicted run counts.
-/// An entry holds its latest run's spend, so a resumed run reports only its
-/// own tokens.
+/// An entry folds every run of its child session, so a resumed run reports
+/// what that child billed across all of them. A restart prices a child only
+/// when its transcript ends with a settled run: a resume that never settled
+/// restores no spend for it, its earlier runs included.
 /// A run the provider never billed contributes nothing. An evicted entry's
 /// spend is folded from `retired`. An id in neither place is reported as
 /// `missing` instead of failing the call: a rehydrated session restores only
@@ -1566,9 +1580,22 @@ pub(super) struct Rollup {
 
 impl Rollup {
     fn add(&mut self, entry: &Entry) {
+        // The child session's spend: the runs it already paid for, then the
+        // run its record or live totals report.
+        self.add_rollup(&entry.carried);
         if let Some(usage) = entry_usage(entry) {
             self.add_usage(&usage);
         }
+    }
+
+    /// Add another fold onto this one.
+    fn add_rollup(&mut self, other: &Rollup) {
+        self.runs += other.runs;
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.cost += other.cost;
     }
 
     /// Add one run's usage record as one run.
@@ -1605,6 +1632,34 @@ impl Rollup {
             "cache_write_tokens": self.cache_write,
             "cost": self.cost,
         })
+    }
+}
+
+impl From<&Rollup> for lofi_types::RunSpend {
+    fn from(rollup: &Rollup) -> Self {
+        lofi_types::RunSpend {
+            runs: rollup.runs,
+            usage: lofi_types::Usage {
+                input_tokens: rollup.input,
+                output_tokens: rollup.output,
+                cache_read_tokens: rollup.cache_read,
+                cache_write_tokens: rollup.cache_write,
+            },
+            cost: rollup.cost,
+        }
+    }
+}
+
+impl From<&lofi_types::RunSpend> for Rollup {
+    fn from(spent: &lofi_types::RunSpend) -> Self {
+        Rollup {
+            runs: spent.runs,
+            input: spent.usage.input_tokens,
+            output: spent.usage.output_tokens,
+            cache_read: spent.usage.cache_read_tokens,
+            cache_write: spent.usage.cache_write_tokens,
+            cost: spent.cost,
+        }
     }
 }
 
@@ -1953,6 +2008,9 @@ async fn run_task(
         *error = cap_at_boundary(error, DEFAULT_OUTPUT_LIMIT);
     }
     let out = outcome_json(&id, session_id.as_deref(), retained, &model);
+    // Read the entry's earlier runs before taking the run's own lock:
+    // readers take the entries lock first and then this one.
+    let carried = carried_spend(&registry, &id);
     // Durable terminal record: after a restart the rehydration tail scan
     // restores exactly this status and outcome.
     let persisted = record_settled(
@@ -1961,6 +2019,7 @@ async fn run_task(
         out["result"].as_str(),
         out["error"].as_str(),
         &lock(&totals),
+        &carried,
     );
     let notice_text = terminal_notice(&id, status, &out);
     // Terminal write in one critical section: a resume observes either
@@ -2074,6 +2133,16 @@ struct RunOutcome {
     usage: Option<Value>,
 }
 
+/// Spend the entry's earlier runs already billed, for its settle marker.
+/// Empty when the entry is gone: a session switch clears the registry while
+/// a resumed child still runs, and that marker prices its own run alone.
+fn carried_spend(registry: &SubagentRegistry, id: &str) -> Rollup {
+    lock(&registry.entries)
+        .get(id)
+        .map(|entry| entry.carried.clone())
+        .unwrap_or_default()
+}
+
 /// Append the run's terminal record as the leaf of the transcript so a
 /// rehydrate after a restart restores this exact status and outcome instead
 /// of inferring them from the transcript tail. Appended last, so the marker
@@ -2088,6 +2157,7 @@ fn record_settled(
     result: Option<&str>,
     error: Option<&str>,
     totals: &ChildUsage,
+    carried: &Rollup,
 ) -> bool {
     let Some(cursor) = cursor else { return false };
     let (usage, cost) = if totals.seen {
@@ -2108,6 +2178,8 @@ fn record_settled(
     // push the serialized line past the tail window.
     let mut result = result.map(|text| cap_at_boundary(text, DEFAULT_OUTPUT_LIMIT));
     let error = error.map(|text| cap_at_boundary(text, DEFAULT_OUTPUT_LIMIT));
+    // The earlier runs of this child, so a restart still totals them.
+    let prior = (!carried.is_empty()).then(|| lofi_types::RunSpend::from(carried));
     let build = |result: &Option<String>| SessionEvent {
         id: String::new(),
         parent_id: None,
@@ -2117,6 +2189,7 @@ fn record_settled(
             error: error.clone(),
             usage,
             cost,
+            prior,
         },
     };
     let mut event = build(&result);
@@ -2138,12 +2211,21 @@ fn record_settled(
     true
 }
 
-/// Terminal spend of a settled run, read from its own transcript. A dialog
-/// row restored from the store shows the columns a live one has, and the
-/// process that held the cost is gone by then.
+/// Terminal spend of the child session a transcript records, through its
+/// last settled run. A dialog row restored from the store shows the columns
+/// a live one has, and the process that held the cost is gone by then.
 pub(crate) fn settled_cost(path: &Path) -> Option<f64> {
     let run = read_settled_marker(path)?;
-    run.usage?.get("cost")?.as_f64()
+    let spent = run
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.get("cost"))
+        .and_then(Value::as_f64);
+    // An earlier run is still spend, even when this one billed nothing.
+    if spent.is_none() && run.prior.is_empty() {
+        return None;
+    }
+    Some(run.prior.cost + spent.unwrap_or(0.0))
 }
 
 /// A subagent run's terminal record as persisted by the `RunSettled` marker.
@@ -2152,6 +2234,9 @@ struct SettledRun {
     result: Option<String>,
     error: Option<String>,
     usage: Option<Value>,
+    /// Spend of the child session's earlier runs, which a resume claims
+    /// before it installs its own totals.
+    prior: Rollup,
 }
 
 /// Restore the terminal record from the transcript tail. The marker is the
@@ -2179,6 +2264,7 @@ fn read_settled_marker(path: &Path) -> Option<SettledRun> {
         error,
         usage,
         cost,
+        prior,
     } = event.kind
     {
         let usage = usage.map(|usage| {
@@ -2190,11 +2276,13 @@ fn read_settled_marker(path: &Path) -> Option<SettledRun> {
                 "cost": cost.unwrap_or(0.0),
             })
         });
+        let carried = prior.as_ref().map(Rollup::from).unwrap_or_default();
         Some(SettledRun {
             status: Status::from_marker(&status),
             result,
             error,
             usage,
+            prior: carried,
         })
     } else {
         None
@@ -2779,6 +2867,7 @@ async fn prepare(
                 background: notify,
                 model: Some(agent.run_model().label()),
                 totals: None,
+                carried: Rollup::default(),
             },
         );
         id
@@ -2851,6 +2940,36 @@ fn entry_session_id(entry: &Entry) -> Option<String> {
     })
 }
 
+/// Terminal state a transcript restores: the status and outcome its marker
+/// records, and the spend of the runs that marker carries. A transcript
+/// whose last line is not a marker restores neither.
+fn restore_settled(path: &Path) -> (Status, Rollup, RunOutcome) {
+    match read_settled_marker(path) {
+        Some(settled) => (
+            settled.status,
+            settled.prior,
+            RunOutcome {
+                status: settled.status,
+                result: settled.result,
+                error: settled.error,
+                full_bytes: None,
+                usage: settled.usage,
+            },
+        ),
+        None => (
+            Status::Cancelled,
+            Rollup::default(),
+            RunOutcome {
+                status: Status::Cancelled,
+                result: None,
+                error: Some("lofi exited before the run settled".to_string()),
+                full_bytes: None,
+                usage: None,
+            },
+        ),
+    }
+}
+
 /// Build one registry entry from a transcript: identity, model, and the
 /// persisted outcome only. The history replays on the first resume; the
 /// system prompt comes from the replayed lineage (a header-level read could
@@ -2866,28 +2985,7 @@ fn restore_entry(
     // file stem stands in so they stay resumable.
     let id = meta.run_id.clone().unwrap_or_else(|| file.id());
     let session_id = file.id();
-    let (status, outcome) = match read_settled_marker(file.path()) {
-        Some(settled) => (
-            settled.status,
-            RunOutcome {
-                status: settled.status,
-                result: settled.result,
-                error: settled.error,
-                full_bytes: None,
-                usage: settled.usage,
-            },
-        ),
-        None => (
-            Status::Cancelled,
-            RunOutcome {
-                status: Status::Cancelled,
-                result: None,
-                error: Some("lofi exited before the run settled".to_string()),
-                full_bytes: None,
-                usage: None,
-            },
-        ),
-    };
+    let (status, carried, outcome) = restore_settled(file.path());
     // Restore the model the transcript ran with. When it is gone (provider
     // or model removed from the config), keep the session model and say so
     // on the entry instead of failing the restore.
@@ -2973,6 +3071,7 @@ fn restore_entry(
         background: false,
         model: Some(model),
         totals: None,
+        carried,
     };
     (id, entry)
 }
@@ -3108,8 +3207,12 @@ fn prepare_resume(
         // The previous run's last words are not this run's live line.
         entry.activity = Activity::default();
         entry.task = task;
-        // The previous run's spend belongs to it; this run installs its own
-        // accumulator when it starts.
+        // The run this resume replaces moves onto the entry's earlier runs,
+        // so a fold of the child session still counts what it billed. This
+        // run installs its own accumulator when it starts.
+        if let Some(spent) = entry_usage(entry) {
+            entry.carried.add_usage(&spent);
+        }
         entry.totals = None;
         // A previous kill barred this owner from acquiring jobs; the new run
         // needs them again.

@@ -559,8 +559,8 @@ impl ToolExecutor {
                     let spend = spend.clone();
                     Box::pin(async move {
                         // A resume installs the new run's totals over the
-                        // entry's, so the spend of the background run this
-                        // call started is read before the hook replaces it.
+                        // entry's, so what the background run this call
+                        // started billed is read before the hook replaces it.
                         let replaced = match op {
                             lofi_code::SubagentOp::Run => {
                                 let id = args.get("id").and_then(serde_json::Value::as_str);
@@ -595,9 +595,10 @@ impl ToolExecutor {
                             // does not. Every run body that reports usage was
                             // billed, completed or not.
                             lofi_code::SubagentOp::Run if out.get("model").is_some() => {
-                                // The resume left the entry holding only this
-                                // run, so the run it replaced is priced from
-                                // the snapshot and stops being a child to fold.
+                                // The resume left the entry's outcome naming
+                                // only this run, so the run it replaced is
+                                // priced from the snapshot and stops being a
+                                // child to fold.
                                 if let Some(replaced) = &replaced {
                                     spend.add_run(replaced);
                                 }
@@ -963,8 +964,8 @@ struct ChildSpend {
 }
 
 impl ChildSpend {
-    /// Take one run body's usage. A resume replaces its entry's totals, so the
-    /// body is the only place that run's spend survives.
+    /// Take one run body's usage. A resume installs the new run's totals over
+    /// the entry's, so a run's body is where its own spend is read from.
     fn add_run(&mut self, body: &serde_json::Value) {
         if let Some(usage) = body.get("usage") {
             self.awaited.add_usage(usage);

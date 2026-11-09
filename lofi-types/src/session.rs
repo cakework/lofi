@@ -169,12 +169,28 @@ pub enum SessionEventKind {
         usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost: Option<f64>,
+        /// Spend of the child session's runs before this one, so the
+        /// transcript totals the session and not its last run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior: Option<RunSpend>,
     },
     /// An event variant this build does not know about — typically a marker
     /// written by a newer (or older, pre-release) binary. The transcript
     /// stays loadable; consumers ignore these.
     #[serde(other)]
     Unknown,
+}
+
+/// Spend a child session accumulated before one run, as a settle marker
+/// keeps it: how many runs produced the totals, and what they billed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunSpend {
+    #[serde(default)]
+    pub runs: u64,
+    #[serde(default)]
+    pub usage: Usage,
+    #[serde(default)]
+    pub cost: f64,
 }
 
 /// One pending wake-up timer as the transcript records it. Times are unix

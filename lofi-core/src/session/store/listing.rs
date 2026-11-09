@@ -50,9 +50,9 @@ impl SessionFile {
         quick_entry_preview(&self.path)
     }
 
-    /// Terminal spend of the run this transcript records. The settle marker
-    /// is the physical last line, so one bounded tail read finds it; a run
-    /// still working has none.
+    /// Terminal spend of the child session this transcript records, through
+    /// its last settled run. The settle marker is the physical last line, so
+    /// one bounded tail read finds it; a run still working has none.
     #[must_use]
     pub fn settled_cost(&self) -> Option<f64> {
         crate::agent::settled_cost(&self.path)
@@ -670,10 +670,52 @@ mod tests {
                 error: None,
                 usage: Some(Usage::default()),
                 cost: Some(0.0412),
+                prior: None,
             },
         };
         let file = settled_file(&tmp, Some(&event));
         assert_eq!(file.settled_cost(), Some(0.0412));
+
+        // A resumed run's marker carries the child session's earlier runs, so
+        // the row totals them and not just the last run.
+        let resumed = SessionEvent {
+            id: String::new(),
+            parent_id: None,
+            kind: SessionEventKind::RunSettled {
+                status: "completed".into(),
+                result: Some("ok".into()),
+                error: None,
+                usage: Some(Usage::default()),
+                cost: Some(0.25),
+                prior: Some(lofi_types::RunSpend {
+                    runs: 2,
+                    usage: Usage::default(),
+                    cost: 0.5,
+                }),
+            },
+        };
+        let file = settled_file(&tmp, Some(&resumed));
+        assert_eq!(file.settled_cost(), Some(0.75));
+
+        // A resumed run the provider never billed is still earlier spend.
+        let unbilled = SessionEvent {
+            id: String::new(),
+            parent_id: None,
+            kind: SessionEventKind::RunSettled {
+                status: "failed".into(),
+                result: None,
+                error: Some("no route".into()),
+                usage: None,
+                cost: None,
+                prior: Some(lofi_types::RunSpend {
+                    runs: 1,
+                    usage: Usage::default(),
+                    cost: 0.5,
+                }),
+            },
+        };
+        let file = settled_file(&tmp, Some(&unbilled));
+        assert_eq!(file.settled_cost(), Some(0.5));
 
         // A run that never settled has no cost to show.
         let bare = settled_file(&tmp, None);

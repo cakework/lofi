@@ -270,7 +270,8 @@ return "done";"#,
 #[test]
 fn a_resumed_background_child_prices_both_of_its_runs() {
     // The background run's spend lives in its registry entry, and the resume
-    // replaces it. The exec result must still report both runs.
+    // moves it onto the entry's earlier runs. The exec result must still
+    // report both runs.
     let server = MockServer::start(vec![
         tool_response(
             "child-resume-call",

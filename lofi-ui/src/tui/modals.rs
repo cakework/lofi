@@ -256,8 +256,8 @@ pub(crate) struct SubagentRow {
     /// The run's model: the registry knows the one it started, and a row read
     /// from the store takes it from the transcript header.
     pub(crate) model: Option<String>,
-    /// The run's spend: live from the registry, terminal from the settle
-    /// marker a row read from the store keeps.
+    /// The child session's spend: live from the registry, terminal from the
+    /// settle marker a row read from the store keeps.
     pub(crate) cost: Option<f64>,
     /// Elapsed time of a live run, 0 for a settled one.
     pub(crate) elapsed_ms: u64,

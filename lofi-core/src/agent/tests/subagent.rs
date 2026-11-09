@@ -1147,19 +1147,93 @@ async fn usage_rollup_folds_each_retained_entry() {
     assert_eq!(one["input_tokens"], json!(11), "{one}");
     assert_eq!(one["missing"], json!(["no-such-run"]), "{one}");
 
-    // A resume replaces the entry's totals, so the entry reports the run it
-    // holds now.
+    // A resume adds the run it replaces to the entry's earlier runs, so the
+    // fold prices the child session and not just the run in flight.
     let again = hook(SubagentOp::Run, json!({ "id": first_id, "prompt": "more" })).await;
     assert_eq!(again["ok"], json!(true), "{again}");
     let resumed = hook(SubagentOp::Usage, json!({ "ids": [first_id] })).await;
-    assert_eq!(resumed["runs"], json!(1), "{resumed}");
-    assert_eq!(resumed["input_tokens"], json!(9), "{resumed}");
+    assert_eq!(resumed["runs"], json!(2), "{resumed}");
+    assert_eq!(resumed["input_tokens"], json!(20), "{resumed}");
     let all = hook(SubagentOp::Usage, json!({})).await;
-    assert_eq!(all["input_tokens"], json!(14), "{all}");
+    assert_eq!(all["input_tokens"], json!(25), "{all}");
+    assert_eq!(all["runs"], json!(3), "{all}");
 
     let bad = hook(SubagentOp::Usage, json!({ "ids": "x" })).await;
     assert_eq!(bad["ok"], json!(false), "{bad}");
     assert_eq!(bad["status"], json!("failed"), "{bad}");
+}
+
+// The child's transcript is the child session: its settle marker prices the
+// run it records plus the runs before it, so a dialog row and a restart both
+// see what the session spent, not what its last run did.
+#[tokio::test]
+async fn a_resumed_child_transcript_totals_both_runs() {
+    let _env = env_lock();
+    let (_state, state_path) = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let round = |input: u64| {
+        vec![
+            StreamingEvent::TextDelta("sub result".to_string()),
+            StreamingEvent::Done {
+                usage: Usage {
+                    input_tokens: input,
+                    ..Usage::default()
+                },
+                stop_reason: None,
+            },
+        ]
+    };
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    // A priced model: one million input tokens bill at the input price.
+    agent.model.input_price = Some(3.0);
+    agent.model.output_price = Some(15.0);
+    agent.provider = Arc::new(MockProvider::recording(vec![
+        round(1_000_000),
+        round(500_000),
+    ]));
+    agent.subagents().set_parent_session("parent-x");
+    let hook = agent.subagent_hook().unwrap();
+
+    let first = hook(SubagentOp::Run, json!({ "prompt": "a" })).await;
+    let id = first["id"].as_str().unwrap().to_string();
+    let again = hook(SubagentOp::Run, json!({ "id": id, "prompt": "b" })).await;
+    assert_eq!(again["status"], json!("completed"), "{again}");
+
+    let files = find_jsonl(&state_path);
+    assert_eq!(files.len(), 1, "{files:?}");
+
+    // The fold of the live entry prices both runs.
+    let folded = hook(SubagentOp::Usage, json!({ "ids": [id] })).await;
+    assert_eq!(folded["runs"], json!(2), "{folded}");
+    let folded_cost = folded["cost"].as_f64().unwrap();
+    assert!((folded_cost - 4.5).abs() < 1e-9, "{folded}");
+
+    // So does the fold of an entry a restart restored: the marker's earlier
+    // runs belong to the new entry too.
+    let restarted = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    restarted.subagents().set_parent_session("parent-x");
+    restarted
+        .subagents()
+        .rehydrate(&restarted, &support(dir.path()));
+    let hook = restarted.subagent_hook().unwrap();
+    let restored = hook(SubagentOp::Usage, json!({ "ids": [id] })).await;
+    assert_eq!(restored["runs"], json!(2), "{restored}");
+    let restored_cost = restored["cost"].as_f64().unwrap();
+    assert!((restored_cost - 4.5).abs() < 1e-9, "{restored}");
+
+    // The dialog row takes a settled entry's cost from the entry, so it must
+    // agree with the marker instead of showing the earlier runs alone.
+    let row = restarted
+        .subagents()
+        .live()
+        .into_iter()
+        .find(|run| run.id == id)
+        .expect("the restart restored the entry");
+    let row_cost = row.cost.expect("the restored row keeps a cost");
+    assert!(
+        (row_cost - 4.5).abs() < 1e-9,
+        "the row prices both runs: {row_cost}"
+    );
 }
 
 #[tokio::test]
@@ -2253,6 +2327,63 @@ async fn the_settled_outcome_names_the_model() {
     )
     .await;
     assert_eq!(out["model"], json!("p/m"), "{out}");
+}
+
+// A resume installs the new run's totals over the entry's. The row names the
+// child session, so it must show both runs and not fall back to what the
+// resumed run alone billed.
+#[tokio::test]
+async fn a_resume_adds_to_the_child_spend_its_row_shows() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.model.input_price = Some(3.0);
+    agent.model.output_price = Some(15.0);
+    agent.provider = Arc::new(SpendThenPendProvider);
+    let hook = agent.subagent_hook().unwrap();
+    let registry = agent.subagents();
+
+    // The first run times out inside its tool call, having billed a round.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "spend one", "timeout_ms": 100 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("timed_out"), "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let spent = registry
+        .live()
+        .into_iter()
+        .find(|run| run.id == id)
+        .unwrap()
+        .cost;
+    assert_eq!(spent, Some(3.0), "the first run's round is priced");
+
+    // The resume replays the rolled-back round, bills another one, and stops
+    // the same way.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "id": id, "prompt": "spend two", "timeout_ms": 100 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("timed_out"), "{out}");
+    let run = out["usage"]["cost"].as_f64().unwrap();
+    assert!(
+        (run - 3.0).abs() < 1e-9,
+        "the resumed run prices itself: {out}"
+    );
+    let kept = registry
+        .live()
+        .into_iter()
+        .find(|run| run.id == id)
+        .unwrap()
+        .cost;
+    let kept = kept.expect("the row keeps a cost");
+    assert!(
+        (kept - 6.0).abs() < 1e-9,
+        "both runs are on the row: {kept}"
+    );
 }
 
 #[tokio::test]

@@ -549,11 +549,14 @@ fan-out reports a total instead of summing child usage by hand.
   a fold never removes a record.
 
 **Returns:** `{ ok, runs, input_tokens, output_tokens, cache_read_tokens,
-cache_write_tokens, cost, missing? }`. `runs` counts the entries that
+cache_write_tokens, cost, missing? }`. `runs` counts the runs that
 reported usage; a run whose provider never reported it contributes
-nothing. An entry keeps the spend of its latest run: a resume replaces the
-previous run's totals, so the entry reports only what that run spent. A
-run still in flight reports what it has spent so far. Each run's own
+nothing. An entry folds every run of its child session: a resume adds to
+the spend the entry reports instead of replacing it, so a resumed child
+names what the child spent across its runs. A run still in flight reports
+what the child has spent through it. A restart prices a child only when
+its transcript ends with a settled run: after a resume that never
+settled, the child shows no spend, earlier runs included. Each run's own
 `usage` in its result stays available for debugging.
 
 The same fold arrives without a call: an exec result carries `subagents`
