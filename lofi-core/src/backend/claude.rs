@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +39,31 @@ pub(super) fn effort_flag(level: &lofi_types::ThinkingLevel) -> Option<String> {
     (*level != lofi_types::ThinkingLevel::Off).then(|| format!("--effort={}", level.as_str()))
 }
 
+/// One frame, bounded by the gap since the last one rather than by the turn,
+/// so a run that keeps streaming has no deadline at all. `reason` names the
+/// silence in the failure, so a wedged CLI says which deadline ran out.
+async fn frame_within<T>(
+    idle: Duration,
+    reason: &str,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(idle, read)
+        .await
+        .map_err(|_| Error::State(reason.to_owned()))?
+}
+
+/// The silence that fails a turn. Zero is rejected: a bound of nothing
+/// would fail every turn the child did not answer inside one poll.
+fn resolve_frame_idle(gap: Option<Duration>) -> Result<Duration> {
+    match gap {
+        Some(idle) if idle.is_zero() => Err(Error::Config(
+            "frame_idle_timeout_ms must be greater than zero".into(),
+        )),
+        Some(idle) => Ok(idle),
+        None => Ok(FRAME_IDLE_TIMEOUT),
+    }
+}
+
 /// The `message.content` of one user frame: a plain string when the turn is
 /// text-only, an array of Anthropic blocks when it carries images.
 pub(super) fn content_value(text: &str, attachments: &[lofi_types::ContentBlock]) -> Value {
@@ -73,6 +99,13 @@ const NO_CHILD_COMPACTION: &str = "1000000";
 /// written. The bridge dies when the child exits, which can follow the result
 /// frame by less than one poll: the turn prefers the answer for this long.
 const BRIDGE_GRACE: Duration = Duration::from_secs(2);
+/// How long the CLI may send no frame before the turn is failed. A gap, not a
+/// turn length: a long run that keeps answering streams frames the whole way,
+/// and only its own tool calls go quiet. Kept wide because a silent stretch is
+/// indistinguishable from a large tool call, and the CLI bounds those itself.
+const FRAME_IDLE_TIMEOUT: Duration = Duration::from_hours(2);
+/// The handshake comes before any tool work, so it has no reason to be slow.
+const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Every flag pins the CLI to the exec bridge: no built-in tools, no user
 /// settings, no hooks, and no slash commands.
@@ -155,6 +188,9 @@ pub(super) struct Launch<'a> {
     /// The prompt the child runs under. A fork carries its own, so a subagent
     /// role prompt reaches a CLI turn the same way it reaches a provider one.
     pub system_prompt: &'a str,
+    /// The silence that fails a turn. `None` uses `FRAME_IDLE_TIMEOUT`; zero
+    /// is rejected when the session opens.
+    pub frame_idle: Option<Duration>,
 }
 
 #[allow(clippy::struct_excessive_bools)] // transport state flags
@@ -166,6 +202,8 @@ pub(super) struct ClaudeSession {
     bridge: Bridge,
     id: String,
     initialized: bool,
+    /// How long the child may send no frame before the turn fails.
+    frame_idle: Duration,
     /// Whether the current turn's prompt reached the CLI's stdin. A frame
     /// over the pipe limit or a dead child leaves it false.
     prompt_written: bool,
@@ -211,6 +249,7 @@ impl ClaudeSession {
             effort,
             resume,
             system_prompt,
+            frame_idle,
         } = launch;
         if command.trim().is_empty() {
             return Err(Error::Config("empty Claude Code command".into()));
@@ -218,6 +257,7 @@ impl ClaudeSession {
         if system_prompt.trim().is_empty() {
             return Err(Error::Config("empty Claude Code system prompt".into()));
         }
+        let frame_idle = resolve_frame_idle(frame_idle)?;
         let id = match resume {
             Some(id) => uuid::Uuid::parse_str(id)
                 .map_err(|_| Error::State("invalid Claude Code session ID".into()))?,
@@ -291,6 +331,7 @@ impl ClaudeSession {
             bridge,
             id,
             initialized: false,
+            frame_idle,
             prompt_written: false,
             model: model.map(str::to_owned),
             poisoned: false,
@@ -404,8 +445,7 @@ impl ClaudeSession {
                         Err(_) => Err(error),
                     },
                 },
-                result = tokio::time::timeout(Duration::from_hours(2), &mut prompt) => result
-                    .unwrap_or_else(|_| Err(Error::State("Claude Code turn timed out".into()))),
+                result = &mut prompt => result,
             };
             (result, lost_child)
         };
@@ -517,6 +557,22 @@ impl ClaudeSession {
         Ok(())
     }
 
+    /// The next frame from the CLI. The bound is on the gap between frames,
+    /// not on the turn: a turn that keeps sending frames is working, and one
+    /// that says nothing this long is wedged. A silent stretch is one of the
+    /// CLI's own tool calls, whose own timeouts bound the work inside it.
+    async fn read_frame(&mut self) -> Result<Value> {
+        let (idle, reason) = if self.initialized {
+            (
+                self.frame_idle,
+                "Claude Code sent no frame before the idle deadline",
+            )
+        } else {
+            (INIT_TIMEOUT, "Claude Code initialization timed out")
+        };
+        frame_within(idle, reason, rpc::read_json(&mut self.output)).await
+    }
+
     async fn prompt_inner(&mut self, frame: Value, context: &ToolCallContext) -> Result<String> {
         self.round_usage = None;
         self.stop_reason = None;
@@ -532,13 +588,7 @@ impl ClaudeSession {
         .await?;
         self.prompt_written = true;
         loop {
-            let message = if self.initialized {
-                rpc::read_json(&mut self.output).await?
-            } else {
-                tokio::time::timeout(Duration::from_secs(30), rpc::read_json(&mut self.output))
-                    .await
-                    .map_err(|_| Error::State("Claude Code initialization timed out".into()))??
-            };
+            let message = self.read_frame().await?;
             if let Some(id) = message["session_id"].as_str() {
                 if id != self.id {
                     return Err(Error::State("Claude Code changed session identity".into()));

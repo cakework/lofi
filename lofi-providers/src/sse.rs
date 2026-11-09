@@ -162,13 +162,26 @@ struct SseState<M> {
     /// `true` once the upstream byte stream has ended.
     exhausted: bool,
     done: bool,
+    body_idle: std::time::Duration,
     mapper: M,
 }
 
-pub(crate) fn map_sse_response<M: SseMapper>(resp: reqwest::Response, mapper: M) -> EventStream {
-    let bytes = Box::pin(resp.bytes_stream());
+pub(crate) fn map_sse_response<M: SseMapper>(
+    resp: reqwest::Response,
+    body_idle: std::time::Duration,
+    mapper: M,
+) -> EventStream {
+    map_sse_stream(Box::pin(resp.bytes_stream()), body_idle, mapper)
+}
+
+/// Map a decoded chunk stream, so a stall test does not need a live socket.
+fn map_sse_stream<S, M>(bytes: S, body_idle: std::time::Duration, mapper: M) -> EventStream
+where
+    S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
+    M: SseMapper,
+{
     let state = SseState {
-        bytes,
+        bytes: Box::pin(bytes),
         transport_chunk: None,
         transport_start: 0,
         pending_bytes: Vec::new(),
@@ -179,6 +192,7 @@ pub(crate) fn map_sse_response<M: SseMapper>(resp: reqwest::Response, mapper: M)
         pending_done: None,
         exhausted: false,
         done: false,
+        body_idle,
         mapper,
     };
     futures::stream::unfold(state, step).boxed()
@@ -230,11 +244,25 @@ async fn step<M: SseMapper>(
             }
             continue;
         }
-        match state.bytes.next().await {
-            Some(Ok(chunk)) => {
+        // Response headers prove the connection, not that chunks keep coming.
+        // A stall is a transport failure, not a turn outcome, so the retry
+        // policy must see it as one.
+        let idle = state.body_idle;
+        match tokio::time::timeout(idle, state.bytes.next()).await {
+            Err(_) => {
+                state.done = true;
+                return Some((
+                    Err(Error::ProviderTimeout {
+                        phase: lofi_error::ProviderPhase::ResponseBody,
+                        timeout_ms: idle.as_millis() as u64,
+                    }),
+                    state,
+                ));
+            }
+            Ok(Some(Ok(chunk))) => {
                 state.transport_chunk = Some(chunk);
             }
-            Some(Err(error)) => {
+            Ok(Some(Err(error))) => {
                 return Some((
                     Err(provider_transport_error(
                         error,
@@ -243,7 +271,7 @@ async fn step<M: SseMapper>(
                     state,
                 ));
             }
-            None => {
+            Ok(None) => {
                 state.exhausted = true;
                 flush_tail(&mut state);
             }
@@ -459,6 +487,7 @@ mod tests {
             pending_done: None,
             exhausted: false,
             done: false,
+            body_idle: std::time::Duration::from_mins(5),
             mapper: text_mapper,
         };
         let stream = futures::stream::unfold(state, step);
@@ -480,6 +509,7 @@ mod tests {
             pending_done: None,
             exhausted: false,
             done: false,
+            body_idle: std::time::Duration::from_mins(5),
             mapper: text_mapper,
         };
         let stream = futures::stream::unfold(state, step);
@@ -563,7 +593,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_response_body_has_no_deadline() {
+    async fn idle_response_body_times_out() {
         let state = SseState {
             bytes: Box::pin(futures::stream::pending()),
             transport_chunk: None,
@@ -576,15 +606,45 @@ mod tests {
             pending_done: None,
             exhausted: false,
             done: false,
+            body_idle: std::time::Duration::from_millis(50),
             mapper: text_mapper,
         };
 
         let stream = futures::stream::unfold(state, step);
         futures::pin_mut!(stream);
 
-        let next = tokio::time::timeout(std::time::Duration::from_mins(1), stream.next()).await;
+        let next = stream.next().await;
 
-        assert!(next.is_err());
+        assert!(matches!(
+            next,
+            Some(Err(Error::ProviderTimeout {
+                phase: lofi_error::ProviderPhase::ResponseBody,
+                timeout_ms: 50,
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stalls_between_chunks_fails() {
+        let first =
+            futures::stream::iter([Ok(Bytes::copy_from_slice(b"data: {\"text\":\"hi\"}\n\n"))]);
+        let bytes = first.chain(futures::stream::pending::<
+            std::result::Result<Bytes, reqwest::Error>,
+        >());
+        let stream = map_sse_stream(bytes, std::time::Duration::from_millis(50), text_mapper);
+        let out: Vec<Result<StreamingEvent>> = stream.collect().await;
+
+        assert_eq!(
+            *out[0].as_ref().unwrap(),
+            StreamingEvent::TextDelta("hi".to_string())
+        );
+        assert!(matches!(
+            out[1],
+            Err(Error::ProviderTimeout {
+                phase: lofi_error::ProviderPhase::ResponseBody,
+                timeout_ms: 50,
+            })
+        ));
     }
 
     #[tokio::test]
@@ -690,6 +750,7 @@ mod tests {
             pending_done: None,
             exhausted: false,
             done: false,
+            body_idle: std::time::Duration::from_mins(5),
             mapper: DeferredDoneMapper,
         };
         let events = futures::stream::unfold(state, step)
@@ -717,6 +778,7 @@ mod tests {
             pending_done: None,
             exhausted: false,
             done: false,
+            body_idle: std::time::Duration::from_mins(5),
             mapper: DeferredDoneMapper,
         };
         let events = futures::stream::unfold(state, step)
@@ -744,6 +806,7 @@ mod tests {
             pending_done: None,
             exhausted: false,
             done: false,
+            body_idle: std::time::Duration::from_mins(5),
             mapper: DoneMapper,
         };
         let events = tokio::time::timeout(

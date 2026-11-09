@@ -396,6 +396,12 @@ fn fake_claude() {
             fake_claude_init(&mut output, &id, text);
             initialized = true;
         }
+        // A child that answers the handshake and then says nothing: the turn
+        // must end on the frame bound, not on a clock over the whole turn.
+        if text == "silent" {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            panic!("adapter did not bound a silent CLI");
+        }
         if text.starts_with("extra ") {
             std::thread::sleep(std::time::Duration::from_secs(10));
             panic!("adapter did not reject extra capabilities");
@@ -659,6 +665,44 @@ fn claude_reported_model_is_saved_for_failed_and_cancelled_turns() {
         tui.submit("/quit");
         tui.wait_exit();
     }
+}
+
+fn claude_fixture_with_frame_idle(value: &str) -> Fixture {
+    let fixture = claude_fixture();
+    let config = std::fs::read_to_string(&fixture.config).unwrap().replace(
+        "[backends.claude]\n",
+        &format!("[backends.claude]\nframe_idle_timeout_ms = {value}\n"),
+    );
+    std::fs::write(&fixture.config, config).unwrap();
+    fixture
+}
+
+#[test]
+fn claude_stops_a_turn_whose_child_stops_sending_frames() {
+    let fixture = claude_fixture_with_frame_idle("500");
+
+    let output = fixture.output(&["--print", "silent"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no frame before the idle deadline"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn claude_rejects_a_zero_frame_idle_timeout() {
+    let fixture = claude_fixture_with_frame_idle("0");
+
+    let output = fixture.output(&["--print", "hello"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("frame_idle_timeout_ms must be greater than zero"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

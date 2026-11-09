@@ -17,6 +17,7 @@ pub(crate) struct GoogleGenerativeAiProvider {
     pub(crate) headers: HashMap<String, String>,
     pub(crate) client: reqwest::Client,
     pub(crate) response_start_timeout: std::time::Duration,
+    pub(crate) body_idle: std::time::Duration,
 }
 
 #[async_trait]
@@ -41,6 +42,7 @@ impl super::Provider for GoogleGenerativeAiProvider {
         let response = send_stream_request(request, self.response_start_timeout).await?;
         Ok(map_sse_response(
             response,
+            self.body_idle,
             IrSseMapper::<GoogleGenerativeAiIr>::new(model),
         ))
     }

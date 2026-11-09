@@ -437,6 +437,7 @@ fn config_round_trips() {
             auto_models: None,
             no_auth: false,
             response_start_timeout_ms: 90_000,
+            body_idle_timeout_ms: 300_000,
             thinking_level: None,
             thinking_levels: Vec::new(),
             service_tier: None,

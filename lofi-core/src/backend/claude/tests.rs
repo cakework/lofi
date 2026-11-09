@@ -83,3 +83,47 @@ fn content_value_sends_images_as_base64_blocks() {
     assert_eq!(value[1]["source"]["media_type"], "image/png");
     assert_eq!(value[1]["source"]["data"], "AQID");
 }
+
+// A turn used to end at a fixed wall clock, which killed runs that were
+// still working. The term is the silence between frames.
+#[tokio::test(start_paused = true)]
+async fn a_silent_cli_ends_the_turn_at_the_frame_idle_deadline() {
+    let error = frame_within(
+        FRAME_IDLE_TIMEOUT,
+        "Claude Code sent no frame before the idle deadline",
+        std::future::pending::<Result<Value>>(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("no frame"), "{error}");
+}
+
+#[test]
+fn an_unset_frame_idle_uses_the_wide_default() {
+    assert_eq!(resolve_frame_idle(None).unwrap(), FRAME_IDLE_TIMEOUT);
+    assert_eq!(
+        resolve_frame_idle(Some(Duration::from_millis(500))).unwrap(),
+        Duration::from_millis(500)
+    );
+}
+
+#[test]
+fn a_zero_frame_idle_is_rejected() {
+    let error = resolve_frame_idle(Some(Duration::ZERO)).unwrap_err();
+    assert!(error.to_string().contains("greater than zero"), "{error}");
+}
+
+#[tokio::test]
+async fn a_frame_that_arrives_is_the_turn_continuing() {
+    let frame = frame_within(
+        FRAME_IDLE_TIMEOUT,
+        "Claude Code sent no frame before the idle deadline",
+        async { Ok(json!({"type": "assistant"})) },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(frame["type"], "assistant");
+}

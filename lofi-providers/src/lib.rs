@@ -54,12 +54,18 @@ pub trait Provider: Send + Sync {
 /// `base_url`; per-model endpoint URLs are resolved earlier by the model
 /// registry. An unknown `api` is a config error rather than a transport one.
 /// # Errors
-/// Returns [`Error::Config`] for an invalid response-start timeout or [`Error::Http`]
-/// if the shared HTTP client cannot be constructed.
+/// Returns [`Error::Config`] for an invalid response-start or body-idle
+/// timeout, or [`Error::Http`] if the shared HTTP client cannot be
+/// constructed.
 pub fn open(api: Api, cfg: &ProviderConfig) -> Result<Box<dyn Provider>> {
     if cfg.response_start_timeout_ms == 0 {
         return Err(Error::Config(
             "response_start_timeout_ms must be greater than zero".to_string(),
+        ));
+    }
+    if cfg.body_idle_timeout_ms == 0 {
+        return Err(Error::Config(
+            "body_idle_timeout_ms must be greater than zero".to_string(),
         ));
     }
     let base_url = cfg
@@ -71,6 +77,7 @@ pub fn open(api: Api, cfg: &ProviderConfig) -> Result<Box<dyn Provider>> {
     let (api_key, headers) = effective_credentials(cfg);
     let client = http_client()?;
     let response_start_timeout = std::time::Duration::from_millis(cfg.response_start_timeout_ms);
+    let body_idle = std::time::Duration::from_millis(cfg.body_idle_timeout_ms);
     let provider: Box<dyn Provider> = match api {
         // A decision API answers typed questions, never a chat turn; the
         // chat path must fail loudly instead of sending a completion to an
@@ -87,6 +94,7 @@ pub fn open(api: Api, cfg: &ProviderConfig) -> Result<Box<dyn Provider>> {
             headers,
             client,
             response_start_timeout,
+            body_idle,
         }),
         Api::OpenAiResponses => Box::new(OpenAiResponsesProvider {
             base_url,
@@ -94,6 +102,7 @@ pub fn open(api: Api, cfg: &ProviderConfig) -> Result<Box<dyn Provider>> {
             headers,
             client,
             response_start_timeout,
+            body_idle,
         }),
         Api::AnthropicMessages => Box::new(AnthropicMessagesProvider {
             base_url,
@@ -101,6 +110,7 @@ pub fn open(api: Api, cfg: &ProviderConfig) -> Result<Box<dyn Provider>> {
             headers,
             client,
             response_start_timeout,
+            body_idle,
         }),
         Api::GoogleGenerativeAi => Box::new(GoogleGenerativeAiProvider {
             base_url,
@@ -108,6 +118,7 @@ pub fn open(api: Api, cfg: &ProviderConfig) -> Result<Box<dyn Provider>> {
             headers,
             client,
             response_start_timeout,
+            body_idle,
         }),
     };
     Ok(provider)
@@ -563,6 +574,7 @@ mod tests {
             auto_models: None,
             no_auth: false,
             response_start_timeout_ms: 90_000,
+            body_idle_timeout_ms: 300_000,
             thinking_level: None,
             thinking_levels: Vec::new(),
             service_tier: None,
@@ -613,6 +625,7 @@ mod tests {
             headers: HashMap::from([("x-custom".to_string(), "yes".to_string())]),
             client: http_client().unwrap(),
             response_start_timeout: std::time::Duration::from_secs(90),
+            body_idle: std::time::Duration::from_mins(5),
         };
         assert_eq!(oc.base_url, "https://api.example.com");
     }
@@ -638,6 +651,18 @@ mod tests {
             panic!("zero response start timeout should fail");
         };
         assert!(matches!(error, Error::Config(message) if message.contains("greater than zero")));
+    }
+
+    #[test]
+    fn open_rejects_zero_body_idle_timeout() {
+        let mut c = cfg();
+        c.body_idle_timeout_ms = 0;
+        let Err(error) = open(Api::OpenAiCompletions, &c) else {
+            panic!("zero body idle timeout should fail");
+        };
+        assert!(
+            matches!(error, Error::Config(message) if message.contains("body_idle_timeout_ms"))
+        );
     }
 
     #[test]

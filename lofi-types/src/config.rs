@@ -695,6 +695,11 @@ pub enum BackendConfig {
         /// exactly as a provider model does.
         #[serde(default = "default_claude_context_window")]
         context_window: Option<u64>,
+        /// How long the child may send no frame before its turn fails. A turn
+        /// has no length limit, so this bounds the silence between frames,
+        /// not the turn; unset uses the wide default.
+        #[serde(default)]
+        frame_idle_timeout_ms: Option<u64>,
     },
 }
 
@@ -717,6 +722,16 @@ impl BackendConfig {
     pub fn context_window(&self) -> Option<u64> {
         match self {
             Self::ClaudeCode { context_window, .. } => *context_window,
+        }
+    }
+
+    #[must_use]
+    pub fn frame_idle_timeout_ms(&self) -> Option<u64> {
+        match self {
+            Self::ClaudeCode {
+                frame_idle_timeout_ms,
+                ..
+            } => *frame_idle_timeout_ms,
         }
     }
 }

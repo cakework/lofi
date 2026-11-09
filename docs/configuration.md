@@ -122,6 +122,7 @@ The supported backend type is `claude-code`.
 | `model` | string | none | Initial model. Also included in the model list. |
 | `models` | string array | empty | Additional model choices. |
 | `context_window` | integer | `200000` | Context window Lofi budgets before the child reports its own. |
+| `frame_idle_timeout_ms` | positive integer | `7200000` | Longest silence a turn tolerates. A turn has no length limit; a child that sends no frame for this long fails its turn and is stopped. |
 
 For a specific installation, set `command`:
 
@@ -145,6 +146,11 @@ Managed Claude Code policy can still apply.
 The `init` frame must report only the `exec` tool and only the connected
 Lofi MCP server; any other tool or server fails the turn, and the error
 names what the child reported.
+
+A turn has no length limit: a child that keeps sending frames keeps running,
+however long the work takes.
+A child that sends no frame for `frame_idle_timeout_ms` fails the turn and is
+stopped; the handshake before the first frame is bounded at 30 s.
 
 Claude Code is a transport, not a second agent.
 Lofi tracks the conversation, so the child holds no decision Lofi cannot see.
@@ -408,7 +414,8 @@ Each `[providers.<name>]` table defines authentication, protocol routing, and it
 | `env_name` | string | none | Environment variable containing the API key. |
 | `headers` | table | none | Additional HTTP headers; values support value resolution. |
 | `no_auth` | boolean | `false` | Make the provider available without authentication headers. |
-| `response_start_timeout_ms` | positive integer | `90000` | Maximum wait for connection and response headers. Successful streaming response bodies have no fixed deadline. |
+| `response_start_timeout_ms` | positive integer | `90000` | Maximum wait for connection and response headers. A successful body is bounded chunk by chunk by `body_idle_timeout_ms`. |
+| `body_idle_timeout_ms` | positive integer | `300000` | Maximum wait for the next chunk of a response body, on every streaming turn including a subagent's. A longer stall fails the request as a provider timeout, which the retry policy retries. |
 | `thinking_level` | string | inherited | Provider-level thinking default. |
 | `thinking_levels` | string array | empty | Provider capability metadata. Declare supported levels on each static model. |
 | `service_tier` | string | inherited | Provider-level service-tier default. |

@@ -22,6 +22,7 @@ pub(crate) struct AnthropicMessagesProvider {
     pub(crate) headers: HashMap<String, String>,
     pub(crate) client: reqwest::Client,
     pub(crate) response_start_timeout: std::time::Duration,
+    pub(crate) body_idle: std::time::Duration,
 }
 
 #[async_trait]
@@ -47,6 +48,7 @@ impl super::Provider for AnthropicMessagesProvider {
         let resp = send_stream_request(req, self.response_start_timeout).await?;
         Ok(map_sse_response(
             resp,
+            self.body_idle,
             IrSseMapper::<AnthropicMessagesIr>::default(),
         ))
     }

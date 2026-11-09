@@ -387,7 +387,11 @@ pub(super) async fn open_external(
 ) -> Result<ClaudeSession> {
     let executable = std::env::current_exe()?;
     match config {
-        lofi_types::BackendConfig::ClaudeCode { command, .. } => {
+        lofi_types::BackendConfig::ClaudeCode {
+            command,
+            frame_idle_timeout_ms,
+            ..
+        } => {
             ClaudeSession::open(
                 super::claude::Launch {
                     command,
@@ -395,6 +399,7 @@ pub(super) async fn open_external(
                     effort,
                     resume,
                     system_prompt,
+                    frame_idle: frame_idle_timeout_ms.map(std::time::Duration::from_millis),
                 },
                 root,
                 &executable,

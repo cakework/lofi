@@ -92,6 +92,7 @@ fn provider(
         auto_models: None,
         no_auth: false,
         response_start_timeout_ms: 90_000,
+        body_idle_timeout_ms: 300_000,
         thinking_level,
         thinking_levels: Vec::new(),
         service_tier: None,
@@ -1022,6 +1023,7 @@ fn claude_backend(model: Option<&str>, listed: &[&str]) -> lofi_types::BackendCo
         model: model.map(str::to_string),
         models: listed.iter().map(|id| (*id).to_string()).collect(),
         context_window: None,
+        frame_idle_timeout_ms: None,
     }
 }
 

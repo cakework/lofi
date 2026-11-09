@@ -209,6 +209,7 @@ mod tests {
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("sk-test".to_string()),
             response_start_timeout_ms: 1000,
+            body_idle_timeout_ms: 300_000,
             ..serde_json::from_str::<ProviderConfig>("{}").unwrap()
         }
     }

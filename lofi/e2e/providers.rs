@@ -273,6 +273,46 @@ fn responses_silent_body_does_not_retry() {
     assert_eq!(server.request_count(), 1);
 }
 
+// A body that proves the connection and then stalls is a transport failure:
+// the chunk bound turns it into a provider timeout, which retries.
+#[test]
+fn responses_stalled_body_times_out_and_retries() {
+    let lifecycle = format!("data: {}\n\n", json!({ "type": "response.created" }));
+    let stalled = MockResponse::sse(responses_body("answer after the stall"))
+        .with_sse_prefix_pause(lifecycle, Duration::from_secs(2));
+    let server = MockServer::start(vec![
+        stalled,
+        responses_response("final thinking", "answer after the retry"),
+    ]);
+    let fixture = Fixture::new(&server);
+    let config = std::fs::read_to_string(&fixture.config).unwrap().replace(
+        "[providers.responses]\n",
+        "[providers.responses]\nbody_idle_timeout_ms = 300\n",
+    );
+    std::fs::write(&fixture.config, config).unwrap();
+
+    let output = fixture.output(&[
+        "--model",
+        "responses/reasoning",
+        "--print",
+        "wait through a stalled response body",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("answer after the retry"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("while waiting for the next response body chunk"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(server.request_count(), 2);
+}
+
 #[test]
 fn responses_retries_reset_after_stream_progress_before_tool_execution() {
     let tool = || {
