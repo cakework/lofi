@@ -173,6 +173,11 @@ pub enum SessionEventKind {
         /// transcript totals the session and not its last run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prior: Option<RunSpend>,
+        /// The deadline that stopped the run, when one did: a run that
+        /// answered its summary request settles completed without finishing
+        /// its task, and a restart must keep the difference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stopped: Option<String>,
     },
     /// An event variant this build does not know about — typically a marker
     /// written by a newer (or older, pre-release) binary. The transcript

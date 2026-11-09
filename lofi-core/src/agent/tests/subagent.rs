@@ -282,6 +282,18 @@ async fn output_limit_counts_bytes_at_char_boundary() {
     assert_eq!(out["result"].as_str().unwrap(), "ab\u{1f600}", "{out}");
 }
 
+/// Whether a request is the wrap-up turn a stopped run is given. These
+/// providers stall it too, so a stopped run keeps its deadline status.
+fn is_wrap_up(messages: &[Message]) -> bool {
+    messages
+        .last()
+        .is_some_and(|m| is_wrap_up_text(&first_text(m)))
+}
+
+fn is_wrap_up_text(text: &str) -> bool {
+    text.starts_with("Your run was stopped at its deadline")
+}
+
 // The answer depends on the request content, not on a call counter, so the
 // tests stay deterministic no matter when the stop fires: a prompt "a" asks
 // for a tool call, the follow-up after a tool result pends forever (the run
@@ -303,6 +315,7 @@ impl Provider for TimeoutResumeProvider {
         self.requests.lock().unwrap().push(messages.to_vec());
         let last = messages.last();
         let round = match last {
+            _ if is_wrap_up(messages) => std::future::pending().await,
             Some(m) if m.role == Role::Tool => std::future::pending().await,
             Some(m) if m.role == Role::User && first_text(m) == "a" => self.tool_round.clone(),
             _ => self.text_round.clone(),
@@ -355,9 +368,14 @@ async fn timeout_keeps_the_partial_history() {
 
     // The resumed turn continues the timed-out one: it replays the prompt
     // that run was given, the tool call it made, and the result of that call.
+    // The wrap-up prompt the stopped run was given sits between them.
     let requests = provider.requests.lock().unwrap();
     let last = requests.last().unwrap();
-    let roles: Vec<_> = last.iter().map(|m| m.role).collect();
+    let roles: Vec<_> = last
+        .iter()
+        .filter(|m| !is_wrap_up_text(&first_text(m)))
+        .map(|m| m.role)
+        .collect();
     assert_eq!(
         roles,
         vec![
@@ -394,12 +412,13 @@ async fn timeout_keeps_the_partial_history() {
         kinds[..first_settle].contains(&IndexKind::ToolResult),
         "the timed-out run's tool exchange is off its lineage: {kinds:?}"
     );
+    // Both task prompts and the wrap-up prompt the stopped run was given.
     assert_eq!(
         kinds
             .iter()
             .filter(|kind| **kind == IndexKind::UserPrompt)
             .count(),
-        2,
+        3,
         "both prompts stay on the lineage: {kinds:?}"
     );
 }
@@ -588,6 +607,7 @@ impl Provider for SlowToolProvider {
     ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
         self.requests.lock().unwrap().push(messages.to_vec());
         let round = match messages.last() {
+            _ if is_wrap_up(messages) => std::future::pending().await,
             Some(message) if message.role == Role::User && first_text(message) == "a" => {
                 exec_round("await lofi.sleep(5)")
             }
@@ -629,9 +649,18 @@ async fn timeout_inside_a_tool_call_stays_resumable() {
     .await;
     assert_eq!(out["status"], json!("completed"), "{out}");
 
-    let requests = provider.requests.lock().unwrap();
+    // The stopped run also asks for a wrap-up; the task requests are what
+    // the replay history is read from.
+    let requests: Vec<_> = provider
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| !is_wrap_up(request))
+        .cloned()
+        .collect();
     assert_eq!(requests.len(), 3);
-    for request in requests.iter() {
+    for request in &requests {
         assert_tool_calls_are_answered(request);
     }
     let texts: Vec<_> = requests
@@ -640,6 +669,8 @@ async fn timeout_inside_a_tool_call_stays_resumable() {
         .iter()
         .filter(|message| message.role == Role::User)
         .map(first_text)
+        // The wrap-up prompt the stopped run was given stays in its history.
+        .filter(|text| !is_wrap_up_text(text))
         .collect();
     assert_eq!(
         texts,
@@ -1055,6 +1086,14 @@ fn find_jsonl(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+fn count_blocks(messages: &[Message], want: impl Fn(&ContentBlock) -> bool) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter(|block| want(block))
+        .count()
 }
 
 fn first_text(m: &Message) -> String {
@@ -1775,6 +1814,54 @@ async fn kill_is_idempotent_and_reports_terminal_state() {
 }
 
 #[tokio::test]
+async fn killing_a_run_drops_the_timers_it_armed() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(NeverProvider);
+    let timers = agent.tool_executor().timers();
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Spawn, json!({ "prompt": "hang" })).await;
+    let id = out["id"].as_str().unwrap().to_string();
+    // A child's timers live in the session's registry, tagged with its run.
+    timers.schedule_every(Some(&id), std::time::Duration::from_hours(1), None);
+    assert_eq!(timers.pending_for(Some(&id)), 1);
+
+    let killed = hook(SubagentOp::Kill, json!({ "id": id })).await;
+    assert_eq!(killed["ok"], json!(true), "{killed}");
+    let done = hook(SubagentOp::Wait, json!({ "id": id, "timeout_ms": 30_000 })).await;
+    assert_eq!(done["status"], json!("cancelled"), "{done}");
+
+    assert_eq!(timers.pending_for(Some(&id)), 0);
+}
+
+#[tokio::test]
+async fn replacing_the_session_drops_the_timers_of_stopped_runs() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(NeverProvider);
+    let timers = agent.tool_executor().timers();
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Spawn, json!({ "prompt": "hang" })).await;
+    let id = out["id"].as_str().unwrap().to_string();
+    timers.schedule_at(
+        Some(&id),
+        std::time::SystemTime::now() + std::time::Duration::from_hours(1),
+        None,
+    );
+    assert_eq!(timers.pending_for(Some(&id)), 1);
+
+    let _ = agent.subagents().clear();
+
+    assert_eq!(timers.pending_for(Some(&id)), 0);
+}
+
+#[tokio::test]
 async fn read_pages_events_and_reports_gaps() {
     let _env = env_lock();
     let _state = StateEnv::new();
@@ -2255,6 +2342,9 @@ impl Provider for SpendThenPendProvider {
         _tools: &[ToolSchema],
     ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
         let round = match messages.last() {
+            // The wrap-up asks for a summary, not a round: this child never
+            // answers it, and nothing is billed for a request that pends.
+            _ if is_wrap_up(messages) => std::future::pending().await,
             Some(m) if m.role == Role::Tool => std::future::pending().await,
             _ => {
                 let mut round = exec_round("return 1");
@@ -2747,4 +2837,812 @@ async fn a_child_reaches_the_parent_mailbox_from_its_own_sandbox() {
         .unwrap_or_else(|| panic!("the parent read the child's message: {messages:#?}"));
     // The reply carries the child's id and its completed status.
     assert!(result.contains("\"status\":\"completed\""), "{result}");
+}
+
+// The deadline work: an idle run is stopped and asks for a wrap-up, so the
+// parent gets a summary instead of a bare timeout.
+struct PendThenSummarizeProvider;
+
+#[async_trait]
+impl Provider for PendThenSummarizeProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        let round = if is_wrap_up(messages) {
+            text_round("reached the third step")
+        } else {
+            std::future::pending().await
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_run_is_stopped_and_wraps_up() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(PendThenSummarizeProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    // One short idle deadline and a far cap, so only the idle deadline can
+    // stop this run, and the wrap-up then answers.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "timeout_ms": 30_000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["result"], json!("reached the third step"), "{out}");
+    // The settle report says where the run was when its deadline fired, and
+    // which deadline it was: a summary is not the task finishing.
+    assert!(out["elapsed_ms"].as_u64().is_some(), "{out}");
+    assert_eq!(out["stopped"], json!("idle"), "{out}");
+}
+
+// A child that keeps producing events is working: only the hard cap stops it,
+// so a run whose gaps stay under the idle deadline finishes on its own.
+struct TrickleProvider;
+
+#[async_trait]
+impl Provider for TrickleProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        if is_wrap_up(messages) {
+            return Ok(Box::pin(stream::iter(
+                text_round("wrapped up").into_iter().map(Ok),
+            )));
+        }
+        let events: Vec<StreamingEvent> = (0..40)
+            .map(|n| StreamingEvent::TextDelta(format!("{n} ")))
+            .chain(std::iter::once(StreamingEvent::Done {
+                usage: Usage::default(),
+                stop_reason: None,
+            }))
+            .collect();
+        // A delta every 5 ms: 200 ms of work against an 80 ms idle deadline,
+        // so no single gap reaches it while the whole run is far longer.
+        let stream = futures::stream::unfold(events.into_iter(), |mut events| async move {
+            let event = events.next()?;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Some((Ok(event), events))
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+#[tokio::test]
+async fn a_run_that_keeps_producing_events_is_not_idle() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(TrickleProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 80, "timeout_ms": 30_000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert!(
+        out["result"].as_str().unwrap().starts_with("0 1 2"),
+        "the run finished its own work: {out}"
+    );
+}
+
+// A run waiting on the user is not idle: only its hard cap stops it, and it
+// settles blocked naming the command nobody answered.
+struct AskThenPendProvider;
+
+#[async_trait]
+impl Provider for AskThenPendProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        let round = match messages.last() {
+            Some(_) if is_wrap_up(messages) => text_round("wrapped up"),
+            _ => exec_round("await lofi.bash({ cmd: \"echo blocked\" })"),
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn a_run_waiting_on_a_prompt_settles_blocked() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let (tx, mut prompts) = tokio::sync::mpsc::unbounded_channel();
+    let mut agent = agent_with(vec![], dir.path())
+        .with_confirm_tx(tx)
+        .with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(AskThenPendProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    // The idle deadline is shorter than the cap, and the run is waiting on
+    // the prompt for longer than that: only the cap may stop it.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 300, "timeout_ms": 2_000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("blocked"), "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(error.contains("echo blocked"), "{out}");
+    // The prompt reached the session: it was never answered.
+    assert!(prompts.try_recv().is_ok(), "the child asked for approval");
+}
+
+#[tokio::test]
+async fn a_settled_run_reports_where_it_worked() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(MockProvider::recording(vec![
+        exec_round("return 1"),
+        text_round("done"),
+    ]));
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a" })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["last_tool"], json!("exec"), "{out}");
+    assert!(out["rounds"].as_u64().unwrap() >= 2, "{out}");
+    assert!(out["elapsed_ms"].as_u64().is_some(), "{out}");
+}
+
+#[tokio::test]
+async fn a_background_spawn_resumes_by_id() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(MockProvider::recording(vec![
+        text_round("first"),
+        text_round("second"),
+    ]));
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a" })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    // A background spawn continues a settled run without a foreground call,
+    // so the run survives the exec that resumed it.
+    let out = hook(
+        SubagentOp::Spawn,
+        json!({ "id": id, "prompt": "b", "timeout_ms": 30_000 }),
+    )
+    .await;
+    assert_eq!(out["ok"], json!(true), "{out}");
+    assert_eq!(out["status"], json!("running"), "{out}");
+    assert_eq!(out["id"], json!(id), "{out}");
+    let done = hook(SubagentOp::Wait, json!({ "id": id, "timeout_ms": 30_000 })).await;
+    assert_eq!(done["status"], json!("completed"), "{done}");
+    assert_eq!(done["result"], json!("second"), "{done}");
+}
+// A call in flight reports nothing until it ends, so a long one is work: the
+// idle deadline must not stop a child that is inside a single tool call.
+struct SlowCallProvider {
+    rounds: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for SlowCallProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        let round = if is_wrap_up(messages) {
+            text_round("wrapped up")
+        } else if self.rounds.fetch_add(1, Ordering::SeqCst) == 0 {
+            exec_round("await lofi.sleep(0.4); return 1")
+        } else {
+            text_round("done")
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn a_run_inside_one_long_tool_call_is_not_idle() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(SlowCallProvider {
+        rounds: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let hook = agent.subagent_hook().unwrap();
+
+    // The call runs four times longer than the idle deadline and emits
+    // nothing meanwhile.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "timeout_ms": 30_000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(
+        out["result"],
+        json!("done"),
+        "the run finished its own work: {out}"
+    );
+}
+
+// A stopped run whose summary came back empty keeps the deadline status: the
+// parent must not read an empty success.
+struct PendThenSayNothingProvider;
+
+#[async_trait]
+impl Provider for PendThenSayNothingProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        if is_wrap_up(messages) {
+            let round = vec![StreamingEvent::Done {
+                usage: Usage::default(),
+                stop_reason: None,
+            }];
+            return Ok(Box::pin(stream::iter(round.into_iter().map(Ok))));
+        }
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn an_empty_wrap_up_keeps_the_deadline_status() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(PendThenSayNothingProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "timeout_ms": 30_000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("timed_out"), "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(error.contains("idle for 100 ms"), "{out}");
+}
+
+// The wrap-up is a turn of its own, so its cumulative cost adds to the run's
+// instead of replacing it.
+struct PaidStallProvider;
+
+fn bill_input(round: &mut [StreamingEvent], input: u64) {
+    if let Some(StreamingEvent::Done { usage, .. }) = round.last_mut() {
+        usage.input_tokens = input;
+    }
+}
+
+#[async_trait]
+impl Provider for PaidStallProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        let round = if is_wrap_up(messages) {
+            let mut round = text_round("wrapped up");
+            bill_input(&mut round, 500_000);
+            round
+        } else {
+            let mut round = exec_round("await lofi.sleep(10)");
+            bill_input(&mut round, 1_000_000);
+            round
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn a_wrap_up_adds_its_spend_to_the_run() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    // One million input tokens bill at the input price.
+    agent.model.input_price = Some(3.0);
+    agent.model.output_price = Some(15.0);
+    agent.provider = Arc::new(PaidStallProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    // The call in flight keeps the idle deadline away, so only the cap stops
+    // this run, and the summary then answers.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 60_000, "timeout_ms": 300 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["result"], json!("wrapped up"), "{out}");
+    let cost = out["usage"]["cost"].as_f64().unwrap();
+    assert!((cost - 4.5).abs() < 1e-9, "both turns are billed: {out}");
+}
+
+// Starts an answer and hangs inside the round, so a deadline lands on work the
+// child had already begun but never finished.
+struct StartedThenStallProvider {
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl Provider for StartedThenStallProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        if is_wrap_up(messages) {
+            return Ok(Box::pin(stream::iter(
+                text_round("the summary").into_iter().map(Ok),
+            )));
+        }
+        let started = stream::iter(vec![Ok(StreamingEvent::TextDelta(
+            "half an answer".to_string(),
+        ))]);
+        Ok(Box::pin(futures::stream::StreamExt::chain(
+            started,
+            stream::pending::<Result<StreamingEvent>>(),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn a_deadline_keeps_the_round_it_stopped() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(StartedThenStallProvider {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = provider.clone();
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a", "idle_ms": 100 })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["stopped"], json!("idle"), "{out}");
+
+    // The round the deadline stopped is in the history the summary reads,
+    // rather than dropped with the turn that was streaming it.
+    let requests = provider.requests.lock().unwrap();
+    let summary = requests
+        .iter()
+        .find(|request| is_wrap_up(request))
+        .expect("a wrap-up request");
+    assert!(
+        summary
+            .iter()
+            .any(|message| first_text(message) == "half an answer"),
+        "{summary:?}"
+    );
+}
+
+// Streams half a summary and then stalls, so the wrap-up's own deadline cuts
+// a reply an earlier turn would have kept.
+struct HalfASummaryThenStall;
+
+#[async_trait]
+impl Provider for HalfASummaryThenStall {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        if !is_wrap_up(messages) {
+            std::future::pending::<()>().await;
+        }
+        let started = stream::iter(vec![Ok(StreamingEvent::TextDelta(
+            "half a summary".to_string(),
+        ))]);
+        Ok(Box::pin(futures::stream::StreamExt::chain(
+            started,
+            stream::pending::<Result<StreamingEvent>>(),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn a_cut_summary_keeps_the_reply_it_was_streaming() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(HalfASummaryThenStall);
+    let hook = agent.subagent_hook().unwrap();
+
+    // The task turn goes idle; the summary then streams a reply and stalls
+    // past the deadline that bounds it here.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "timeout_ms": 400 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("timed_out"), "{out}");
+    // The half-written summary is work a resume continues from, so the hint
+    // names the id instead of saying the run kept nothing.
+    let id = out["id"].as_str().unwrap();
+    assert_eq!(
+        out["error"],
+        json!(format!(
+            "idle for 100 ms; resume with id {id} to continue from the work so far"
+        )),
+        "{out}"
+    );
+}
+
+// Runs one tool exchange in the wrap-up and bills past the budget, so the
+// summary is cut after completing work a resume would keep.
+struct ToolThenOverBudgetSummary;
+
+#[async_trait]
+impl Provider for ToolThenOverBudgetSummary {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        let round = if is_wrap_up(messages) {
+            let mut round = exec_round("return 1");
+            bill_input(&mut round, 500_000);
+            round
+        } else {
+            std::future::pending().await
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn a_wrap_up_cut_after_its_tool_stays_resumable() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(ToolThenOverBudgetSummary);
+    let hook = agent.subagent_hook().unwrap();
+
+    // The task turn is stopped by its deadline; the summary then runs a tool
+    // and bills past the budget before it can answer.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "token_budget": 10 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("failed"), "{out}");
+    // The tool exchange it completed is work a resume continues from, even
+    // though the summary itself never answered.
+    let id = out["id"].as_str().unwrap();
+    assert_eq!(
+        out["error"],
+        json!(format!(
+            "token budget exceeded (500000 > 10); resume with id {id} to continue from the work so far"
+        )),
+        "{out}"
+    );
+}
+
+// Only the summary bills here: a wrap-up round that crosses the budget is a
+// failure, not the deadline that asked for it.
+struct SummarizeOverBudgetProvider;
+
+#[async_trait]
+impl Provider for SummarizeOverBudgetProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        if !is_wrap_up(messages) {
+            std::future::pending::<()>().await;
+        }
+        let mut round = text_round("wrapped up");
+        bill_input(&mut round, 500_000);
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn a_wrap_up_that_crosses_the_budget_fails_the_run() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(SummarizeOverBudgetProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "token_budget": 10 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("failed"), "{out}");
+    // The summary answered, so its reply is work a resume continues from.
+    let id = out["id"].as_str().unwrap();
+    assert_eq!(
+        out["error"],
+        json!(format!(
+            "token budget exceeded (500000 > 10); resume with id {id} to continue from the work so far"
+        )),
+        "{out}"
+    );
+    assert_eq!(out["stopped"], json!("idle"), "{out}");
+    // The breach ends the run; it does not wait out the wrap-up deadline.
+    assert!(out["elapsed_ms"].as_u64().unwrap() < 10_000, "{out}");
+}
+
+// A summary request is a real request: it must survive the watchdog ticks that
+// follow the deadline it answers, and only a caller may cut it short.
+struct PendThenSlowSummarizeProvider;
+
+#[async_trait]
+impl Provider for PendThenSlowSummarizeProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        if !is_wrap_up(messages) {
+            std::future::pending::<()>().await;
+        }
+        let round = text_round("reached step two");
+        let stream = futures::stream::unfold(round.into_iter(), |mut events| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let event = events.next()?;
+            Some((Ok(event), events))
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+#[tokio::test]
+async fn a_slow_wrap_up_still_reports_where_the_run_stopped() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(PendThenSlowSummarizeProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    // The summary answers over several watchdog ticks after the deadline.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "timeout_ms": 30_000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["result"], json!("reached step two"), "{out}");
+}
+
+// The status of a settled stopped run carries the same progress the settled
+// result does, so polling the public API reads where it stopped.
+#[tokio::test]
+async fn a_settled_status_reports_where_the_run_worked() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(MockProvider::recording(vec![
+        exec_round("return 1"),
+        text_round("done"),
+    ]));
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a" })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let status = hook(SubagentOp::Status, json!({ "id": id })).await;
+    assert_eq!(status["status"], json!("completed"), "{status}");
+    assert_eq!(status["last_tool"], json!("exec"), "{status}");
+    assert!(status["rounds"].as_u64().unwrap() >= 2, "{status}");
+    assert!(status["elapsed_ms"].as_u64().is_some(), "{status}");
+}
+
+// A call an earlier run left running belongs to that run: a resumed run must
+// count only its own, or its idle deadline never fires.
+#[tokio::test]
+async fn a_resumed_run_counts_only_its_own_calls() {
+    let watch = crate::agent::tool_executor::ActivityWatch::default();
+    let old = watch.enter();
+    watch.reset();
+    let new = watch.enter();
+    assert_eq!(watch.idle_mark(), (1, None));
+    drop(old);
+    assert_eq!(watch.idle_mark().0, 1);
+    // A call that has ended keeps the idle clock young, so a tick racing its
+    // event does not read the run as idle.
+    let dropping = std::time::Instant::now();
+    drop(new);
+    assert_eq!(watch.idle_mark().0, 0);
+    assert!(watch.idle_mark().1.unwrap() <= dropping.elapsed());
+    watch.reset();
+    assert_eq!(watch.idle_mark(), (0, None));
+}
+
+#[tokio::test]
+async fn a_zero_idle_deadline_is_rejected() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let agent = agent_with(vec![text_round("never")], dir.path())
+        .with_subagent_support(support(dir.path()));
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "a", "idle_ms": 0 })).await;
+    assert_eq!(out["ok"], json!(false), "{out}");
+    assert_eq!(out["status"], json!("failed"), "{out}");
+    assert!(out["error"].as_str().unwrap().contains("idle_ms"), "{out}");
+}
+
+// A restart rebuilds the entry from the settle marker: a run a deadline
+// stopped must not come back indistinguishable from one that finished.
+#[tokio::test]
+async fn a_restored_run_keeps_the_deadline_that_stopped_it() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.subagents().set_parent_session("parent-x");
+    agent.provider = Arc::new(PendThenSummarizeProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 100, "timeout_ms": 30_000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["stopped"], json!("idle"), "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    let restored = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    restored.subagents().set_parent_session("parent-x");
+    restored
+        .subagents()
+        .rehydrate(&restored, &support(dir.path()));
+    let hook = restored.subagent_hook().unwrap();
+    let status = hook(SubagentOp::Status, json!({ "id": id })).await;
+    assert_eq!(status["status"], json!("completed"), "{status}");
+    assert_eq!(status["stopped"], json!("idle"), "{status}");
+}
+
+// The notice is what a background run's parent reads first, so a wrapped run
+// says that a deadline stopped it.
+#[test]
+fn a_wrapped_notice_names_the_deadline_and_where_it_stopped() {
+    let out = json!({
+        "status": "completed",
+        "result": "reached step two\nmore",
+        "stopped": "idle",
+        "rounds": 4,
+        "elapsed_ms": 312_500,
+        "last_tool": "bash",
+    });
+    let notice = crate::agent::subagent::terminal_notice(
+        "id1",
+        crate::agent::subagent::Status::Completed,
+        &out,
+    );
+    assert_eq!(
+        notice,
+        "subagent id1 completed (stopped: idle; round 4 after 312 s, bash): reached step two"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_watch_names_the_oldest_open_prompt() {
+    let watch = crate::agent::tool_executor::ConfirmWatch::default();
+    let first = watch.open("echo first");
+    let second = watch.open("echo second");
+    assert_eq!(watch.pending(), 2);
+    // Answering the newer prompt first leaves the older one blocking.
+    drop(second);
+    assert_eq!(watch.pending(), 1);
+    assert_eq!(watch.command().as_deref(), Some("echo first"));
+    drop(first);
+    assert_eq!(watch.pending(), 0);
+    assert_eq!(watch.command(), None);
+}
+
+// Prompts an earlier run left open answer late, because their tool work can
+// outlive the reset a resume does: they must not take the new run's prompt.
+#[tokio::test]
+async fn a_resumed_run_keeps_its_own_prompt() {
+    let watch = crate::agent::tool_executor::ConfirmWatch::default();
+    let old = watch.open("echo old");
+    watch.reset();
+    let new = watch.open("echo new");
+    drop(old);
+    assert_eq!(watch.pending(), 1);
+    assert_eq!(watch.command().as_deref(), Some("echo new"));
+    drop(new);
+    assert_eq!(watch.pending(), 0);
+}
+
+// A turn dropped mid-call leaves a tool call nothing answered. Providers
+// reject that, so the history is repaired before it settles and the resumed
+// run replays a request they accept.
+#[tokio::test]
+async fn a_stopped_run_answers_the_call_it_dropped() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(MockProvider::recording(vec![
+        exec_round("await new Promise(() => {});"),
+        text_round("reached the call"),
+        text_round("resumed done"),
+    ]));
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = provider.clone();
+    let hook = agent.subagent_hook().unwrap();
+
+    // The call in flight keeps the idle deadline away, so the cap stops this
+    // run while the exec is still running.
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 60_000, "timeout_ms": 300 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["result"], json!("reached the call"), "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    // The resumed run replays a history whose call is answered, so a
+    // provider that pairs calls on the wire accepts it.
+    let resumed = hook(SubagentOp::Run, json!({ "id": id, "prompt": "b" })).await;
+    assert_eq!(resumed["status"], json!("completed"), "{resumed}");
+    // The last request is the resumed run's, replaying the stopped history.
+    let requests = provider.requests();
+    let replay = requests.last().unwrap();
+    let calls = count_blocks(replay, |block| {
+        matches!(block, ContentBlock::ToolUse { .. })
+    });
+    let results = count_blocks(replay, |block| {
+        matches!(block, ContentBlock::ToolResult { .. })
+    });
+    assert!(calls > 0, "the stopped run called a tool: {replay:?}");
+    assert_eq!(calls, results, "every call is answered: {replay:?}");
+}
+
+#[tokio::test]
+async fn a_prompt_watch_reports_the_time_it_waited() {
+    let watch = crate::agent::tool_executor::ConfirmWatch::default();
+    assert_eq!(watch.waited(), std::time::Duration::ZERO);
+    let open = watch.open("echo x");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(watch.waited() >= std::time::Duration::from_millis(20));
+    drop(open);
+    let closed = watch.waited();
+    assert!(closed >= std::time::Duration::from_millis(20));
 }

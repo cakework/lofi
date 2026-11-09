@@ -11,11 +11,21 @@ fn claude_fixture() -> Fixture {
 }
 
 fn install_fake_claude(fixture: &Fixture) {
+    install_fake_claude_with(fixture, "");
+}
+
+// A child that keeps its bridge and stops reading its input after the first
+// turn: the frame the adapter writes next has to end on a bound.
+fn install_stalled_fake_claude(fixture: &Fixture) {
+    install_fake_claude_with(fixture, "LOFI_FAKE_CLAUDE_STALLED=1 ");
+}
+
+fn install_fake_claude_with(fixture: &Fixture, env: &str) {
     use std::os::unix::fs::PermissionsExt;
     let command = fixture.workspace.join("fake-claude");
     let executable = std::env::current_exe().unwrap();
     std::fs::write(&command, format!(
-        "#!/bin/sh\nprintf '%s\\0' \"$@\" > claude-args\nLOFI_FAKE_CLAUDE=1 exec '{}' --exact backends::fake_claude --nocapture 3>&1 1>/dev/null\n",
+        "#!/bin/sh\nprintf '%s\\0' \"$@\" > claude-args\n{env}LOFI_FAKE_CLAUDE=1 exec '{}' --exact backends::fake_claude --nocapture 3>&1 1>/dev/null\n",
         executable.display()
     )).unwrap();
     std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -256,6 +266,7 @@ fn fake_claude_code(text: &str) -> &'static str {
         "shell" => r#"return await lofi.bash({cmd:"touch denied-marker",timeoutMs:1000})"#,
         "cancel" => "while (true) {}",
         "job" => r#"return await lofi.jobSpawn({cmd:"sleep 1",timeoutMs:3000})"#,
+        "slow tool" => r#"await lofi.sleep(1); return "slept""#,
         "subagent" => {
             r#"const out = await lofi.subagent({prompt:"child task",timeoutMs:5000}); await lofi.write({path:"subagent-result",text:JSON.stringify(out)}); return out"#
         }
@@ -357,6 +368,28 @@ fn fake_claude_tool_then_error(mcp: &mut Mcp, output: &mut impl Write, id: &str,
     fake_claude_failure(output, id, "error_during_execution");
 }
 
+// A child that answers the handshake and then says nothing: the turn must end
+// on the frame bound, not on a clock over the whole turn.
+fn fake_claude_silence(text: &str) {
+    if text == "silent" {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        panic!("adapter did not bound a silent CLI");
+    }
+    if text.starts_with("extra ") {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        panic!("adapter did not reject extra capabilities");
+    }
+}
+
+// A child that keeps its bridge and stops reading its input after its first
+// turn: the next frame the adapter writes has to end on a bound.
+fn fake_claude_stalls(turn: u32) {
+    if std::env::var_os("LOFI_FAKE_CLAUDE_STALLED").is_some() && turn > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        panic!("adapter did not bound a prompt write to a stalled child");
+    }
+}
+
 #[test]
 fn fake_claude() {
     if std::env::var_os("LOFI_FAKE_CLAUDE").is_none() {
@@ -382,6 +415,7 @@ fn fake_claude() {
     let mut initialized = false;
     let mut turn = 0;
     loop {
+        fake_claude_stalls(turn);
         let prompt = read(&mut input);
         if fake_claude_control(&prompt, &mut output) {
             continue;
@@ -396,16 +430,7 @@ fn fake_claude() {
             fake_claude_init(&mut output, &id, text);
             initialized = true;
         }
-        // A child that answers the handshake and then says nothing: the turn
-        // must end on the frame bound, not on a clock over the whole turn.
-        if text == "silent" {
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            panic!("adapter did not bound a silent CLI");
-        }
-        if text.starts_with("extra ") {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            panic!("adapter did not reject extra capabilities");
-        }
+        fake_claude_silence(text);
         if text == "disconnect" {
             return;
         }
@@ -689,6 +714,68 @@ fn claude_stops_a_turn_whose_child_stops_sending_frames() {
         stderr.contains("no frame before the idle deadline"),
         "stderr: {stderr}"
     );
+}
+
+// The child says nothing while Lofi's own exec runs: that quiet is not the
+// child going silent, so a turn whose tool outlasts the gap still answers.
+#[test]
+fn claude_keeps_quiet_while_its_own_tool_runs() {
+    let fixture = claude_fixture_with_frame_idle("300");
+
+    let output = fixture.output(&["--print", "slow tool"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("claude answer"), "{stdout}");
+}
+
+fn claude_fixture_with_stalled_stdin() -> Fixture {
+    let fixture = Fixture::without_models();
+    install_stalled_fake_claude(&fixture);
+    let config = std::fs::read_to_string(&fixture.config).unwrap().replace(
+        "[backends.claude]\n",
+        "[backends.claude]\nframe_idle_timeout_ms = 500\n",
+    );
+    std::fs::write(&fixture.config, config).unwrap();
+    fixture
+}
+
+// The child stops reading its input after its first turn, so a frame too big
+// for the pipe it no longer drains must end the turn on the write bound.
+#[test]
+fn claude_bounds_a_prompt_a_stalled_child_stops_reading() {
+    let fixture = claude_fixture_with_stalled_stdin();
+    let mut tui = fixture.spawn(&[]);
+    tui.wait_for_screen("claude/test-model", WAIT);
+    tui.submit("hello");
+    fixture.wait_for_event_count("turn_end", 1);
+    tui.wait_idle(WAIT);
+
+    let huge = "x".repeat(200_000);
+    tui.send(b"\x1b[200~");
+    tui.send(huge.as_bytes());
+    tui.send(b"\x1b[201~");
+    tui.send(b"\r");
+    fixture.wait_for_event_count("turn_failed", 1);
+    let events = fixture.events();
+    let failed = events
+        .iter()
+        .rfind(|event| event["type"] == "turn_failed")
+        .unwrap();
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("stopped reading its input"),
+        "{failed}"
+    );
+
+    tui.submit("/quit");
+    tui.wait_exit();
 }
 
 #[test]

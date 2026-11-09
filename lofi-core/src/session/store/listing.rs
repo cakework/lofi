@@ -671,6 +671,7 @@ mod tests {
                 usage: Some(Usage::default()),
                 cost: Some(0.0412),
                 prior: None,
+                stopped: None,
             },
         };
         let file = settled_file(&tmp, Some(&event));
@@ -692,6 +693,7 @@ mod tests {
                     usage: Usage::default(),
                     cost: 0.5,
                 }),
+                stopped: None,
             },
         };
         let file = settled_file(&tmp, Some(&resumed));
@@ -712,6 +714,7 @@ mod tests {
                     usage: Usage::default(),
                     cost: 0.5,
                 }),
+                stopped: None,
             },
         };
         let file = settled_file(&tmp, Some(&unbilled));

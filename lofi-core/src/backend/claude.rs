@@ -52,6 +52,23 @@ async fn frame_within<T>(
         .map_err(|_| Error::State(reason.to_owned()))?
 }
 
+/// How much silence the child has left before the turn fails, or `None`
+/// once it has spent the budget. A quiet stretch during one of Lofi's own
+/// calls does not count, and the budget is re-armed from the call's end.
+fn frame_budget(
+    start: Instant,
+    idle: Duration,
+    (busy, free): (usize, Option<Duration>),
+) -> Option<Duration> {
+    let silence = free.map_or_else(|| start.elapsed(), |free| free.min(start.elapsed()));
+    let left = idle.saturating_sub(silence);
+    if !left.is_zero() {
+        return Some(left);
+    }
+    // A call still in flight is work, not silence: look again shortly.
+    (busy > 0).then_some(BUSY_POLL)
+}
+
 /// The silence that fails a turn. Zero is rejected: a bound of nothing
 /// would fail every turn the child did not answer inside one poll.
 fn resolve_frame_idle(gap: Option<Duration>) -> Result<Duration> {
@@ -62,6 +79,16 @@ fn resolve_frame_idle(gap: Option<Duration>) -> Result<Duration> {
         Some(idle) => Ok(idle),
         None => Ok(FRAME_IDLE_TIMEOUT),
     }
+}
+
+/// A resumed turn keeps the id it was handed; a new one gets a fresh id.
+fn session_id(resume: Option<&str>) -> Result<String> {
+    let id = match resume {
+        Some(id) => uuid::Uuid::parse_str(id)
+            .map_err(|_| Error::State("invalid Claude Code session ID".into()))?,
+        None => uuid::Uuid::new_v4(),
+    };
+    Ok(id.to_string())
 }
 
 /// The `message.content` of one user frame: a plain string when the turn is
@@ -100,12 +127,13 @@ const NO_CHILD_COMPACTION: &str = "1000000";
 /// frame by less than one poll: the turn prefers the answer for this long.
 const BRIDGE_GRACE: Duration = Duration::from_secs(2);
 /// How long the CLI may send no frame before the turn is failed. A gap, not a
-/// turn length: a long run that keeps answering streams frames the whole way,
-/// and only its own tool calls go quiet. Kept wide because a silent stretch is
-/// indistinguishable from a large tool call, and the CLI bounds those itself.
+/// turn length: a run that keeps working streams frames the whole way, and a
+/// silent stretch is Lofi's own tool call, which pauses this clock.
 const FRAME_IDLE_TIMEOUT: Duration = Duration::from_hours(2);
 /// The handshake comes before any tool work, so it has no reason to be slow.
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a paused frame clock looks for the call it is waiting on to end.
+const BUSY_POLL: Duration = Duration::from_millis(25);
 
 /// Every flag pins the CLI to the exec bridge: no built-in tools, no user
 /// settings, no hooks, and no slash commands.
@@ -204,6 +232,9 @@ pub(super) struct ClaudeSession {
     initialized: bool,
     /// How long the child may send no frame before the turn fails.
     frame_idle: Duration,
+    /// Our own tool calls: the child waits on one through its quiet, so that
+    /// time is not silence.
+    activity: Arc<crate::agent::ActivityWatch>,
     /// Whether the current turn's prompt reached the CLI's stdin. A frame
     /// over the pipe limit or a dead child leaves it false.
     prompt_written: bool,
@@ -258,12 +289,7 @@ impl ClaudeSession {
             return Err(Error::Config("empty Claude Code system prompt".into()));
         }
         let frame_idle = resolve_frame_idle(frame_idle)?;
-        let id = match resume {
-            Some(id) => uuid::Uuid::parse_str(id)
-                .map_err(|_| Error::State("invalid Claude Code session ID".into()))?,
-            None => uuid::Uuid::new_v4(),
-        }
-        .to_string();
+        let id = session_id(resume)?;
         // A rebuild can take the path away, or swap the build behind it, while
         // this build keeps running. The path handed to the child is settled
         // here, and settling it can write the whole image, which must not block
@@ -279,6 +305,7 @@ impl ClaudeSession {
         .await
         .map_err(|error| Error::State(format!("preparing the exec bridge: {error}")))?;
         let executable = executable?;
+        let activity = executor.activity.clone();
         let bridge = Bridge::start(executor, &executable).await?;
         let files = private_files(dir, system_prompt, &mcp_config(&bridge)?)?;
         let mut process = Command::new(command);
@@ -332,6 +359,7 @@ impl ClaudeSession {
             id,
             initialized: false,
             frame_idle,
+            activity,
             prompt_written: false,
             model: model.map(str::to_owned),
             poisoned: false,
@@ -559,8 +587,9 @@ impl ClaudeSession {
 
     /// The next frame from the CLI. The bound is on the gap between frames,
     /// not on the turn: a turn that keeps sending frames is working, and one
-    /// that says nothing this long is wedged. A silent stretch is one of the
-    /// CLI's own tool calls, whose own timeouts bound the work inside it.
+    /// that says nothing this long is wedged. A quiet stretch while Lofi's own
+    /// exec runs is not silence: the child is waiting on us, and that call
+    /// bounds itself.
     async fn read_frame(&mut self) -> Result<Value> {
         let (idle, reason) = if self.initialized {
             (
@@ -570,7 +599,19 @@ impl ClaudeSession {
         } else {
             (INIT_TIMEOUT, "Claude Code initialization timed out")
         };
-        frame_within(idle, reason, rpc::read_json(&mut self.output)).await
+        // Pinned: a half-read frame cannot be replayed, so the timer stops
+        // and restarts around the read rather than the read restarting.
+        let read = rpc::read_json(&mut self.output);
+        tokio::pin!(read);
+        let start = Instant::now();
+        loop {
+            let Some(budget) = frame_budget(start, idle, self.activity.idle_mark()) else {
+                return Err(Error::State(reason.into()));
+            };
+            if let Ok(result) = tokio::time::timeout(budget, &mut read).await {
+                return result;
+            }
+        }
     }
 
     async fn prompt_inner(&mut self, frame: Value, context: &ToolCallContext) -> Result<String> {
@@ -580,12 +621,16 @@ impl ClaudeSession {
         if self.initialized {
             self.bridge.activate(context.clone());
         }
-        rpc::write(
-            &mut self.input,
-            &json!({"type":"user","session_id":self.id,
-            "parent_tool_use_id":null,"message":{"role":"user","content":frame}}),
-        )
-        .await?;
+        // Writing is the other side of the same deadline: a child that stops
+        // reading its input wedges a prompt far past any frame gap.
+        let (bound, reason) = if self.initialized {
+            (self.frame_idle, "Claude Code stopped reading its input")
+        } else {
+            (INIT_TIMEOUT, "Claude Code initialization timed out")
+        };
+        let message = json!({"type":"user","session_id":self.id,
+            "parent_tool_use_id":null,"message":{"role":"user","content":frame}});
+        frame_within(bound, reason, rpc::write(&mut self.input, &message)).await?;
         self.prompt_written = true;
         loop {
             let message = self.read_frame().await?;

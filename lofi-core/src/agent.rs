@@ -91,6 +91,7 @@ mod model;
 pub(crate) mod native;
 mod subagent;
 mod tool_executor;
+pub(crate) use tool_executor::ActivityWatch;
 pub(crate) mod turn;
 pub(crate) mod turn_session;
 pub use lofi_code::SubagentOp;
@@ -210,6 +211,9 @@ pub struct Agent {
     auto_continue: lofi_types::AutoContinuePolicy,
     confirm_tx: Option<tokio::sync::mpsc::UnboundedSender<ConfirmRequest>>,
     confirm_counter: Arc<AtomicU64>,
+    confirm_watch: Arc<tool_executor::ConfirmWatch>,
+    /// Tool calls this session is running; a child's idle deadline pauses.
+    activity: Arc<tool_executor::ActivityWatch>,
     auto_mode: Option<lofi_code::AutoModeFn>,
     /// Config the evaluator was opened from, with its provider resolved.
     auto_mode_config: Option<Arc<lofi_types::Config>>,
@@ -299,6 +303,8 @@ impl Agent {
             auto_continue: lofi_types::AutoContinuePolicy::default(),
             confirm_tx: None,
             confirm_counter: Arc::new(AtomicU64::new(0)),
+            confirm_watch: Arc::new(tool_executor::ConfirmWatch::default()),
+            activity: Arc::new(tool_executor::ActivityWatch::default()),
             auto_mode: None,
             auto_mode_config: None,
             auto_mode_hints: auto_mode::hint_handle(),
@@ -358,6 +364,8 @@ impl Agent {
             auto_continue: self.auto_continue,
             confirm_tx: self.confirm_tx.clone(),
             confirm_counter: self.confirm_counter.clone(),
+            confirm_watch: self.confirm_watch.clone(),
+            activity: self.activity.clone(),
             auto_mode: self.auto_mode.clone(),
             auto_mode_config: self.auto_mode_config.clone(),
             auto_mode_hints: self.auto_mode_hints.clone(),
@@ -392,6 +400,8 @@ impl Agent {
             shell_policy: self.shell_policy.clone(),
             confirm_tx: self.confirm_tx.clone(),
             confirm_counter: self.confirm_counter.clone(),
+            confirm_watch: self.confirm_watch.clone(),
+            activity: self.activity.clone(),
             auto_mode: self.auto_mode.clone(),
             auto_mode_config: self.auto_mode_config.clone(),
             auto_mode_hints: self.auto_mode_hints.clone(),
@@ -429,6 +439,8 @@ impl Agent {
             shell_policy: self.shell_policy.clone(),
             confirm_tx: self.confirm_tx.clone(),
             confirm_counter: self.confirm_counter.clone(),
+            confirm_watch: self.confirm_watch.clone(),
+            activity: self.activity.clone(),
             auto_mode: self.auto_mode.clone(),
             auto_mode_config: self.auto_mode_config.clone(),
             auto_mode_hints: self.auto_mode_hints.clone(),
@@ -465,6 +477,8 @@ impl Agent {
             image: executor.image,
             confirm_tx: executor.confirm_tx.clone(),
             confirm_counter: executor.confirm_counter.clone(),
+            confirm_watch: executor.confirm_watch.clone(),
+            activity: executor.activity.clone(),
             auto_mode: executor.auto_mode.clone(),
             auto_mode_config: executor.auto_mode_config.clone(),
             auto_mode_hints: executor.auto_mode_hints.clone(),
@@ -543,6 +557,8 @@ impl Agent {
             image: self.image,
             confirm_tx: self.confirm_tx.clone(),
             confirm_counter: self.confirm_counter.clone(),
+            confirm_watch: self.confirm_watch.clone(),
+            activity: self.activity.clone(),
             auto_mode: self.auto_mode.clone(),
             auto_mode_config: self.auto_mode_config.clone(),
             auto_mode_hints: self.auto_mode_hints.clone(),
@@ -577,6 +593,8 @@ impl Agent {
         self.image = executor.image;
         self.confirm_tx = executor.confirm_tx;
         self.confirm_counter = executor.confirm_counter;
+        self.confirm_watch = executor.confirm_watch;
+        self.activity = executor.activity;
         self.auto_mode = executor.auto_mode;
         self.auto_mode_config = executor.auto_mode_config;
         self.auto_mode_hints = executor.auto_mode_hints;

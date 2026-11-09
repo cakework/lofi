@@ -34,8 +34,9 @@ use crate::models::ModelRegistry;
 use crate::session::recorder::TurnOutcome;
 use crate::session::store::{SessionCursor, SessionFile, SessionStore};
 
-/// Maximum time a subagent turn may run when `timeout_ms` is not set.
-const DEFAULT_TIMEOUT_MS: u64 = 600_000;
+/// A run that produces no event for this long is stopped: a stalled child
+/// must not hold its entry, and nothing else ends a run by default.
+const DEFAULT_IDLE_MS: u64 = 300_000;
 /// Cap on the `result` text returned to the parent when `output_limit` is
 /// not set. Also the retention cap: the registry entry and the transcript
 /// settle marker keep at most this much of the result and error text, so
@@ -74,12 +75,15 @@ const MIN_NOTIFY_INTERVAL_MS: u64 = 5_000;
 
 /// Lifecycle states of a subagent entry, reported in tool results.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Status {
+pub(super) enum Status {
     Running,
     Completed,
     Failed,
     Cancelled,
     TimedOut,
+    /// The hard cap passed while a confirmation prompt this child raised was
+    /// still unanswered.
+    Blocked,
 }
 
 impl Status {
@@ -90,6 +94,7 @@ impl Status {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed_out",
+            Self::Blocked => "blocked",
         }
     }
 
@@ -104,6 +109,7 @@ impl Status {
             "completed" => Self::Completed,
             "cancelled" => Self::Cancelled,
             "timed_out" => Self::TimedOut,
+            "blocked" => Self::Blocked,
             _ => Self::Failed,
         }
     }
@@ -700,8 +706,9 @@ impl SubagentRegistry {
     ///
     /// Running entries are cancelled first: a background run can outlive
     /// the switch by minutes, and without the cancel it would keep spending
-    /// against a session that no longer owns it. Their jobs die with them;
-    /// their terminal notices are silenced.
+    /// against a session that no longer owns it. Their jobs die with them
+    /// and the timers they armed are dropped; their terminal notices are
+    /// silenced.
     #[must_use]
     pub fn clear(&self) -> (f64, lofi_types::Usage) {
         {
@@ -712,7 +719,9 @@ impl SubagentRegistry {
                 }
                 entry.cancel.store(true, Ordering::SeqCst);
                 entry.notify_terminal = false;
-                entry.backend.tool_executor().jobs().kill_owned(id);
+                let tools = entry.backend.tool_executor();
+                tools.jobs().kill_owned(id);
+                let _ = tools.timers().cancel_owner(Some(id.as_str()));
                 if let Some(abort) = &entry.abort {
                     abort.abort();
                 }
@@ -776,7 +785,7 @@ impl SubagentRegistry {
     /// reports the state it found. `None` means no entry has that id.
     #[must_use]
     pub fn kill(&self, id: &str, reason: Option<&str>) -> Option<&'static str> {
-        let (jobs, abort, status) = {
+        let (tools, abort, status) = {
             let mut entries = lock(&self.entries);
             let entry = entries.get_mut(id)?;
             if entry.status.is_terminal() {
@@ -789,13 +798,16 @@ impl SubagentRegistry {
             }
             entry.events.push("state", state);
             (
-                entry.backend.tool_executor().jobs(),
+                entry.backend.tool_executor(),
                 entry.abort.clone(),
                 entry.status.as_str(),
             )
         };
-        // The child's process tree dies with it.
-        jobs.kill_owned(id);
+        // The child's process tree dies with it, and so do the reminders it
+        // armed: their owner is gone, and the notices would otherwise keep
+        // waking this session for a run that no longer exists.
+        tools.jobs().kill_owned(id);
+        let _ = tools.timers().cancel_owner(Some(id));
         // Backstop: a run that never observes the cancel flag is aborted
         // after a grace period; its SettleOnDrop then settles it as
         // cancelled.
@@ -1057,6 +1069,8 @@ impl Drop for SettleOnDrop {
             } else {
                 "subagent task ended unexpectedly"
             }),
+            // The guard does not know a deadline: it settles an abandoned run.
+            None,
             &lock(&self.totals),
             &carried,
         );
@@ -1350,14 +1364,14 @@ async fn spawn(
     registry: &SubagentRegistry,
     args: &Value,
 ) -> Value {
-    for rejected in ["id", "output_limit"] {
-        if args.get(rejected).is_some_and(|v| !v.is_null()) {
-            return json!({
-                "ok": false,
-                "status": "failed",
-                "error": format!("subagentSpawn does not accept {rejected}"),
-            });
-        }
+    // `id` resumes that run in the background, so a run stopped at its
+    // deadline continues without a foreground call that dies with its exec.
+    if args.get("output_limit").is_some_and(|v| !v.is_null()) {
+        return json!({
+            "ok": false,
+            "status": "failed",
+            "error": "subagentSpawn does not accept output_limit",
+        });
     }
     let started = match start(template, support, registry, args, true).await {
         Ok(started) => started,
@@ -1389,11 +1403,19 @@ fn status_op(registry: &SubagentRegistry, args: &Value) -> Value {
         out["note"] = json!(note);
     }
     if let Some(outcome) = &entry.outcome {
-        if let Some(usage) = outcome.get("usage") {
-            out["usage"] = usage.clone();
-        }
-        if let Some(error) = outcome.get("error") {
-            out["error"] = error.clone();
+        // The outcome flattens the run's progress into these keys, and the
+        // status reports the same fields the settled result carries.
+        for key in [
+            "usage",
+            "error",
+            "rounds",
+            "elapsed_ms",
+            "last_tool",
+            "stopped",
+        ] {
+            if let Some(value) = outcome.get(key) {
+                out[key] = value.clone();
+            }
         }
     }
     out
@@ -1874,7 +1896,9 @@ async fn start(
         .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| Error::Tool("prompt is required and must be non-empty".into()))?
         .to_string();
-    let timeout = Duration::from_millis(u64_arg(args, "timeout_ms")?.unwrap_or(DEFAULT_TIMEOUT_MS));
+    // `timeout_ms` stays the hard cap; `idle_ms` is the silence that stops a
+    // stalled run long before the cap.
+    let limits = Deadlines::from_args(args)?;
     let output_limit = u64_arg(args, "output_limit")?.map_or(DEFAULT_OUTPUT_LIMIT, |v| v as usize);
     let token_budget = u64_arg(args, "token_budget")?;
     if token_budget == Some(0) {
@@ -1918,7 +1942,7 @@ async fn start(
                 registry,
                 id,
                 base_len,
-                timeout,
+                limits,
                 prompt,
                 output_limit,
                 token_budget,
@@ -1951,7 +1975,7 @@ async fn run_task(
     registry: SubagentRegistry,
     id: String,
     base_len: usize,
-    timeout: Duration,
+    limits: Deadlines,
     prompt: String,
     output_limit: usize,
     token_budget: Option<u64>,
@@ -1985,7 +2009,7 @@ async fn run_task(
         registry.clone(),
         id.clone(),
         base_len,
-        timeout,
+        limits,
         prompt,
         output_limit,
         token_budget,
@@ -2018,6 +2042,7 @@ async fn run_task(
         status,
         out["result"].as_str(),
         out["error"].as_str(),
+        out["stopped"].as_str(),
         &lock(&totals),
         &carried,
     );
@@ -2068,21 +2093,53 @@ async fn run_task(
 }
 
 /// One-line terminal notice: status plus the first line of the outcome.
-fn terminal_notice(id: &str, status: Status, outcome: &Value) -> String {
+pub(super) fn terminal_notice(id: &str, status: Status, outcome: &Value) -> String {
     let detail = outcome["result"]
         .as_str()
         .or_else(|| outcome["error"].as_str())
         .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
         // A detail that only repeats the status adds nothing.
         .filter(|line| *line != status.as_str());
-    match detail {
-        Some(line) => format!(
-            "subagent {id} {}: {}",
-            status.as_str(),
-            cap_at_boundary(line, NOTICE_DETAIL_CAP)
-        ),
+    // Where the run got to, so a stopped run says more than that it stopped;
+    // a run that finished its task has nothing to explain. A wrapped run
+    // settles completed, so it names its deadline too: a summary is not the
+    // task finishing.
+    let deadline = outcome["stopped"].as_str();
+    let where_to = (status != Status::Completed || deadline.is_some())
+        .then(|| progress_note(outcome))
+        .flatten();
+    let note = match (deadline, &where_to) {
+        (Some(deadline), Some(note)) => Some(format!("stopped: {deadline}; {note}")),
+        (Some(deadline), None) => Some(format!("stopped: {deadline}")),
+        (None, note) => note.clone(),
+    };
+    let head = match note {
+        Some(note) => format!("subagent {id} {} ({note})", status.as_str()),
         None => format!("subagent {id} {}", status.as_str()),
+    };
+    match detail {
+        Some(line) => format!("{head}: {}", cap_at_boundary(line, NOTICE_DETAIL_CAP)),
+        None => head,
     }
+}
+
+/// "round 4 after 312 s, bash" for a settled run that reported progress.
+fn progress_note(outcome: &Value) -> Option<String> {
+    let rounds = outcome["rounds"].as_u64().filter(|rounds| *rounds > 0);
+    let seconds = outcome["elapsed_ms"].as_u64().map(|ms| ms / 1000);
+    let rounds = rounds.map(|rounds| format!("round {rounds}"));
+    let seconds = seconds.map(|seconds| format!("{seconds} s"));
+    let note = [rounds, seconds]
+        .into_iter()
+        .flatten()
+        .reduce(|head, tail| format!("{head} after {tail}"))
+        .unwrap_or_default();
+    let note = match (note.is_empty(), outcome["last_tool"].as_str()) {
+        (true, Some(tool)) => tool.to_string(),
+        (false, Some(tool)) => format!("{note}, {tool}"),
+        (_, None) => note,
+    };
+    (!note.is_empty()).then_some(note)
 }
 
 /// The JSON body stored at settle and returned to the foreground caller,
@@ -2112,6 +2169,14 @@ fn outcome_json(id: &str, session_id: Option<&str>, outcome: RunOutcome, model: 
     if let Some(usage) = outcome.usage {
         out["usage"] = usage;
     }
+    if let Some(stopped) = outcome.stopped {
+        out["stopped"] = json!(stopped);
+    }
+    if let Some(progress) = outcome.progress {
+        for (key, value) in progress.as_object().into_iter().flatten() {
+            out[key] = value.clone();
+        }
+    }
     if let Some(session_id) = session_id {
         out["session_id"] = json!(session_id);
     }
@@ -2131,6 +2196,12 @@ struct RunOutcome {
     full_bytes: Option<usize>,
     // Token and cost totals of the run, when the provider reported any.
     usage: Option<Value>,
+    // Where the run got to (rounds, elapsed, last tool), for the settle
+    // report. A restored entry keeps no live progress.
+    progress: Option<Value>,
+    // The deadline that stopped the run, when one did: a run that answered
+    // its summary request settles completed but did not finish its task.
+    stopped: Option<String>,
 }
 
 /// Spend the entry's earlier runs already billed, for its settle marker.
@@ -2156,6 +2227,7 @@ fn record_settled(
     status: Status,
     result: Option<&str>,
     error: Option<&str>,
+    stopped: Option<&str>,
     totals: &ChildUsage,
     carried: &Rollup,
 ) -> bool {
@@ -2190,6 +2262,7 @@ fn record_settled(
             usage,
             cost,
             prior,
+            stopped: stopped.map(str::to_string),
         },
     };
     let mut event = build(&result);
@@ -2237,6 +2310,8 @@ struct SettledRun {
     /// Spend of the child session's earlier runs, which a resume claims
     /// before it installs its own totals.
     prior: Rollup,
+    /// The deadline that stopped the run, when one did.
+    stopped: Option<String>,
 }
 
 /// Restore the terminal record from the transcript tail. The marker is the
@@ -2265,6 +2340,7 @@ fn read_settled_marker(path: &Path) -> Option<SettledRun> {
         usage,
         cost,
         prior,
+        stopped,
     } = event.kind
     {
         let usage = usage.map(|usage| {
@@ -2283,6 +2359,7 @@ fn read_settled_marker(path: &Path) -> Option<SettledRun> {
             error,
             usage,
             prior: carried,
+            stopped,
         })
     } else {
         None
@@ -2300,6 +2377,7 @@ fn spawn_event_drain(
     token_budget: Option<u64>,
     registry: SubagentRegistry,
     id: String,
+    progress: Arc<RunProgress>,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
@@ -2307,6 +2385,9 @@ fn spawn_event_drain(
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let drain = tokio::spawn(async move {
         let note = |event: &AgentEvent| {
+            // Every event is progress: the deadline and the settle report
+            // both read this.
+            progress.note(event);
             if let AgentEvent::RoundUsage { cost, usage } = event {
                 let spent = {
                     let mut totals = lock(&totals);
@@ -2378,6 +2459,118 @@ fn cap_event_text(text: &str) -> String {
     cap_at_boundary(text, EVENT_TEXT_CAP)
 }
 
+/// Restamp the entry, drop its sandbox thread, and fold the run's spend into
+/// the session's unreported total, which the parent turn loop reports after
+/// the current tool round. Skipped when `clear()` removed the entry or the
+/// generation moved on: that spend belongs to a session this registry no
+/// longer owns.
+fn settle_entry(
+    registry: &SubagentRegistry,
+    id: &str,
+    totals: &Arc<std::sync::Mutex<ChildUsage>>,
+    generation: u64,
+) {
+    let present = if let Some(entry) = lock(&registry.entries).get_mut(id) {
+        // Restamp at settle: the stamp orders eviction, and a long run that
+        // finishes last must not become the oldest victim.
+        entry.used = registry.stamp();
+        // Idle entries must not hold a sandbox thread: it restarts lazily on
+        // the first exec of the next resume.
+        entry.backend = entry
+            .backend
+            .with_tool_executor(entry.backend.tool_executor().reset_exec_worker());
+        true
+    } else {
+        false
+    };
+    if present {
+        let mut unreported = lock(&registry.unreported);
+        if registry.generation() == generation {
+            lock(totals).report(&mut unreported);
+        }
+    }
+}
+
+/// Run one turn until it finishes or a deadline stops it. Returns the turn's
+/// result (a cancelled turn when a deadline fired) with the deadline that
+/// fired and the prompt the child was waiting on when it did.
+#[allow(clippy::too_many_arguments)]
+async fn run_under_watchdog(
+    backend: &BackendRef,
+    messages: &mut Vec<Message>,
+    tx: mpsc::Sender<AgentEvent>,
+    cursor: Option<&SessionCursor>,
+    cancel: &Arc<AtomicBool>,
+    prompt: String,
+    progress: &Arc<RunProgress>,
+    limits: &Deadlines,
+) -> (Result<TurnOutcome>, Option<(Expiry, Option<String>)>) {
+    // The turn stops on its own flag: the run's flag stays the caller's, so
+    // a deadline that stops this turn does not read as a kill to the summary
+    // turn that follows it.
+    let stopping = Arc::new(AtomicBool::new(false));
+    // A run whose task is aborted (a kill, a /new, a panic) still stops the
+    // work it started: the sandbox watches this flag, not the task.
+    let _stop_on_drop = CancelOnDrop {
+        cancel: stopping.clone(),
+        armed: true,
+    };
+    let turn = backend.run_turn(
+        messages,
+        // The task is parent-written, so it must not read as user
+        // authorization in the child's auto-mode context.
+        TurnRequest::prompt(prompt, PromptKind::Task),
+        tx,
+        cursor,
+        RunControls {
+            cancel: Some(stopping.clone()),
+            preempt: None,
+        },
+    );
+    tokio::pin!(turn);
+    let mut expired = None;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            res = &mut turn => break res,
+            () = tokio::time::sleep(WATCHDOG_TICK) => {
+                // A kill, an Esc, or a dropped caller stops the turn it
+                // started, and the run then settles cancelled. The turn still
+                // finishes on its own so the round it reached is recorded and
+                // the transcript sealed; only a turn that ignores the flag is
+                // dropped, after the grace a kill already allows.
+                if cancel.load(Ordering::SeqCst) {
+                    stopping.store(true, Ordering::SeqCst);
+                    break tokio::time::timeout(KILL_GRACE, &mut turn)
+                        .await
+                        .unwrap_or(Ok(TurnOutcome::Cancelled));
+                }
+                if let Some(reason) = progress.expired(limits) {
+                    // Read the open prompt now: dropping the turn closes it,
+                    // and a blocked settle names what it waited on.
+                    let waiting = (progress.confirms.pending() > 0)
+                        .then(|| progress.confirms.command())
+                        .flatten();
+                    // The turn keeps the round it is in: a dropped future
+                    // takes its partial answer with it. A turn that ignores
+                    // the flag is dropped after the grace a kill allows; one
+                    // blocked on a prompt has no partial to keep and closes
+                    // that prompt now, so an answer in the window cannot
+                    // start the command under a set stop flag.
+                    let unwinding = waiting.is_none();
+                    expired = Some((reason, waiting));
+                    stopping.store(true, Ordering::SeqCst);
+                    if unwinding {
+                        let _ = tokio::time::timeout(KILL_GRACE, &mut turn).await;
+                    }
+                    break Ok(TurnOutcome::Cancelled);
+                }
+            }
+        }
+    };
+    (outcome, expired)
+}
+
 /// Run one turn to completion and finalize the registry entry: the open
 /// tool call a timeout closes, the restamp, and the sandbox thread of an
 /// idle entry. The caller owns `messages`, so the history outlives an
@@ -2391,7 +2584,7 @@ async fn run_turn_with_timeout(
     registry: SubagentRegistry,
     id: String,
     base_len: usize,
-    timeout: Duration,
+    limits: Deadlines,
     prompt: String,
     output_limit: usize,
     token_budget: Option<u64>,
@@ -2402,6 +2595,10 @@ async fn run_turn_with_timeout(
     // settle must not fold spend into the new session.
     generation: u64,
 ) -> RunOutcome {
+    let progress = Arc::new(RunProgress::new(
+        backend.tool_executor().confirm_watch.clone(),
+        backend.tool_executor().activity.clone(),
+    ));
     let (tx, rx) = mpsc::channel::<AgentEvent>(256);
     // The child events have no consumer: the parent transcript records the
     // tool call, not the child stream. Collect the usage so the spend is
@@ -2413,50 +2610,83 @@ async fn run_turn_with_timeout(
         token_budget,
         registry.clone(),
         id.clone(),
+        progress.clone(),
     );
-    let turn = backend.run_turn(
+    // A watchdog, not one timeout: a child that keeps producing events is
+    // working, and a child waiting on the user is not idle at all.
+    let (outcome, expired) = run_under_watchdog(
+        &backend,
         messages,
-        // The task is parent-written, so it must not read as user
-        // authorization in the child's auto-mode context.
-        TurnRequest::prompt(prompt, PromptKind::Task),
         tx,
         cursor.as_ref(),
-        RunControls {
-            cancel: Some(cancel.clone()),
-            preempt: None,
-        },
-    );
-    let outcome = tokio::time::timeout(timeout, turn).await;
+        &cancel,
+        prompt.clone(),
+        &progress,
+        &limits,
+    )
+    .await;
     // Sender clones may outlive the turn, so the channel may never close:
     // stop the drain explicitly; it flushes the buffer before exiting.
     let _ = stop_tx.send(());
     let _ = drain.await;
 
-    // The drain flushed before this point, so a breached budget is visible
-    // here even when the provider finished the round before noticing.
-    let budget_over = {
-        let totals = lock(&totals);
-        let spent = totals.total();
-        token_budget
-            .filter(|&budget| spent > budget)
-            .map(|budget| (spent, budget))
+    // A stopped run is wrapped up: one short turn asks what it reached, so
+    // the parent reads a summary. A run stopped while the user owed it an
+    // answer never reaches its model.
+    let blocked = match &expired {
+        Some((Expiry::Cap(_), Some(command))) => Some(command.clone()),
+        _ => None,
     };
-    // Read before the close below rewrites the history: a resume replays the
-    // whole history this entry keeps, so the terminal text must only promise
-    // one when the history holds a reply or a tool exchange to continue from.
-    // Earlier runs on a resumed entry count: their work is kept too.
-    let kept = messages
-        .iter()
-        .any(|message| matches!(message.role, Role::Assistant | Role::Tool));
-    let (status, error) = classify_outcome(outcome, budget_over, &cancel, timeout, &id, kept);
-    if status == Status::TimedOut {
-        // A timeout keeps what the run reached, so a resume continues
-        // instead of paying for the work again. The abort may leave a tool
-        // call open, which providers reject, so close it with the interrupted
-        // result. The transcript keeps the open call, and a replay repairs it
-        // the same way.
+    // The progress report describes the run, not the summary that follows it.
+    let reported = progress.json();
+    // A turn dropped mid-call (a deadline, or a kill that outran its grace)
+    // leaves a tool call no provider will accept, so the history is repaired
+    // before it settles. A stopped run keeps what it reached either way, so a
+    // resume continues instead of paying for the work again.
+    close_unanswered_tool_uses(messages);
+    let mut wrapped = false;
+    // A caller that already stopped the run, or a budget the drain's last
+    // flush crossed, gets no summary request: it would only be dropped, and
+    // its spend would never reach the drain.
+    if expired.is_some() && blocked.is_none() && !cancel.load(Ordering::SeqCst) {
+        wrapped = wrap_up(
+            &backend,
+            messages,
+            cursor.as_ref(),
+            &totals,
+            &registry,
+            &id,
+            &progress,
+            token_budget,
+            &limits,
+            &cancel,
+        )
+        .await;
+        // A summary cut mid-call leaves the same unpaired call behind.
         close_unanswered_tool_uses(messages);
     }
+    // The terminal text only promises a resume when the history holds a reply
+    // or a tool exchange: the turn's own work, an earlier run's, and whatever
+    // round a summary cut mid-exchange still completed.
+    let kept = holds_work(messages);
+    // The wrap-up spent tokens too, so a breached budget is only visible
+    // now; the drain flushed, so it also catches a round the provider
+    // finished before noticing the cancel flag.
+    let budget_over = breach(&totals, token_budget);
+    // A kill, an Esc or a dropped caller that landed while the summary ran
+    // is a cancellation, not the deadline that had already passed.
+    let stopped_by_caller = cancel.load(Ordering::SeqCst) && budget_over.is_none();
+    let (mut status, mut error) = match (&expired, budget_over) {
+        (None, _) => classify_outcome(outcome, budget_over, &id, kept),
+        // The summary's own spend can cross the budget: a stopped run keeps
+        // the failure contract of an ordinary turn.
+        (Some(_), Some((spent, budget))) => budget_failure(spent, budget, &id, kept),
+        (Some(_), None) if stopped_by_caller => (Status::Cancelled, Some("cancelled".to_string())),
+        (Some(_), None) if wrapped => (Status::Completed, None),
+        (Some((reason, _)), None) => {
+            deadline_status(*reason, blocked.as_deref(), &limits, &id, kept)
+        }
+    };
     let (result, full_bytes) = if status == Status::Completed {
         last_text(&messages[base_len..], output_limit)
             .map_or((None, None), |(text, full)| (Some(text), full))
@@ -2464,42 +2694,27 @@ async fn run_turn_with_timeout(
         (None, None)
     };
     // A completed run without a final text is a failure: reporting
-    // an empty string as a successful result would hide it.
-    let (status, error) = if status == Status::Completed && result.is_none() {
-        (
-            Status::Failed,
-            Some("subagent completed without a text result".to_string()),
-        )
-    } else {
-        (status, error)
-    };
+    // an empty string as a successful result would hide it. A summary that
+    // came back empty is no summary, so a stopped run keeps the deadline
+    // status and its resume hint instead.
+    if status == Status::Completed && result.is_none() {
+        match &expired {
+            Some((reason, _)) => {
+                (status, error) = deadline_status(*reason, blocked.as_deref(), &limits, &id, kept);
+            }
+            None => {
+                (status, error) = (
+                    Status::Failed,
+                    Some("subagent completed without a text result".to_string()),
+                );
+            }
+        }
+    }
     // The terminal status is NOT set here: `run_task` writes status,
     // outcome, event, and the watch state in one critical section. Setting
     // it early would let a resume claim the entry in between and this
     // run's stale outcome would then land on the new run's waiters.
-    let entry_present = if let Some(entry) = lock(&registry.entries).get_mut(&id) {
-        // Restamp at settle: the stamp orders eviction, and a long run that
-        // finishes last must not become the oldest victim.
-        entry.used = registry.stamp();
-        // Idle entries must not hold a sandbox thread: it restarts
-        // lazily on the first exec of the next resume.
-        entry.backend = entry
-            .backend
-            .with_tool_executor(entry.backend.tool_executor().reset_exec_worker());
-        true
-    } else {
-        false
-    };
-    // Fold the run's spend into the session's unreported total; the parent
-    // turn loop records and reports it after the current tool round. Skip
-    // when the entry is gone (clear ran) or the generation moved on: both
-    // mean the spend belongs to a session that no longer owns this registry.
-    if entry_present {
-        let mut unreported = lock(&registry.unreported);
-        if registry.generation() == generation {
-            lock(&totals).report(&mut unreported);
-        }
-    }
+    settle_entry(&registry, &id, &totals, generation);
     let usage = lock(&totals).json();
     RunOutcome {
         status,
@@ -2507,7 +2722,143 @@ async fn run_turn_with_timeout(
         error,
         full_bytes,
         usage,
+        progress: Some(reported),
+        stopped: expired.map(|(reason, _)| reason.as_str().to_string()),
     }
+}
+
+/// The budget a run crossed, if it did: the provider reports it per round,
+/// and the wrap-up's own spend is only visible once it flushed.
+fn breach(
+    totals: &Arc<std::sync::Mutex<ChildUsage>>,
+    token_budget: Option<u64>,
+) -> Option<(u64, u64)> {
+    let spent = lock(totals).total();
+    token_budget
+        .filter(|&budget| spent > budget)
+        .map(|budget| (spent, budget))
+}
+
+/// One short turn asking a stopped run what it reached, so the parent reads
+/// a summary instead of a bare timeout. Returns whether the child answered;
+/// the caller settles `completed` on the answer and keeps the deadline
+/// status when it has none.
+#[allow(clippy::too_many_arguments)]
+async fn wrap_up(
+    backend: &BackendRef,
+    messages: &mut Vec<Message>,
+    cursor: Option<&SessionCursor>,
+    totals: &Arc<std::sync::Mutex<ChildUsage>>,
+    registry: &SubagentRegistry,
+    id: &str,
+    progress: &Arc<RunProgress>,
+    token_budget: Option<u64>,
+    limits: &Deadlines,
+    // The run's own stop flag: a kill or a dropped caller stops the summary
+    // like it stops any other turn.
+    run_cancel: &Arc<AtomicBool>,
+) -> bool {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    // The wrap-up is a request like any other, so its spend counts too; the
+    // turn boundary keeps a per-turn cumulative cost from replacing the
+    // run's total.
+    lock(totals).start_turn();
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Dropping this future (an aborted caller, a panic) still stops the
+    // sandbox work a summary call may have started.
+    let _stop = CancelOnDrop {
+        cancel: cancel.clone(),
+        armed: true,
+    };
+    let (stop_tx, drain) = spawn_event_drain(
+        rx,
+        totals.clone(),
+        cancel.clone(),
+        token_budget,
+        registry.clone(),
+        id.to_string(),
+        progress.clone(),
+    );
+    let turn = backend.run_turn(
+        messages,
+        TurnRequest::prompt(WRAP_UP_PROMPT.to_string(), PromptKind::Task),
+        tx,
+        cursor,
+        RunControls {
+            cancel: Some(cancel.clone()),
+            preempt: None,
+        },
+    );
+    tokio::pin!(turn);
+    let budget = limits
+        .cap
+        .map_or(WRAP_UP_TIMEOUT, |cap| WRAP_UP_TIMEOUT.min(cap));
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    // A cap shorter than the wrap-up budget bounds it too, so a test or a
+    // tight caller never waits much past the deadline it set.
+    let finished = loop {
+        tokio::select! {
+            biased;
+            res = &mut turn => break Some(res),
+            () = &mut deadline => {
+                // The summary keeps the round it is in for the same reason
+                // the turn above does: dropping the future takes the reply
+                // it was streaming, and its message with it. The deadline
+                // stays authoritative, so this is not a wrap-up that
+                // finished.
+                cancel.store(true, Ordering::SeqCst);
+                let _ = tokio::time::timeout(KILL_GRACE, &mut turn).await;
+                break None;
+            }
+            () = tokio::time::sleep(WATCHDOG_TICK) => {
+                // The caller stopped the run, or the drain stopped the
+                // summary for crossing the budget: either way the turn winds
+                // down on its own so its round is recorded and the transcript
+                // sealed, and only a turn that ignores the flag is dropped.
+                if run_cancel.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
+                    cancel.store(true, Ordering::SeqCst);
+                    break Some(
+                        tokio::time::timeout(KILL_GRACE, &mut turn)
+                            .await
+                            .unwrap_or(Ok(TurnOutcome::Cancelled)),
+                    );
+                }
+            }
+        }
+    };
+    cancel.store(true, Ordering::SeqCst);
+    let _ = stop_tx.send(());
+    let _ = drain.await;
+    matches!(
+        finished,
+        Some(Ok(
+            TurnOutcome::Finished | TurnOutcome::ContextPressure { resume: false }
+        ))
+    )
+}
+
+/// Whether the history holds work a resume would continue from: a reply with
+/// text or a tool call, a tool result, or an image. An empty message, or one
+/// whose only thinking was cut before its signature, carries nothing a
+/// request replays, so a resume would have no history to continue from and
+/// the hint must not promise one.
+fn holds_work(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::Assistant | Role::Tool))
+        .any(|message| {
+            message.blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => !text.trim().is_empty(),
+                ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::Image { .. } => true,
+                ContentBlock::Thinking {
+                    text, signature, ..
+                } => !text.trim().is_empty() && signature.as_deref().is_some_and(|s| !s.is_empty()),
+                ContentBlock::PartSignature { .. } => false,
+            })
+        })
 }
 
 /// Map the turn result to the terminal status. `budget_over` is `(spent,
@@ -2515,24 +2866,15 @@ async fn run_turn_with_timeout(
 /// this call, so the breach is visible even when the provider finished the
 /// round before noticing the cancel flag.
 fn classify_outcome(
-    outcome: std::result::Result<Result<TurnOutcome>, tokio::time::error::Elapsed>,
+    outcome: Result<TurnOutcome>,
     budget_over: Option<(u64, u64)>,
-    cancel: &Arc<AtomicBool>,
-    timeout: Duration,
     id: &str,
     kept: bool,
 ) -> (Status, Option<String>) {
     match outcome {
-        Ok(Ok(outcome)) => {
+        Ok(outcome) => {
             if let Some((spent, budget)) = budget_over {
-                (
-                    Status::Failed,
-                    Some(resume_hint(
-                        &format!("token budget exceeded ({spent} > {budget})"),
-                        id,
-                        kept,
-                    )),
-                )
+                budget_failure(spent, budget, id, kept)
             } else {
                 match outcome {
                     TurnOutcome::Cancelled | TurnOutcome::Detached => {
@@ -2554,20 +2896,57 @@ fn classify_outcome(
                 }
             }
         }
-        Ok(Err(e)) => (Status::Failed, Some(e.to_string())),
-        Err(_) => {
-            cancel.store(true, Ordering::SeqCst);
-            // The run keeps the history it reached: a resume continues from
-            // the work already done instead of rerunning the task.
-            (
-                Status::TimedOut,
-                Some(resume_hint(
-                    &format!("timed out after {} ms", timeout.as_millis()),
-                    id,
-                    kept,
-                )),
-            )
-        }
+        Err(e) => (Status::Failed, Some(e.to_string())),
+    }
+}
+
+/// The status and text of a run that crossed its token budget: the parent
+/// reads it as a failure, with the resume path when work was kept.
+fn budget_failure(spent: u64, budget: u64, id: &str, kept: bool) -> (Status, Option<String>) {
+    (
+        Status::Failed,
+        Some(resume_hint(
+            &format!("token budget exceeded ({spent} > {budget})"),
+            id,
+            kept,
+        )),
+    )
+}
+
+/// The terminal status of a run its deadlines stopped. A run that kept its
+/// work names the resume path, like a timeout always did.
+fn deadline_status(
+    expiry: Expiry,
+    blocked: Option<&str>,
+    limits: &Deadlines,
+    id: &str,
+    kept: bool,
+) -> (Status, Option<String>) {
+    match (expiry, blocked) {
+        (_, Some(command)) => (
+            Status::Blocked,
+            Some(resume_hint(
+                &format!("blocked on a confirmation prompt for {command}"),
+                id,
+                kept,
+            )),
+        ),
+        (Expiry::Idle, None) => (
+            Status::TimedOut,
+            Some(resume_hint(
+                &format!("idle for {} ms", limits.idle.as_millis()),
+                id,
+                kept,
+            )),
+        ),
+        (Expiry::Cap(cap), None) => (
+            Status::TimedOut,
+            Some(resume_hint(
+                &format!("timed out after {} ms", cap.as_millis()),
+                id,
+                kept,
+            )),
+        ),
     }
 }
 
@@ -2584,6 +2963,161 @@ fn resume_hint(reason: &str, id: &str, kept: bool) -> String {
     }
 }
 
+/// Wall-clock bounds on one run: an idle deadline every event resets, and an
+/// optional cap that no event postpones. There is no default cap: a fixed
+/// clock cuts exactly the long-horizon work a subagent exists for, and a run
+/// that keeps producing events is working, not stuck.
+#[derive(Clone, Copy)]
+struct Deadlines {
+    idle: Duration,
+    cap: Option<Duration>,
+}
+
+impl Deadlines {
+    fn from_args(args: &Value) -> Result<Self> {
+        let idle = Duration::from_millis(u64_arg(args, "idle_ms")?.unwrap_or(DEFAULT_IDLE_MS));
+        // A zero idle deadline would stop the run on its first tick, before
+        // any child work: reject it instead of silently killing the run.
+        if idle.is_zero() {
+            return Err(Error::Tool("idle_ms must be greater than zero".to_string()));
+        }
+        Ok(Self {
+            idle,
+            cap: u64_arg(args, "timeout_ms")?.map(Duration::from_millis),
+        })
+    }
+}
+
+/// Which deadline stopped a run, carrying the cap that fired so the settle
+/// report names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Expiry {
+    Idle,
+    Cap(Duration),
+}
+
+impl Expiry {
+    /// The deadline that fired, so a settled run says a deadline stopped it
+    /// even when it answered the summary request.
+    fn as_str(self) -> &'static str {
+        match self {
+            Expiry::Idle => "idle",
+            Expiry::Cap(_) => "cap",
+        }
+    }
+}
+
+/// How long the watchdog sleeps between checks. Small enough that a short
+/// idle deadline means what a test says, cheap enough to ignore: it takes no
+/// lock a child's turn needs.
+const WATCHDOG_TICK: Duration = Duration::from_millis(25);
+
+/// One short turn after a deadline stops a run, so the parent learns what the
+/// child reached instead of only that it stopped. Small next to any deadline.
+const WRAP_UP_TIMEOUT: Duration = Duration::from_mins(1);
+
+const WRAP_UP_PROMPT: &str = "Your run was stopped at its deadline. In this reply only, state what you reached and what remains, in at most a few lines, and nothing else. Do not call tools in this reply.";
+
+/// What a live run has done: the deadline reads it, and the settle report
+/// names it, so a stopped run says where it stopped.
+struct RunProgress {
+    started: std::time::Instant,
+    /// Milliseconds since `started` of the last event the child produced.
+    last_event: AtomicU64,
+    rounds: AtomicU64,
+    /// Milliseconds since `started` of the answer wait already spent at
+    /// `last_event`; only the wait since that event is the child's own.
+    waited_at_event: AtomicU64,
+    last_tool: std::sync::Mutex<Option<String>>,
+    /// Prompts this child is waiting on: the idle clock pauses while any is
+    /// open, because the child cannot make progress until the user answers.
+    confirms: Arc<super::tool_executor::ConfirmWatch>,
+    /// Calls this child is running: the idle clock pauses while any runs,
+    /// because a call reports nothing until it ends.
+    activity: Arc<super::tool_executor::ActivityWatch>,
+}
+
+impl RunProgress {
+    fn new(
+        confirms: Arc<super::tool_executor::ConfirmWatch>,
+        activity: Arc<super::tool_executor::ActivityWatch>,
+    ) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            last_event: AtomicU64::new(0),
+            rounds: AtomicU64::new(0),
+            waited_at_event: AtomicU64::new(confirms.waited().as_millis() as u64),
+            last_tool: std::sync::Mutex::new(None),
+            confirms,
+            activity,
+        }
+    }
+
+    /// Note one drained event. Every event counts as progress, not only tool
+    /// rounds: a long stream of deltas is a working child.
+    fn note(&self, event: &AgentEvent) {
+        self.last_event
+            .store(self.started.elapsed().as_millis() as u64, Ordering::SeqCst);
+        self.waited_at_event
+            .store(self.confirms.waited().as_millis() as u64, Ordering::SeqCst);
+        match event {
+            AgentEvent::RoundUsage { .. } => {
+                self.rounds.fetch_add(1, Ordering::SeqCst);
+            }
+            // A nested call of the child's own agent loop reports the same
+            // way, so both name what the child last reached for.
+            AgentEvent::ToolStart { name, .. } | AgentEvent::NativeToolStart { name, .. } => {
+                *lock(&self.last_tool) = Some(name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// The deadline that has passed, if any. A run waiting on the user, or
+    /// busy inside a tool call that reports nothing until it ends, is
+    /// working: only the hard cap stops it.
+    fn expired(&self, limits: &Deadlines) -> Option<Expiry> {
+        let elapsed = self.started.elapsed();
+        if let Some(cap) = limits.cap {
+            if elapsed >= cap {
+                return Some(Expiry::Cap(cap));
+            }
+        }
+        let (busy, free) = self.activity.idle_mark();
+        if self.confirms.pending() > 0 || busy > 0 {
+            return None;
+        }
+        let last_event = Duration::from_millis(self.last_event.load(Ordering::SeqCst));
+        // Answer waits are the user's time, not the child's: only the wait
+        // since the last event is subtracted, so one long approval does not
+        // stretch every later idle window.
+        let waited = self.confirms.waited().saturating_sub(Duration::from_millis(
+            self.waited_at_event.load(Ordering::SeqCst),
+        ));
+        let idle = elapsed.saturating_sub(last_event).saturating_sub(waited);
+        // A call that has just ended is activity the drain has not noted yet:
+        // without this, a tick racing the end of a long call stops a run that
+        // was working all along.
+        let idle = match free {
+            Some(free) => idle.min(free),
+            None => idle,
+        };
+        idle.ge(&limits.idle).then_some(Expiry::Idle)
+    }
+
+    /// Where the run got to, as the settle report and the notice name it.
+    fn json(&self) -> Value {
+        let mut out = json!({
+            "rounds": self.rounds.load(Ordering::SeqCst),
+            "elapsed_ms": self.started.elapsed().as_millis() as u64,
+        });
+        if let Some(tool) = lock(&self.last_tool).clone() {
+            out["last_tool"] = json!(tool);
+        }
+        out
+    }
+}
+
 /// Usage totals of one subagent run, collected from the drained events.
 #[derive(Default)]
 struct ChildUsage {
@@ -2592,6 +3126,8 @@ struct ChildUsage {
     cache_read: u64,
     cache_write: u64,
     cost: f64,
+    /// The cost the current turn has reported so far.
+    turn_cost: f64,
     seen: bool,
 }
 
@@ -2601,9 +3137,16 @@ impl ChildUsage {
         self.output += usage.output_tokens;
         self.cache_read += usage.cache_read_tokens;
         self.cache_write += usage.cache_write_tokens;
-        // RoundUsage reports the turn's cumulative cost, so keep the latest.
-        self.cost = cost;
+        // RoundUsage reports the turn's cumulative cost: add what this turn
+        // billed on top of the run's other turns.
+        self.cost += cost - self.turn_cost;
+        self.turn_cost = cost;
         self.seen = true;
+    }
+
+    /// Start another turn of the same run: its cost counts from zero again.
+    fn start_turn(&mut self) {
+        self.turn_cost = 0.0;
     }
 
     /// Total tokens across every category the provider reports.
@@ -2688,6 +3231,11 @@ pub(super) fn child_executor(
         .tool_executor()
         .reset_exec_worker()
         .with_fresh_auto_mode_hints();
+    // A child inherits the session's confirm channel, so its own open
+    // prompts and running calls need their own count: the idle deadline
+    // pauses on them, and a sibling's work is not this child's progress.
+    executor.confirm_watch = Arc::new(super::tool_executor::ConfirmWatch::default());
+    executor.activity = Arc::new(super::tool_executor::ActivityWatch::default());
     isolate_auto_mode(&mut executor, support);
     // Seed the inherited request into the handle the turn loop preserves:
     // the child's own history holds only its task, so a later turn cannot
@@ -2793,7 +3341,7 @@ async fn prepare(
     RunRejection,
 > {
     if let Some(id) = id {
-        return prepare_resume(registry, id, args, notify);
+        return prepare_resume(registry, &id, args, notify);
     }
 
     // Built before the entry exists, so a rejected override leaves no state.
@@ -2954,6 +3502,9 @@ fn restore_settled(path: &Path) -> (Status, Rollup, RunOutcome) {
                 error: settled.error,
                 full_bytes: None,
                 usage: settled.usage,
+                progress: None,
+                // A restored entry keeps only what the marker recorded.
+                stopped: settled.stopped,
             },
         ),
         None => (
@@ -2965,6 +3516,8 @@ fn restore_settled(path: &Path) -> (Status, Rollup, RunOutcome) {
                 error: Some("lofi exited before the run settled".to_string()),
                 full_bytes: None,
                 usage: None,
+                progress: None,
+                stopped: None,
             },
         ),
     }
@@ -3147,23 +3700,40 @@ fn evict_for_spawn(
     }
 }
 
-/// Resume path of `prepare`: claim a settled entry for a fresh run.
-#[allow(clippy::type_complexity)]
+/// Resume path of `prepare`: claim a settled entry for a fresh run. A
+/// background resume is folded by its exec at the end, like a spawn, so its
+/// spend must survive eviction until then; a rejected or unloadable resume
+/// claims nothing, because no exec would ever release it.
+/// A resumed run: the backend it continues on, the history it replays, the
+/// transcript to record into, its cancel flag, and its id.
+type ResumedRun = (
+    BackendRef,
+    Vec<Message>,
+    Option<SessionCursor>,
+    Arc<AtomicBool>,
+    String,
+);
+
 fn prepare_resume(
+    registry: &SubagentRegistry,
+    id: &str,
+    args: &Value,
+    notify: bool,
+) -> std::result::Result<ResumedRun, RunRejection> {
+    let started = prepare_resume_run(registry, id.to_string(), args, notify);
+    if notify && started.is_ok() {
+        lock(&registry.retired).claim(id);
+    }
+    started
+}
+
+/// The body of `prepare_resume`, which claims the retirement slot itself.
+fn prepare_resume_run(
     registry: &SubagentRegistry,
     id: String,
     args: &Value,
     notify: bool,
-) -> std::result::Result<
-    (
-        BackendRef,
-        Vec<Message>,
-        Option<SessionCursor>,
-        Arc<AtomicBool>,
-        String,
-    ),
-    RunRejection,
-> {
+) -> std::result::Result<ResumedRun, RunRejection> {
     let (agent, history, cursor, transcript_path, cancel, loaded) = {
         let mut entries = lock(&registry.entries);
         match entries.get(&id) {
@@ -3187,6 +3757,11 @@ fn prepare_resume(
         let entry = entries
             .get_mut(&id)
             .ok_or_else(|| Error::Tool(format!("unknown subagent id: {id}")))?;
+        // The previous run's prompts and calls are not this run's: a prompt it
+        // left open would otherwise pause this run's idle deadline forever.
+        let executor = entry.backend.tool_executor();
+        executor.confirm_watch.reset();
+        executor.activity.reset();
         if str_arg(args, "model")?.is_some()
             || str_arg(args, "thinking")?.is_some()
             || str_arg(args, "system")?.is_some()
@@ -3225,9 +3800,10 @@ fn prepare_resume(
         // new run stores its own. Waiters see the state move back to running.
         entry.outcome = None;
         entry.abort = None;
-        // The resume path is always foreground: silence the terminal notice and
-        // retire the previous run's periodic loop, which would otherwise wake
-        // up on the running status.
+        // Notices and the periodic loop follow the caller: a background
+        // resume keeps them, and a foreground one silences the terminal
+        // notice and retires the previous run's loop, which would otherwise
+        // wake up on the running status.
         entry.notify_terminal = notify;
         entry.background = notify;
         entry.notify_tick += 1;
@@ -3584,5 +4160,152 @@ mod activity_line {
         activity.note(&exec(Some("Map the parser")));
         activity.note(&AgentEvent::Text("\n  ".to_string()));
         assert_eq!(activity.line(), "Exec: Map the parser");
+    }
+}
+
+#[cfg(test)]
+mod deadlines {
+    use super::*;
+
+    fn limits(args: &Value) -> Deadlines {
+        match Deadlines::from_args(args) {
+            Ok(limits) => limits,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn progress() -> RunProgress {
+        RunProgress::new(
+            Arc::new(super::super::tool_executor::ConfirmWatch::default()),
+            Arc::new(super::super::tool_executor::ActivityWatch::default()),
+        )
+    }
+
+    // A cap is the caller's bound, never a default: a fixed clock cuts exactly
+    // the long-horizon work a child exists for.
+    #[test]
+    fn a_run_has_no_cap_unless_the_caller_sets_one() {
+        let limits = limits(&json!({ "prompt": "a" }));
+
+        assert!(limits.cap.is_none(), "a run was capped by default");
+        assert_eq!(limits.idle, Duration::from_millis(DEFAULT_IDLE_MS));
+    }
+
+    #[test]
+    fn timeout_ms_is_the_only_way_to_cap_a_run() {
+        let limits = limits(&json!({ "prompt": "a", "timeout_ms": 1_500 }));
+
+        assert_eq!(limits.cap, Some(Duration::from_millis(1_500)));
+    }
+
+    #[test]
+    fn an_uncapped_run_never_expires_on_the_clock() {
+        let limits = Deadlines {
+            idle: Duration::from_hours(1),
+            cap: None,
+        };
+        // Thirty hours of work, with an event a second ago: long, not stuck.
+        let mut progress = progress();
+        let Some(far_past) = std::time::Instant::now().checked_sub(Duration::from_hours(30)) else {
+            panic!("thirty hours fits in an instant");
+        };
+        progress.started = far_past;
+        progress.last_event.store(
+            (Duration::from_hours(30) - Duration::from_secs(1)).as_millis() as u64,
+            Ordering::SeqCst,
+        );
+
+        assert_eq!(progress.expired(&limits), None);
+
+        let capped = Deadlines {
+            idle: limits.idle,
+            cap: Some(Duration::from_hours(2)),
+        };
+        assert_eq!(
+            progress.expired(&capped),
+            Some(Expiry::Cap(Duration::from_hours(2)))
+        );
+    }
+
+    #[test]
+    fn a_capped_run_expires_at_its_cap_and_names_it() {
+        let limits = Deadlines {
+            idle: Duration::from_hours(1),
+            cap: Some(Duration::ZERO),
+        };
+
+        assert_eq!(
+            progress().expired(&limits),
+            Some(Expiry::Cap(Duration::ZERO))
+        );
+    }
+}
+
+#[cfg(test)]
+mod kept_work {
+    use super::*;
+
+    fn message(role: Role, blocks: Vec<ContentBlock>) -> Message {
+        Message {
+            origin: None,
+            role,
+            blocks,
+            kind: PromptKind::default(),
+        }
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: text.to_string(),
+        }
+    }
+
+    fn thinking(text: &str, signature: Option<&str>) -> ContentBlock {
+        ContentBlock::Thinking {
+            text: text.to_string(),
+            signature: signature.map(str::to_string),
+            redacted: false,
+        }
+    }
+
+    #[test]
+    fn a_reply_or_a_tool_result_is_work() {
+        assert!(holds_work(&[message(Role::Assistant, vec![text("hi")])]));
+        assert!(holds_work(&[message(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "exec".to_string(),
+                input: json!({}),
+            }],
+        )]));
+        assert!(holds_work(&[message(
+            Role::Tool,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+                images: Vec::new(),
+            }],
+        )]));
+    }
+
+    // A request replays neither an empty message nor a thinking block cut
+    // before its signature, and the task prompt is replayed by any resume.
+    #[test]
+    fn a_message_a_request_would_drop_is_not_work() {
+        assert!(!holds_work(&[]));
+        assert!(!holds_work(&[message(Role::Assistant, vec![])]));
+        assert!(!holds_work(&[message(Role::Assistant, vec![text("")])]));
+        assert!(!holds_work(&[message(Role::Assistant, vec![text(" \n ")])]));
+        assert!(!holds_work(&[message(
+            Role::Assistant,
+            vec![thinking("half a thought", None)]
+        )]));
+        assert!(!holds_work(&[message(Role::User, vec![text("a")])]));
+        assert!(holds_work(&[message(
+            Role::Assistant,
+            vec![thinking("a thought", Some("sig"))]
+        )]));
     }
 }

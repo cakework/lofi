@@ -984,6 +984,8 @@ async fn run_continuation_force_stops_at_hard_cap() {
         ),
         confirm_tx: None,
         confirm_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        confirm_watch: std::sync::Arc::new(super::super::tool_executor::ConfirmWatch::default()),
+        activity: std::sync::Arc::new(super::super::tool_executor::ActivityWatch::default()),
         auto_mode: None,
         auto_mode_hints: super::super::auto_mode::hint_handle(),
         policy_override: lofi_code::policy::PolicyOverride::default(),
@@ -1030,6 +1032,24 @@ async fn run_continuation_force_stops_at_hard_cap() {
     assert_eq!(messages.last().unwrap().role, Role::Tool);
 }
 
+/// 7 MiB raw -> ~9.3 MiB base64, over the 8 MiB request image budget.
+fn oversized_image_messages() -> Vec<Message> {
+    vec![Message {
+        origin: None,
+        role: Role::User,
+        blocks: vec![
+            ContentBlock::Text {
+                text: "look".to_string(),
+            },
+            ContentBlock::Image {
+                bytes: vec![0u8; 7 * 1024 * 1024],
+                media_type: "image/jpeg".to_string(),
+            },
+        ],
+        kind: PromptKind::default(),
+    }]
+}
+
 #[tokio::test]
 async fn run_continuation_image_byte_pressure_stops_before_send() {
     let dir = tempdir().unwrap();
@@ -1069,6 +1089,8 @@ async fn run_continuation_image_byte_pressure_stops_before_send() {
         ),
         confirm_tx: None,
         confirm_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        confirm_watch: std::sync::Arc::new(super::super::tool_executor::ConfirmWatch::default()),
+        activity: std::sync::Arc::new(super::super::tool_executor::ActivityWatch::default()),
         auto_mode: None,
         auto_mode_hints: super::super::auto_mode::hint_handle(),
         policy_override: lofi_code::policy::PolicyOverride::default(),
@@ -1086,21 +1108,7 @@ async fn run_continuation_image_byte_pressure_stops_before_send() {
         source: None,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    // 7 MiB raw -> ~9.3 MiB base64, over the 8 MiB request image budget.
-    let mut messages = vec![Message {
-        origin: None,
-        role: Role::User,
-        blocks: vec![
-            ContentBlock::Text {
-                text: "look".to_string(),
-            },
-            ContentBlock::Image {
-                bytes: vec![0u8; 7 * 1024 * 1024],
-                media_type: "image/jpeg".to_string(),
-            },
-        ],
-        kind: PromptKind::default(),
-    }];
+    let mut messages = oversized_image_messages();
     agent
         .run_turn(
             &mut messages,

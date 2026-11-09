@@ -2,6 +2,188 @@
 
 use super::*;
 
+/// Confirmations one executor is waiting on, and how long their answers
+/// took: a child's idle deadline pauses while one is open, and its hard cap
+/// names the prompt it was waiting on.
+#[derive(Default)]
+pub(super) struct ConfirmWatch {
+    state: Mutex<WatchState>,
+}
+
+#[derive(Default)]
+struct WatchState {
+    next_id: u64,
+    /// Reset count: a guard from an earlier run must not touch this run's
+    /// prompts, because the tool work that opened it can outlive the reset.
+    generation: u64,
+    /// Still-open prompts, oldest first, with the command each asks about.
+    open: Vec<(u64, String)>,
+    /// When the first still-open prompt opened.
+    since: Option<std::time::Instant>,
+    /// Total time any prompt was open, including the interval in progress.
+    waited: std::time::Duration,
+}
+
+impl ConfirmWatch {
+    /// Prompts still unanswered.
+    pub(super) fn pending(&self) -> usize {
+        lock(&self.state).open.len()
+    }
+
+    /// The oldest prompt still unanswered: the one a blocked run waited on,
+    /// so answering a newer prompt first does not misname it.
+    pub(super) fn command(&self) -> Option<String> {
+        lock(&self.state)
+            .open
+            .first()
+            .map(|(_, command)| command.clone())
+    }
+
+    /// How long this child has spent waiting on answers.
+    pub(super) fn waited(&self) -> std::time::Duration {
+        let state = lock(&self.state);
+        state.waited.saturating_add(
+            state
+                .since
+                .map_or(std::time::Duration::ZERO, |since| since.elapsed()),
+        )
+    }
+
+    /// Count `command` as open until the guard drops.
+    pub(super) fn open(&self, command: &str) -> OpenConfirm<'_> {
+        let mut state = lock(&self.state);
+        let id = state.next_id;
+        let generation = state.generation;
+        state.next_id += 1;
+        if state.since.is_none() {
+            state.since = Some(std::time::Instant::now());
+        }
+        state.open.push((id, command.to_string()));
+        drop(state);
+        OpenConfirm {
+            watch: self,
+            id,
+            generation,
+        }
+    }
+}
+
+impl ConfirmWatch {
+    /// Forget prompts an earlier run left open: one must not pause or name
+    /// the next run. Resetting in place reaches the executor clones a
+    /// backend's worker captured.
+    pub(super) fn reset(&self) {
+        let mut state = lock(&self.state);
+        // Ids keep counting up: an earlier run's prompt that is still open
+        // drops its own guard later and must not take a new one with it.
+        state.generation += 1;
+        state.open.clear();
+        state.since = None;
+        state.waited = std::time::Duration::ZERO;
+    }
+}
+
+/// Tool calls one executor is running right now. A call reports nothing
+/// until it ends, so a child inside a long one is working, not idle.
+#[derive(Default)]
+pub(crate) struct ActivityWatch {
+    state: Mutex<ActivityState>,
+}
+
+#[derive(Default)]
+struct ActivityState {
+    /// Calls in flight, in the current generation.
+    busy: usize,
+    /// When the last call of the current generation ended. A call reports
+    /// nothing until it ends, so this is the last sign of work the drain may
+    /// not have seen yet.
+    free_since: Option<std::time::Instant>,
+    /// Reset count: a guard an earlier run left running belongs to that run,
+    /// and an increment and a reset must not interleave.
+    generation: u64,
+}
+
+impl ActivityWatch {
+    /// Calls in flight, and how long an idle run has looked idle. The pair is
+    /// read under one lock: a call starting between two reads would hide the
+    /// call that just ended.
+    pub(crate) fn idle_mark(&self) -> (usize, Option<std::time::Duration>) {
+        let state = lock(&self.state);
+        let free = (state.busy == 0)
+            .then_some(state.free_since)
+            .flatten()
+            .map(|at| at.elapsed());
+        (state.busy, free)
+    }
+
+    /// Forget calls an earlier run left running: they belong to that run,
+    /// and a resumed one must not wait for them.
+    pub(super) fn reset(&self) {
+        let mut state = lock(&self.state);
+        state.generation += 1;
+        state.busy = 0;
+        state.free_since = None;
+    }
+
+    /// Count the call as running until the guard drops, so a failed call
+    /// still clears it.
+    pub(super) fn enter(&self) -> RunningCall<'_> {
+        let mut state = lock(&self.state);
+        let generation = state.generation;
+        state.busy += 1;
+        state.free_since = None;
+        drop(state);
+        RunningCall {
+            watch: self,
+            generation,
+        }
+    }
+}
+
+/// One running call; see [`ActivityWatch::enter`].
+pub(super) struct RunningCall<'a> {
+    watch: &'a ActivityWatch,
+    generation: u64,
+}
+
+impl Drop for RunningCall<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.watch.state);
+        // A call a previous run started is not this run's activity.
+        if state.generation != self.generation {
+            return;
+        }
+        state.busy = state.busy.saturating_sub(1);
+        if state.busy == 0 {
+            state.free_since = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// One open confirmation; see [`ConfirmWatch::open`]. It removes its own
+/// prompt, so overlapping prompts leave the right one open.
+pub(super) struct OpenConfirm<'a> {
+    watch: &'a ConfirmWatch,
+    id: u64,
+    generation: u64,
+}
+
+impl Drop for OpenConfirm<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.watch.state);
+        // A guard an earlier run left open has no say over this one.
+        if state.generation != self.generation {
+            return;
+        }
+        state.open.retain(|(id, _)| *id != self.id);
+        if state.open.is_empty() {
+            if let Some(since) = state.since.take() {
+                state.waited += since.elapsed();
+            }
+        }
+    }
+}
+
 /// Session-scoped execution state shared by native and external backends.
 #[derive(Clone)]
 pub struct ToolExecutor {
@@ -14,6 +196,13 @@ pub struct ToolExecutor {
     pub(super) image: lofi_types::ImageConfig,
     pub(super) confirm_tx: Option<tokio::sync::mpsc::UnboundedSender<ConfirmRequest>>,
     pub(super) confirm_counter: Arc<AtomicU64>,
+    /// Confirmations this executor has open. A child's idle deadline pauses
+    /// while one is unanswered, and its hard cap names what it waited on.
+    pub(super) confirm_watch: Arc<ConfirmWatch>,
+    /// Calls this executor is running. A child's idle deadline and a CLI
+    /// child's frame clock pause while one runs, because it reports nothing
+    /// until it ends.
+    pub(crate) activity: Arc<ActivityWatch>,
     pub(super) auto_mode: Option<lofi_code::AutoModeFn>,
     /// Config the evaluator was opened from, with its provider resolved. A
     /// child re-attaches from it, so its requests carry the same credentials.
@@ -122,6 +311,8 @@ impl ToolExecutor {
             image: config.image,
             confirm_tx: None,
             confirm_counter: Arc::new(AtomicU64::new(0)),
+            confirm_watch: Arc::new(ConfirmWatch::default()),
+            activity: Arc::new(ActivityWatch::default()),
             auto_mode: None,
             auto_mode_config: None,
             auto_mode_hints: super::auto_mode::hint_handle(),
@@ -366,6 +557,9 @@ impl ToolExecutor {
         if tool_uses.is_empty() {
             return Ok(Vec::new());
         }
+        // The child's idle deadline pauses for the whole run of calls: a long
+        // one emits no event until it returns.
+        let _running = self.activity.enter();
         // The scratch directory arrives with the first tool run, so a
         // session that never runs one leaves no directory behind.
         if let Some(lease) = &self.tmp_lease {
@@ -502,12 +696,15 @@ impl ToolExecutor {
             let confirm: Option<lofi_code::ConfirmFn> = self.confirm_tx.as_ref().map(|tx| {
                 let tx = tx.clone();
                 let counter = self.confirm_counter.clone();
+                let watch = self.confirm_watch.clone();
                 Arc::new(move |prompt: lofi_code::ConfirmPrompt| {
                     let tx = tx.clone();
                     let counter = counter.clone();
+                    let watch = watch.clone();
                     Box::pin(async move {
                         let id = counter.fetch_add(1, Ordering::SeqCst);
                         let (resp_tx, resp_rx) = oneshot::channel();
+                        let command = prompt.command.clone();
                         let req = ConfirmRequest {
                             id,
                             command: prompt.command,
@@ -516,6 +713,7 @@ impl ToolExecutor {
                             deny_at: prompt.deny_at,
                             respond: resp_tx,
                         };
+                        let _open = watch.open(&command);
                         if tx.send(req).is_err() {
                             return false;
                         }
@@ -527,14 +725,20 @@ impl ToolExecutor {
             let approve_dir: Option<lofi_code::ApproveDirFn> = self.confirm_tx.as_ref().map(|tx| {
                 let tx = tx.clone();
                 let counter = self.confirm_counter.clone();
+                let watch = self.confirm_watch.clone();
                 let root = self.root.clone();
                 let config_grants = self.grants.clone();
                 Arc::new(move |approval: lofi_code::DirApproval| {
                     let tx = tx.clone();
                     let counter = counter.clone();
+                    let watch = watch.clone();
                     let root = root.clone();
                     let config_grants = config_grants.clone();
                     Box::pin(async move {
+                        // The prompt stays open for the whole approval: the
+                        // stored-grant reads it does first are instantaneous
+                        // next to the wait for an answer.
+                        let _open = watch.open(&approval.dir.display().to_string());
                         approve_outside_dir(&root, approval, &config_grants, &tx, &counter).await
                     })
                         as std::pin::Pin<
@@ -583,8 +787,13 @@ impl ToolExecutor {
                         let out = hook(op, args).await;
                         let mut spend = lock(&spend);
                         match op {
-                            // Only an admitted spawn returns an id.
-                            lofi_code::SubagentOp::Spawn => {
+                            // Only an admitted spawn returns an id: a
+                            // rejection or a busy resume echoes the id it
+                            // was asked for, and started nothing to fold.
+                            lofi_code::SubagentOp::Spawn
+                                if out.get("ok").and_then(serde_json::Value::as_bool)
+                                    == Some(true) =>
+                            {
                                 if let Some(id) = out.get("id").and_then(serde_json::Value::as_str)
                                 {
                                     spend.spawned.push(id.to_string());

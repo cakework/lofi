@@ -221,6 +221,8 @@ fn agent_with(rounds: Vec<Vec<StreamingEvent>>, root: &std::path::Path) -> Agent
         ),
         confirm_tx: None,
         confirm_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        confirm_watch: std::sync::Arc::new(super::tool_executor::ConfirmWatch::default()),
+        activity: std::sync::Arc::new(super::tool_executor::ActivityWatch::default()),
         auto_mode: None,
         auto_mode_config: None,
         auto_mode_hints: super::auto_mode::hint_handle(),

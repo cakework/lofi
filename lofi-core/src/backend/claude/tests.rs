@@ -84,8 +84,7 @@ fn content_value_sends_images_as_base64_blocks() {
     assert_eq!(value[1]["source"]["data"], "AQID");
 }
 
-// A turn used to end at a fixed wall clock, which killed runs that were
-// still working. The term is the silence between frames.
+// A turn has no length limit; only the silence between frames ends it.
 #[tokio::test(start_paused = true)]
 async fn a_silent_cli_ends_the_turn_at_the_frame_idle_deadline() {
     let error = frame_within(
@@ -113,6 +112,49 @@ fn an_unset_frame_idle_uses_the_wide_default() {
 fn a_zero_frame_idle_is_rejected() {
     let error = resolve_frame_idle(Some(Duration::ZERO)).unwrap_err();
     assert!(error.to_string().contains("greater than zero"), "{error}");
+}
+
+#[test]
+fn a_running_call_pauses_the_frame_clock() {
+    let idle = Duration::from_secs(10);
+    let start = Instant::now();
+    let since = |gap: Duration| start.checked_sub(gap).unwrap();
+
+    // Nothing running and nothing counted yet: the whole gap is left.
+    let fresh = frame_budget(start, idle, (0, None)).unwrap();
+    assert!(
+        fresh <= idle && fresh > idle.checked_sub(Duration::from_secs(1)).unwrap(),
+        "{fresh:?}"
+    );
+    // A call of ours is what the child waits on, so the clock waits too.
+    assert_eq!(
+        frame_budget(since(Duration::from_secs(30)), idle, (1, None)),
+        Some(BUSY_POLL)
+    );
+    // The call ended two seconds ago, and only that silence counts.
+    let left = frame_budget(
+        since(Duration::from_secs(30)),
+        idle,
+        (0, Some(Duration::from_secs(2))),
+    )
+    .unwrap();
+    assert!(
+        left <= Duration::from_secs(8) && left > Duration::from_secs(7),
+        "{left:?}"
+    );
+    // Spent, with nothing in flight: the turn fails.
+    assert_eq!(
+        frame_budget(since(Duration::from_secs(30)), idle, (0, None)),
+        None
+    );
+    assert_eq!(
+        frame_budget(
+            since(Duration::from_secs(30)),
+            idle,
+            (0, Some(Duration::from_secs(30)))
+        ),
+        None
+    );
 }
 
 #[tokio::test]

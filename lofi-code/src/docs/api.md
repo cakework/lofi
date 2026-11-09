@@ -420,7 +420,7 @@ bounded during recovery.
 **Returns:** `string` — the raw content (a tool result's output text, or a
 tool call's input JSON). Cheap and on-demand.
 
-## lofi.subagent({ prompt, id?, model?, thinking?, system?, timeout_ms?, output_limit?, token_budget? })
+## lofi.subagent({ prompt, id?, model?, thinking?, system?, timeout_ms?, idle_ms?, output_limit?, token_budget? })
 
 Delegate a task to a foreground subagent: a fresh agent run in its own
 context window. Only the final result crosses back into this exec, so use
@@ -431,7 +431,8 @@ log reads, mechanical edits).
 - `prompt` (string, required) — the task for the subagent.
 - `id` (string, optional) — resume a previous subagent run, continuing its
   context with this prompt. `model`, `thinking`, and `system` are rejected
-  on resume; `timeout_ms`, `output_limit`, and `token_budget` still apply.
+  on resume; `idle_ms`, `timeout_ms`, `output_limit`, and `token_budget`
+  still apply.
   A resumed run keeps the model and service tier it first ran with while
   that model and tier are still available; otherwise it uses the session
   model.
@@ -450,12 +451,36 @@ log reads, mechanical edits).
   backend. A level the target does not accept fails the run. It always wins
   over the parent's level, so `off` runs the child with no thinking.
 - `system` (string, optional) — system prompt override.
-- `timeout_ms` (number, optional) — wall-clock limit for the whole run.
-  A run that expires keeps the history it reached, and its error names the
-  `id` that resumes it when that history holds a reply or a tool exchange.
-  For work that may outlive one call, start it with `lofi.subagentSpawn`
-  and take the result with `lofi.subagentWait`, whose wait timeout never
-  cancels the run.
+- `timeout_ms` (number, optional) — hard cap on the run, unset by
+  default: a run ends when it goes quiet for `idle_ms`, not when a clock
+  runs out, so long-horizon work is not cut for being long. Set it only
+  when the caller has to bound the run. Only the wrap-up below may run past
+  it, and by at most `min(60_000, timeout_ms)` plus up to 10 s while the
+  stopped turn and its summary wind down. A run that reaches it keeps the
+  history it reached, so `stopped` names the deadline that stopped it; a
+  wrap-up that answers settles `completed`, and one that crosses the token
+  budget settles `failed` with how to resume: by `id` when the run kept
+  work, or that a resume would start over. For work that may outlive one
+  call, start it with `lofi.subagentSpawn` and take the result with
+  `lofi.subagentWait`, whose wait timeout never cancels the run.
+- `idle_ms` (number, optional) — how long the run may go without an event
+  before it is stopped, default 300_000; zero is rejected. Every text
+  delta, tool start and tool end resets it, so a long run is not cut for
+  being long. So is a tool call in flight, which emits nothing until it
+  ends, and a run waiting on a confirmation prompt it raised: that clock
+  pauses until the user answers and restarts from there. Only `timeout_ms` stops such a run:
+  one stopped while a prompt was open settles `blocked` naming the command
+  it waited on, and one stopped inside a tool call wraps up like any other.
+  A run's own `notifyAt` and `notifyEvery` timers are not a wake-up: the
+  child reads their notices at its next turn, so they cannot end a wait or
+  reset this clock. Killing a run, or replacing the session, drops the
+  timers it armed along with its jobs.
+- A run either deadline stops is asked to wrap up: one short turn returns
+  what it reached, and the run settles `completed` with that summary. It
+  keeps `timed_out` only when that wrap-up fails, or `blocked` when a
+  prompt was still open. Such a run reports `stopped: "idle" | "cap"`
+  (which deadline fired), and `rounds`, `elapsed_ms` and `last_tool`
+  describe the work before that wrap-up, not the summary turn.
 - `output_limit` (number, optional) — cap on the returned result bytes.
 - `token_budget` (number, optional) — total token budget, counting every
   token category the provider reports (input, output, cache). The run is
@@ -463,8 +488,9 @@ log reads, mechanical edits).
   keeps the history it reached, and its error names the resuming `id` or
   says that nothing was kept.
 
-**Returns:** `{ ok, id, status, result?, error?, session_id?, truncated?, full_bytes?, usage? }`.
-`status` is one of `completed`, `failed`, `cancelled`, `timed_out` —
+**Returns:** `{ ok, id, status, result?, error?, session_id?, truncated?, full_bytes?, usage?, rounds?, elapsed_ms?, last_tool?, stopped? }`.
+`status` is one of `completed`, `failed`, `cancelled`, `timed_out`,
+`blocked` —
 `running` when a resume targets a run that is still active, or
 `unavailable` when the sandbox has no subagent support. Keep the `id` to
 resume the run later; `/new` or capacity eviction invalidates it. Entries
@@ -480,7 +506,12 @@ is evicted. When `result` was cut to fit `output_limit`, `truncated` is
 error are capped at 32768 bytes regardless of `output_limit`, so a status
 or wait after the fact may report a shorter, marked-truncated text than
 the original return. `usage` reports the run's token totals and cost when
-the provider reported them. A timed-out run keeps the history it reached,
+the provider reported them; `rounds` counts the model rounds the run
+finished, `elapsed_ms` its wall time, and `last_tool` the tool it called
+last, so a stopped run says where it stopped; `stopped` names the deadline
+(`idle` or `cap`) for a run a deadline stopped, including one that
+answered its wrap-up and settled `completed`. A stopped run keeps the
+history it reached,
 so a resume continues that work instead of rerunning it, and its `error`
 says so with the `id` to pass back; a run that kept nothing says that
 instead, so the hint never promises work that does not exist. A tool call
@@ -495,18 +526,21 @@ does not persist (`--no-session`, print mode). Each session keeps at most
 64 subagent entries; past that, spawning evicts a finished entry, and it
 fails while 64 runs are still active.
 
-## lofi.subagentSpawn({ prompt, model?, thinking?, system?, timeout_ms?, token_budget? })
+## lofi.subagentSpawn({ prompt, id?, model?, thinking?, system?, timeout_ms?, idle_ms?, token_budget? })
 
 Start a background subagent and return immediately. The run survives the
 end of this exec; unlike `lofi.subagent`, cancelling the exec does not
 cancel the run. Take the result later with `lofi.subagentWait`.
 
-**Parameters:** same as `lofi.subagent`, except `id` (resume) and
-`output_limit` are not accepted; resume stays a foreground operation.
+**Parameters:** same as `lofi.subagent`, except `output_limit`, which
+only a foreground call takes. `id` resumes that run in the background, so
+a run stopped at its deadline continues without a foreground call that
+would die with its exec.
 
 **Returns:** `{ ok, id, status, session_id? }`. `status` is `running` on
 success, `failed` with an `error` on rejection (concurrency cap, bad
-override, unknown argument problem). Keep the `id`: it is the handle for
+override, unknown argument problem), and `running` with `ok: false` when
+an `id` names a run that has not ended. Keep the `id`: it is the handle for
 `subagentStatus`, `subagentWait`, `subagentRead`, `subagentKill`, and
 `subagentNotify`.
 
@@ -517,9 +551,13 @@ Report one subagent run's state.
 **Parameters:**
 - `id` (string, required) — the run id from `subagentSpawn` or `subagent`.
 
-**Returns:** `{ ok, id, status, session_id?, usage?, error? }`. `status` is
-`running`, `completed`, `failed`, `cancelled`, or `timed_out`; `error` is
-set for `failed`. Unknown ids resolve with `ok: false`.
+**Returns:** `{ ok, id, status, session_id?, usage?, error?, rounds?, elapsed_ms?, last_tool?, stopped? }`. `status` is
+`running`, `completed`, `failed`, `cancelled`, `timed_out`, or
+`blocked`; `error` is set for every status but `completed` and
+`running`, and a run that settled in this
+process carries `rounds`, `elapsed_ms` and `last_tool` (a rehydrated entry
+keeps only the settle marker). `stopped` names the deadline that stopped
+the run, and survives a restart. Unknown ids resolve with `ok: false`.
 
 ## lofi.subagentList({ state?, limit?, cursor? })
 

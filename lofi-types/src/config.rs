@@ -724,16 +724,6 @@ impl BackendConfig {
             Self::ClaudeCode { context_window, .. } => *context_window,
         }
     }
-
-    #[must_use]
-    pub fn frame_idle_timeout_ms(&self) -> Option<u64> {
-        match self {
-            Self::ClaudeCode {
-                frame_idle_timeout_ms,
-                ..
-            } => *frame_idle_timeout_ms,
-        }
-    }
 }
 
 fn default_claude_command() -> String {

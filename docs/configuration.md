@@ -150,7 +150,8 @@ names what the child reported.
 A turn has no length limit: a child that keeps sending frames keeps running,
 however long the work takes.
 A child that sends no frame for `frame_idle_timeout_ms` fails the turn and is
-stopped; the handshake before the first frame is bounded at 30 s.
+stopped. Each frame read before the init frame is bounded at 30 s, since the
+handshake does no tool work.
 
 Claude Code is a transport, not a second agent.
 Lofi tracks the conversation, so the child holds no decision Lofi cannot see.

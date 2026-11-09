@@ -287,7 +287,7 @@ pub(super) async fn run_exchange(
                 biased;
                 // A consumer that left must stop the child even while the
                 // child is quiet: waiting for the next event would hold the
-                // turn until the timeout.
+                // turn open with nobody to settle it.
                 () = io.events().closed() => break,
                 event = receiver.recv() => event,
             };
@@ -320,7 +320,7 @@ pub(super) async fn run_exchange(
         }
         // The child watches its own sink to stop a turn nobody listens to. A
         // receiver that outlives this consumer never closes it, so the child
-        // blocks on a full channel until its own timeout.
+        // would block on a full channel forever.
         rx = None;
         failure
     };
