@@ -12,7 +12,10 @@ mod events;
 mod load;
 mod preview;
 mod scan;
+mod tree;
 
+pub(in crate::session::store) use self::tree::load_tree_index;
+pub use self::tree::{TreeCheckpoint, TreeIndex};
 #[allow(clippy::wildcard_imports)]
 pub(in crate::session::store) use self::{events::*, load::*, preview::*, scan::*};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]

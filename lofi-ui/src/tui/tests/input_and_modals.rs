@@ -375,7 +375,7 @@ fn topmost_permission_dialog_handles_input_before_tree_picker() {
             branch_point: "root".into(),
             label: "user: earlier prompt".into(),
             prefix: "- ".into(),
-            prefill: String::new(),
+            prefill: Box::default(),
             is_active: true,
             source_index: 0,
             source_offset: 0,
@@ -924,7 +924,7 @@ fn tree_picker_is_centered() {
                 branch_point: "x".into(),
                 label: "agent: hi".into(),
                 prefix: "`- ".into(),
-                prefill: String::new(),
+                prefill: Box::default(),
                 is_active: true,
                 source_index: 0,
                 source_offset: 0,
@@ -935,7 +935,7 @@ fn tree_picker_is_centered() {
                 branch_point: "y".into(),
                 label: "user: yo".into(),
                 prefix: "|- ".into(),
-                prefill: String::new(),
+                prefill: Box::default(),
                 is_active: false,
                 source_index: 1,
                 source_offset: 0,
@@ -977,6 +977,40 @@ fn tree_picker_is_centered() {
         top_y < 15,
         "tree modal should be centered, got top_y={top_y}"
     );
+}
+
+#[test]
+fn tree_picker_renders_a_loading_placeholder_for_a_skeleton_row() {
+    // A row that has not been hydrated carries no label; the picker renders
+    // the placeholder for its kind instead of holding text per row.
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut a = app();
+    a.tree_picker = Some(TreePickerState {
+        entries: vec![TreeEntry {
+            branch_point: Box::default(),
+            label: Box::default(),
+            prefix: "- ".into(),
+            prefill: Box::default(),
+            is_active: true,
+            source_index: 0,
+            source_offset: 0,
+            source_kind: store::IndexKind::UserPrompt,
+            hydrated: false,
+        }],
+        selected: 0,
+        generation: 0,
+        loading: false,
+    });
+    let backend = TestBackend::new(80, 22);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = (0..22)
+        .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(screen.contains("user: loading"), "{screen}");
 }
 
 #[test]

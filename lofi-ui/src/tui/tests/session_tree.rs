@@ -109,7 +109,7 @@ fn tree_opens_rolls_back_and_prefills_prompt() {
     let edit_idx = picker
         .entries
         .iter()
-        .position(|e| e.prefill == "second")
+        .position(|e| e.prefill.as_ref() == "second")
         .unwrap();
     a.tree_picker.as_mut().unwrap().selected = edit_idx;
     a.tree_picker_confirm();
@@ -316,7 +316,7 @@ fn tree_file_backing_excludes_physically_interleaved_sibling_events() {
         .unwrap()
         .entries
         .iter()
-        .position(|entry| entry.branch_point == branch_b_end)
+        .position(|entry| entry.branch_point.as_ref() == branch_b_end)
         .unwrap();
     a.tree_picker.as_mut().unwrap().selected = selected;
     a.tree_picker_confirm();
@@ -455,7 +455,7 @@ fn tree_shows_compaction_node_and_reverts_before_it() {
         .iter()
         .position(|e| e.label.starts_with("compact:"))
         .unwrap();
-    assert_eq!(picker.entries[comp_idx].branch_point, turn_end1_id);
+    assert_eq!(picker.entries[comp_idx].branch_point.as_ref(), turn_end1_id);
     assert!(picker.entries[comp_idx].prefill.is_empty());
     a.tree_picker.as_mut().unwrap().selected = comp_idx;
     a.tree_picker_confirm();
@@ -534,10 +534,12 @@ fn tree_rollback_after_compacted_failed_turn_keeps_checkpoint_context() {
         .unwrap()
         .entries
         .iter()
-        .position(|entry| entry.prefill == "n+8")
+        .position(|entry| entry.prefill.as_ref() == "n+8")
         .expect("post-error prompt is selectable");
     assert_eq!(
-        a.tree_picker.as_ref().unwrap().entries[edit_idx].branch_point,
+        a.tree_picker.as_ref().unwrap().entries[edit_idx]
+            .branch_point
+            .as_ref(),
         failed_id
     );
     a.tree_picker.as_mut().unwrap().selected = edit_idx;
@@ -639,8 +641,8 @@ fn tree_revert_to_cancelled_turn_drops_aborted_tail() {
     // The branch point is the aborted turn's last message, not the cancelled
     // outcome (which is already the leaf), so the revert drops only the marker.
     let branch_point = &picker.entries[cancelled_idx].branch_point;
-    assert_eq!(*branch_point, partial_id);
-    assert_ne!(*branch_point, cancelled_id);
+    assert_eq!(branch_point.as_ref(), partial_id);
+    assert_ne!(branch_point.as_ref(), cancelled_id);
     a.tree_picker.as_mut().unwrap().selected = cancelled_idx;
     a.tree_picker_confirm();
     assert!(a.tree_picker.is_none());
@@ -720,7 +722,7 @@ fn tree_hides_checkpoint_copies_and_reverts_to_pre_compaction_leaf() {
         .iter()
         .find(|e| e.label.starts_with("compact:"))
         .unwrap();
-    assert_eq!(compact.branch_point, pre_compaction_leaf);
+    assert_eq!(compact.branch_point.as_ref(), pre_compaction_leaf);
 }
 
 #[test]
@@ -1024,7 +1026,7 @@ fn tree_shows_tool_result_nodes() {
         "tool label should contain result preview, got {}",
         picker.entries[1].label
     );
-    assert_eq!(picker.entries[1].branch_point, tool_result_id);
+    assert_eq!(picker.entries[1].branch_point.as_ref(), tool_result_id);
     assert!(picker.entries[1].prefill.is_empty());
 }
 
@@ -1163,9 +1165,8 @@ fn tree_exec_label_shows_native_tools() {
     // synchronous fallback above. Keep that path covered independently so an
     // optimization cannot silently degrade exec rows to raw result previews.
     let cursor = a.session.cursor.as_ref().unwrap();
-    let snapshot = cursor.tree_snapshot().unwrap();
-    let skeletons =
-        build_tree_entry_skeletons(&snapshot.index, snapshot.leaf_id.as_deref(), cursor);
+    let snapshot = cursor.tree_index().unwrap();
+    let skeletons = build_tree_entry_skeletons(&snapshot.index, snapshot.leaf_pos, cursor);
     let mut hydrated = Vec::new();
     hydrate_tree_entry_window(
         &snapshot.index,

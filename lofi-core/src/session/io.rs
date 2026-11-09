@@ -8,10 +8,10 @@
 //! reuses one arena across all of them, so the peak is paid once.
 //!
 //! The worker additionally owns a registry of in-flight /tree snapshots.
-//! Tree picking allocates a multi-MB `Vec<EventIndex>` plus parent/child
-//! `HashMaps` on whichever thread builds them; if those allocations are freed
-//! on a different thread (e.g. the UI dropping `Arc<Vec<EventIndex>>` after
-//! the picker closes), glibc returns the pages to the *allocating* thread's
+//! Tree picking allocates a multi-MB positional index on whichever thread
+//! builds it; if those allocations are freed on a different thread (e.g. the
+//! UI dropping the `SessionTreeIndex` after the picker closes), glibc returns
+//! the pages to the *allocating* thread's
 //! arena where they sit idle until that thread allocates again. Pinning the
 //! snapshot's whole lifecycle to this worker keeps both the allocation and
 //! the free on the same thread, so the freed slack is reusable on the next
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
-use super::store::SessionTreeSnapshot;
+use super::store::SessionTreeIndex;
 
 type Job = Box<dyn FnOnce(&mut WorkerState) + Send + 'static>;
 
@@ -31,7 +31,7 @@ type Job = Box<dyn FnOnce(&mut WorkerState) + Send + 'static>;
 /// cross-call state on the worker.
 #[derive(Default)]
 pub struct WorkerState {
-    tree_snapshots: HashMap<u64, SessionTreeSnapshot>,
+    tree_snapshots: HashMap<u64, SessionTreeIndex>,
     next_tree_snapshot_id: u64,
 }
 
@@ -39,7 +39,7 @@ impl WorkerState {
     /// Store a snapshot, returning its handle. The handle is scoped to this
     /// worker — the caller is expected to round-trip every operation through
     /// the same worker (which the sink guarantees by keying on store root).
-    pub fn insert_tree_snapshot(&mut self, snapshot: SessionTreeSnapshot) -> u64 {
+    pub fn insert_tree_snapshot(&mut self, snapshot: SessionTreeIndex) -> u64 {
         self.next_tree_snapshot_id += 1;
         let id = self.next_tree_snapshot_id;
         self.tree_snapshots.insert(id, snapshot);
@@ -47,7 +47,7 @@ impl WorkerState {
     }
 
     #[must_use]
-    pub fn tree_snapshot(&self, id: u64) -> Option<&SessionTreeSnapshot> {
+    pub fn tree_snapshot(&self, id: u64) -> Option<&SessionTreeIndex> {
         self.tree_snapshots.get(&id)
     }
 

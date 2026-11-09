@@ -717,6 +717,43 @@ fn closing_large_tree_picker_releases_transient_memory() {
     );
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn deep_large_tree_picker_keeps_peak_growth_bounded() {
+    // One long lineage with spread branch points is the shape a real session
+    // takes, and the opposite of the sibling fixture above. That fixture only
+    // proves the tail is released after closing; this one bounds the peak
+    // while the picker is still open and while it scrolls.
+    const PEAK_GROWTH_LIMIT_KIB: u64 = 72 * 1024;
+
+    let server = MockServer::start(vec![text_response("memory seed answer")]);
+    let fixture = Fixture::new(&server);
+    let mut seed = fixture.spawn(&[]);
+    seed.submit("memory seed prompt");
+    seed.wait_for("memory seed answer", WAIT);
+    seed.submit("/quit");
+    seed.wait_exit();
+    fixture.append_tree_deep(100_000, 20);
+
+    let mut tui = fixture.spawn(&["--continue"]);
+    // Reset the high-water mark so the measurement below covers the picker
+    // alone: loading a transcript this size peaks well above where it settles.
+    tui.reset_peak_resident();
+    let baseline_peak = tui.peak_resident_kib();
+    tui.submit("/tree");
+    tui.wait_for_screen("Roll back to a turn", WAIT);
+    tui.wait_for("deep prompt 99999", WAIT);
+    tui.send("\x1b[A".repeat(200).as_bytes());
+    tui.wait_for("deep prompt 998", WAIT);
+    let peak = tui.peak_resident_kib();
+    assert!(
+        peak <= baseline_peak + PEAK_GROWTH_LIMIT_KIB,
+        "/tree peak grew by {} KiB on a deep transcript: baseline_peak={baseline_peak} KiB, peak={peak} KiB",
+        peak.saturating_sub(baseline_peak)
+    );
+    tui.send(b"\x1b");
+}
+
 #[test]
 fn resume_by_id_prefix_selects_the_older_session() {
     let server = MockServer::start(vec![

@@ -727,18 +727,9 @@ fn tree_active_path_is_not_shadowed_by_cursor_record() {
     cursor.append_events(&mut events).unwrap();
 
     let reopened = SessionCursor::open(path).unwrap();
-    let snapshot = reopened.tree_snapshot().unwrap();
-    let leaf = snapshot.leaf_id.as_deref().expect("leaf set after append");
-    // Mirror the picker's map construction: id -> index, excluding cursor
-    // records, which is the invariant under test.
-    let by_id: std::collections::HashMap<&IndexId, usize> = snapshot
-        .index
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.kind != IndexKind::Cursor && !e.id.is_empty())
-        .map(|(i, e)| (&e.id, i))
-        .collect();
-    let path = crate::session::tree::active_path_from_index(&snapshot.index, &by_id, leaf);
+    let tree = reopened.tree_index().unwrap();
+    let leaf = tree.leaf_pos.expect("leaf set after append");
+    let path = tree.index.active_path(Some(leaf)).unwrap();
     assert_eq!(
         path.len(),
         8,
@@ -1188,4 +1179,111 @@ fn subagent_cursor_without_parent_omits_the_link() {
         .unwrap();
     let files = store.list_subagent_files_for_cwd(cwd, "anything").unwrap();
     assert!(files.is_empty());
+}
+
+#[test]
+fn tree_index_resolves_cross_links_and_drops_cursor_records() {
+    let (_guard, store) = isolated_store();
+    let cursor = store
+        .create_cursor(Path::new("/tmp/tree-index"), &"p/m".into())
+        .unwrap();
+    let mut trunk = [ev(user("p1")), ev(assistant("a1"))];
+    cursor.append_events(&mut trunk).unwrap();
+    let fork = trunk[1].id.clone();
+    // Every head move writes a cursor record mid-file. Those records carry no
+    // id and no parent, so the index must not give them a position.
+    cursor.branch_from(fork.clone()).unwrap();
+    let mut left = [ev(user("p2")), ev(assistant("a2"))];
+    cursor.append_events(&mut left).unwrap();
+    cursor.branch_from(fork.clone()).unwrap();
+    let mut right = [ev(user("pB"))];
+    cursor.append_events(&mut right).unwrap();
+    let right_id = right[0].id.clone();
+
+    let indexed = cursor.tree_index().unwrap();
+    let index = &indexed.index;
+    assert_eq!(index.len(), 5);
+    // Both branches hang off the assistant at position 1. The second is a
+    // cross link: its predecessor is the first branch.
+    assert_eq!(index.children(1), &[2, 4]);
+    assert_eq!(index.parent(2), Some(1));
+    assert_eq!(index.parent(3), Some(2));
+    assert_eq!(index.parent(4), Some(1));
+    assert_eq!(index.position_of(&fork), Some(1));
+    assert_eq!(index.position_of(&right_id), Some(4));
+    assert_eq!(indexed.leaf_pos, Some(4));
+    let path: Vec<usize> = index
+        .active_path(indexed.leaf_pos)
+        .unwrap()
+        .iter()
+        .map(|&position| position as usize)
+        .collect();
+    assert_eq!(path, vec![0, 1, 4]);
+}
+
+#[test]
+fn tree_index_resolves_a_kept_event_and_flags_a_missing_one() {
+    let (_guard, store) = isolated_store();
+    let cursor = store
+        .create_cursor(Path::new("/tmp/tree-checkpoint"), &"p/m".into())
+        .unwrap();
+    let mut events = [ev(user("before"))];
+    cursor.append_events(&mut events).unwrap();
+    cursor
+        .append_compaction(
+            &[user("kept")],
+            "summary",
+            &[String::new(), String::new()],
+            CompactionCounts {
+                summarized: 1,
+                represented: 1,
+                kept: 1,
+            },
+        )
+        .unwrap();
+    let mut dangling = [SessionEvent {
+        id: String::new(),
+        parent_id: None,
+        kind: SessionEventKind::Compaction {
+            summary: "dangling".into(),
+            first_kept_entry_id: "missing".into(),
+            summarized_range: [String::new(), String::new()],
+            checkpointed_tail: true,
+            summarized: 1,
+            represented: 1,
+            kept: 0,
+        },
+    }];
+    cursor.append_events(&mut dangling).unwrap();
+
+    let indexed = cursor.tree_index().unwrap();
+    let checkpoints = indexed.index.checkpoints();
+    assert_eq!(checkpoints.len(), 2);
+    let checkpointed = checkpoints[0];
+    assert!(checkpointed.names_first_kept);
+    // The kept copy is re-appended directly before the marker.
+    assert_eq!(checkpointed.first_kept, Some(checkpointed.marker - 1));
+    assert!(checkpointed.checkpointed_tail);
+    let dangling = checkpoints[1];
+    assert!(dangling.names_first_kept);
+    assert_eq!(dangling.first_kept, None);
+}
+
+#[test]
+fn tree_index_rejects_a_missing_leaf_and_follows_the_root() {
+    let (_guard, store) = isolated_store();
+    let cursor = store
+        .create_cursor(Path::new("/tmp/tree-leaf"), &"p/m".into())
+        .unwrap();
+    let mut events = [ev(user("p1"))];
+    cursor.append_events(&mut events).unwrap();
+    let path = cursor.path().to_path_buf();
+
+    let indexed = cursor.tree_index().unwrap();
+    assert!(indexed.index.active_path(None).unwrap().is_empty());
+    assert_eq!(indexed.leaf_pos, Some(0));
+
+    let detached = SessionCursor::new(path, Some("missing".to_string()));
+    let error = detached.tree_index().unwrap_err();
+    assert!(error.to_string().contains("session branch leaf not found"));
 }

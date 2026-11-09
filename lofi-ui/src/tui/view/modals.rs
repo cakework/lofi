@@ -1,8 +1,9 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::tui::tree::tree_entry_loading_label;
 use crate::tui::{
     BackgroundKill, BackgroundModalState, BackgroundTab, BackgroundView, InfoLine, JobOutputView,
-    JobRow, JobViewContent, SubagentRow, SubagentTranscriptView, Theme,
+    JobRow, JobViewContent, SubagentRow, SubagentTranscriptView, Theme, TreeEntry,
 };
 
 use lofi_types::short_id;
@@ -745,6 +746,16 @@ pub(super) fn render_service_picker(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// A hydrated row carries its own label; a skeleton row renders the
+/// placeholder for its kind, so the row list holds no text of its own.
+fn tree_entry_label(entry: &TreeEntry) -> &str {
+    if entry.label.is_empty() {
+        tree_entry_loading_label(entry.source_kind)
+    } else {
+        &entry.label
+    }
+}
+
 pub(super) fn render_tree_picker(f: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::ListState;
     let Some(picker) = &app.tree_picker else {
@@ -766,7 +777,7 @@ pub(super) fn render_tree_picker(f: &mut Frame, area: Rect, app: &App) {
     let content_w = picker.entries
         [preliminary_start..(preliminary_start + desired_rows.min(total))]
         .iter()
-        .map(|entry| prim::width(&entry.prefix) + prim::width(&entry.label))
+        .map(|entry| prim::width(&entry.prefix) + prim::width(tree_entry_label(entry)))
         .max()
         .unwrap_or(0);
     let chrome_w = prim::width(title).max(prim::width(help));
@@ -789,11 +800,12 @@ pub(super) fn render_tree_picker(f: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = picker.entries[start..end]
         .iter()
         .map(|entry| {
-            let kind_color = if entry.label.starts_with("user:") {
+            let label = tree_entry_label(entry);
+            let kind_color = if label.starts_with("user:") {
                 t.user
-            } else if entry.label.starts_with("agent:") {
+            } else if label.starts_with("agent:") {
                 t.agent
-            } else if entry.label.starts_with("tool:") || entry.label.starts_with("exec:") {
+            } else if label.starts_with("tool:") || label.starts_with("exec:") {
                 t.success
             } else {
                 t.muted
@@ -803,8 +815,8 @@ pub(super) fn render_tree_picker(f: &mut Frame, area: Rect, app: &App) {
                 label_style = label_style.add_modifier(Modifier::BOLD);
             }
             ListItem::new(Line::from(vec![
-                Span::styled(entry.prefix.clone(), tree_art),
-                Span::styled(entry.label.clone(), label_style),
+                Span::styled(entry.prefix.to_string(), tree_art),
+                Span::styled(label.to_string(), label_style),
             ]))
         })
         .collect();

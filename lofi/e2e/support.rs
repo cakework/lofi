@@ -1326,6 +1326,81 @@ impl Fixture {
         writer.flush().unwrap();
     }
 
+    /// Append one long lineage with a handful of branch points spread through
+    /// it. The sibling fixture is wide and shallow; a real session is a single
+    /// straight line with a few forks, and only that shape grows a per-event
+    /// topology in the picker.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub fn append_tree_deep(&self, turns: usize, branch_points: usize) {
+        let path = self
+            .session_files()
+            .into_iter()
+            .next()
+            .expect("session transcript");
+        let events = self.events();
+        let mut parent_id = events
+            .iter()
+            .rev()
+            .find_map(|event| event["leaf_id"].as_str().or_else(|| event["id"].as_str()))
+            .expect("session leaf")
+            .to_string();
+        let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        let mut writer = std::io::BufWriter::new(file);
+        let mut event_index = 0usize;
+        let every = (turns / branch_points.max(1)).max(1);
+        let mut forks: Vec<String> = Vec::new();
+        for turn in 0..turns {
+            let prompt_id = format!("f{event_index:031x}");
+            if turn % every == 0 {
+                forks.push(prompt_id);
+            }
+            append_synthetic_event(
+                &mut writer,
+                &mut parent_id,
+                &mut event_index,
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "blocks": [{ "type": "text", "text": format!("deep prompt {turn}") }],
+                }),
+            );
+            append_synthetic_event(
+                &mut writer,
+                &mut parent_id,
+                &mut event_index,
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "blocks": [{ "type": "text", "text": format!("deep answer {turn}") }],
+                }),
+            );
+            append_synthetic_event(
+                &mut writer,
+                &mut parent_id,
+                &mut event_index,
+                json!({ "type": "turn_end", "model": "mock/chat", "elapsed_ms": 1, "cost": 0.0, "usage": {} }),
+            );
+        }
+        let leaf = parent_id.clone();
+        for (fork, parent) in forks.iter().enumerate() {
+            serde_json::to_writer(
+                &mut writer,
+                &json!({
+                    "id": format!("e{fork:031x}"),
+                    "parent_id": parent,
+                    "type": "message",
+                    "role": "user",
+                    "blocks": [{ "type": "text", "text": format!("deep fork prompt {fork:03}") }],
+                }),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+        serde_json::to_writer(&mut writer, &json!({ "type": "cursor", "leaf_id": leaf })).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    }
+
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     pub fn append_tree_sibling_bytes(&self, count: usize, payload_bytes: usize) {
         let path = self
@@ -2085,6 +2160,40 @@ impl Tui {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     pub fn peak_resident_kib(&self) -> u64 {
         self.status_kib("VmHWM:")
+    }
+
+    /// Reset the child's high-water mark to its current resident size, so a
+    /// later peak measures only what the action under test added. Startup can
+    /// peak far above where it settles, and `VmHWM` never falls on its own.
+    ///
+    /// Wait for the resident size to stop moving first: the caller only waited
+    /// for a screen, not for whatever load ran behind it, and a reset taken
+    /// mid-load leaves a high-water mark above the real resting size. Panic
+    /// when the reset does not take effect, because the peak it guards would
+    /// then compare against startup and never fail.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub fn reset_peak_resident(&self) {
+        let mut previous = self.resident_kib();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(100));
+            let resident = self.resident_kib();
+            if resident.abs_diff(previous) <= 256 {
+                break;
+            }
+            previous = resident;
+        }
+        let path = format!("/proc/{}/clear_refs", self.child.id());
+        let reset = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(b"5"));
+        let resident = self.resident_kib();
+        let peak = self.peak_resident_kib();
+        assert!(
+            reset.is_ok() && peak <= resident + 1024,
+            "clear_refs {path} did not reset the peak: reset={reset:?}, resident={resident} KiB, peak={peak} KiB"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

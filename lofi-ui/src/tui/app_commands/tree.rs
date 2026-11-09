@@ -7,7 +7,7 @@ fn run_tree_snapshot(
     tx: &tokio::sync::mpsc::UnboundedSender<PickerLoad>,
     state: &mut lofi_core::session::io::WorkerState,
 ) {
-    match cursor.tree_snapshot() {
+    match cursor.tree_index() {
         Ok(snapshot) => {
             // Pin the snapshot before the first cancellation check. Every
             // return path can then release it through the same worker-owned
@@ -20,8 +20,7 @@ fn run_tree_snapshot(
             let Some(snapshot) = state.tree_snapshot(snapshot_id) else {
                 return;
             };
-            let skeletons =
-                build_tree_entry_skeletons(&snapshot.index, snapshot.leaf_id.as_deref(), cursor);
+            let skeletons = build_tree_entry_skeletons(&snapshot.index, snapshot.leaf_pos, cursor);
             if generation_clock.load(Ordering::Relaxed) != generation {
                 drop(skeletons);
                 state.remove_tree_snapshot(snapshot_id);
@@ -144,10 +143,9 @@ impl App {
                 run_tree_snapshot(generation, &generation_clock, &cursor, &tx, state);
             }));
         } else {
-            match cursor.tree_snapshot() {
+            match cursor.tree_index() {
                 Ok(snapshot) => {
-                    let entries =
-                        build_tree_entries(&snapshot.index, snapshot.leaf_id.as_deref(), &cursor);
+                    let entries = build_tree_entries(&snapshot.index, snapshot.leaf_pos, &cursor);
                     if entries.is_empty() {
                         self.tree_picker = None;
                         self.notify(NotifyKind::Info, "no branch points in this session yet");
@@ -292,7 +290,7 @@ impl App {
             let Some(sink) = self.session.sink.as_ref() else {
                 return;
             };
-            match sink.switch_branch(entry.branch_point.clone()) {
+            match sink.switch_branch(entry.branch_point.to_string()) {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
                     self.notify(NotifyKind::Error, format!("persist session cursor: {e}"));
@@ -350,7 +348,7 @@ impl App {
             }
         }
         let prefill = if !entry.prefill.is_empty() {
-            entry.prefill
+            entry.prefill.to_string()
         } else if entry.source_kind == store::IndexKind::UserPrompt {
             load_prompt_text(&cursor, entry.source_offset)
         } else {

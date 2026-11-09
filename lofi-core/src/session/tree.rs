@@ -1,64 +1,92 @@
-//! Session tree projection over the event index. Owns all index-walking
-//! (active path, hidden checkpoints, branch detection) and event-derived row
-//! labels so the TUI only maps rows onto widgets.
+//! Session tree projection over the positional event index. Owns all
+//! index-walking (active path, hidden checkpoints, branch detection) and
+//! event-derived row labels so the TUI only maps rows onto widgets.
 
-// The graph maps here are built internally with the std hasher; generalizing
-// the hasher on every walker buys nothing for an internal projection.
-#![allow(clippy::implicit_hasher)]
-
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use lofi_types::{ContentBlock, Role, SessionEventKind};
 
-use super::store::{EventIndex, IndexId, IndexKind, SessionCursor};
+use super::store::{IndexKind, SessionCursor, TreeIndex};
 
 /// A display-agnostic tree row. The TUI maps these onto its widgets; all
 /// session reasoning (which events, what labels, which branches) lives here.
 #[derive(Debug, Clone)]
 pub struct TreeRow {
-    pub branch_point: String,
-    pub label: String,
-    pub prefix: String,
-    pub prefill: String,
+    pub branch_point: Box<str>,
+    pub label: Box<str>,
+    /// Shared indentation: a whole-transcript row list repeats the same two
+    /// connectors, so each row holds a reference instead of its own string.
+    pub prefix: Arc<str>,
+    pub prefill: Box<str>,
     pub is_active: bool,
-    pub source_index: usize,
+    /// Position in the tree index, which never exceeds `u32::MAX` because one
+    /// entry per transcript event is already the addressable limit.
+    pub source_index: u32,
     pub source_offset: u64,
     pub source_kind: IndexKind,
     pub hydrated: bool,
 }
 
 struct TreeCtx<'a> {
-    indices: &'a [EventIndex],
-    children_by_parent: &'a HashMap<&'a IndexId, Vec<usize>>,
-    by_id: &'a HashMap<&'a IndexId, usize>,
+    index: &'a TreeIndex,
     cursor: &'a SessionCursor,
-    native_tools: std::cell::RefCell<HashMap<String, Vec<(String, String)>>>,
+    native_tools: RefCell<HashMap<String, Vec<(String, String)>>>,
     lazy_native_tools: bool,
     hydrate: bool,
     retain_prefill: bool,
-    hydrate_only: Option<&'a std::collections::HashSet<usize>>,
+    hydrate_only: Option<&'a HashSet<usize>>,
+}
+
+/// A set of positions or path slots, sized to the collection it describes.
+/// A tree row set spans the whole transcript, where a hash set per entry
+/// would cost more than the rows it classifies.
+#[derive(Default)]
+struct PositionSet {
+    words: Vec<u64>,
+}
+
+impl PositionSet {
+    fn with_len(len: usize) -> Self {
+        Self {
+            words: vec![0; len.div_ceil(64)],
+        }
+    }
+
+    fn insert(&mut self, position: usize) {
+        if let Some(word) = self.words.get_mut(position / 64) {
+            *word |= 1 << (position % 64);
+        }
+    }
+
+    fn contains(&self, position: usize) -> bool {
+        self.words
+            .get(position / 64)
+            .is_some_and(|word| word & (1 << (position % 64)) != 0)
+    }
 }
 
 #[must_use]
 pub fn build_tree_rows(
-    indices: &[EventIndex],
-    leaf_id: Option<&str>,
+    index: &TreeIndex,
+    leaf: Option<u32>,
     cursor: &SessionCursor,
 ) -> Vec<TreeRow> {
-    build_tree_rows_inner(indices, leaf_id, cursor, true, true, None)
+    build_tree_rows_inner(index, leaf, cursor, true, true, None)
 }
 
 #[must_use]
 pub fn build_tree_row_skeletons(
-    indices: &[EventIndex],
-    leaf_id: Option<&str>,
+    index: &TreeIndex,
+    leaf: Option<u32>,
     cursor: &SessionCursor,
 ) -> Vec<TreeRow> {
-    build_tree_rows_inner(indices, leaf_id, cursor, false, false, None)
+    build_tree_rows_inner(index, leaf, cursor, false, false, None)
 }
 
 pub fn hydrate_tree_rows(
-    indices: &[EventIndex],
+    index: &TreeIndex,
     cursor: &SessionCursor,
     requested: &[(usize, TreeRow)],
     mut emit: impl FnMut(Vec<(usize, TreeRow)>) -> bool,
@@ -67,27 +95,10 @@ pub fn hydrate_tree_rows(
     if requested.is_empty() || cancelled() {
         return;
     }
-    let mut children_by_parent: HashMap<&IndexId, Vec<usize>> = HashMap::new();
-    let mut by_id: HashMap<&IndexId, usize> = HashMap::new();
-    for (index, entry) in indices.iter().enumerate() {
-        if cancelled() {
-            return;
-        }
-        // Cursor records reuse `id` for the selected leaf; including them
-        // shadows the real leaf event (appended last) and truncates the path.
-        if entry.kind != IndexKind::Cursor && !entry.id.is_empty() {
-            by_id.insert(&entry.id, index);
-        }
-        if let Some(parent) = entry.parent_id.as_ref().filter(|parent| !parent.is_empty()) {
-            children_by_parent.entry(parent).or_default().push(index);
-        }
-    }
     let ctx = TreeCtx {
-        indices,
-        children_by_parent: &children_by_parent,
-        by_id: &by_id,
+        index,
         cursor,
-        native_tools: std::cell::RefCell::new(HashMap::new()),
+        native_tools: RefCell::new(HashMap::new()),
         lazy_native_tools: true,
         hydrate: true,
         retain_prefill: false,
@@ -101,8 +112,8 @@ pub fn hydrate_tree_rows(
         let mut entry = Vec::with_capacity(1);
         push_tree_row(
             &ctx,
-            skeleton.source_index,
-            &skeleton.prefix,
+            skeleton.source_index as usize,
+            Arc::clone(&skeleton.prefix),
             skeleton.is_active,
             &mut entry,
         );
@@ -116,7 +127,7 @@ pub fn hydrate_tree_rows(
 }
 
 pub fn hydrate_tree_window(
-    indices: &[EventIndex],
+    index: &TreeIndex,
     cursor: &SessionCursor,
     skeletons: &[TreeRow],
     display_range: std::ops::Range<usize>,
@@ -124,154 +135,156 @@ pub fn hydrate_tree_window(
     cancelled: impl Fn() -> bool,
 ) {
     let requested: Vec<_> = display_range
-        .filter_map(|index| {
+        .filter_map(|position| {
             skeletons
-                .get(index)
+                .get(position)
                 .filter(|entry| !entry.hydrated)
                 .cloned()
-                .map(|entry| (index, entry))
+                .map(|entry| (position, entry))
         })
         .collect();
-    hydrate_tree_rows(indices, cursor, &requested, emit, cancelled);
+    hydrate_tree_rows(index, cursor, &requested, emit, cancelled);
 }
 
-fn hidden_checkpoint_indices(
-    indices: &[EventIndex],
-    active_path: &[usize],
-    cursor: &SessionCursor,
-) -> std::collections::HashSet<usize> {
-    let mut hidden = std::collections::HashSet::new();
-    // Lazily map lineage ids to their path position: the previous shape
-    // re-scanned the whole prefix per marker and re-parsed the 32-char hex id
-    // at every comparison.
-    let mut path_pos: Option<std::collections::HashMap<&IndexId, usize>> = None;
-    for (marker_pos, &idx) in active_path.iter().enumerate() {
-        if indices[idx].kind != IndexKind::Compaction {
+/// Path slots hidden by a compaction checkpoint, resolved through the
+/// precomputed checkpoint positions: a marker hides the path between the
+/// event it keeps and itself.
+fn hidden_path_positions(index: &TreeIndex, path: &[u32]) -> PositionSet {
+    let mut hidden = PositionSet::with_len(path.len());
+    let checkpoints = index.checkpoints();
+    if checkpoints.is_empty() {
+        return hidden;
+    }
+    let mut targets: HashSet<u32> = HashSet::with_capacity(checkpoints.len() * 2);
+    for checkpoint in checkpoints {
+        targets.insert(checkpoint.marker);
+        if let Some(first_kept) = checkpoint.first_kept {
+            targets.insert(first_kept);
+        }
+    }
+    // Resolving every event through a map would scale with the path; only the
+    // checkpoint boundaries are wanted, so one pass records those.
+    let mut slots: HashMap<u32, usize> = HashMap::with_capacity(targets.len());
+    for (slot, &position) in path.iter().enumerate() {
+        if targets.contains(&position) {
+            // First occurrence holds: a later duplicate must not win the hide
+            // start, matching the lineage projection's own rule.
+            slots.entry(position).or_insert(slot);
+        }
+    }
+    for checkpoint in checkpoints {
+        let Some(first_kept) = checkpoint.first_kept else {
+            continue;
+        };
+        if !checkpoint.checkpointed_tail {
             continue;
         }
-        let (_, _, checkpointed, first_kept) = load_compaction_details(cursor, indices[idx].offset);
-        if checkpointed && !first_kept.is_empty() {
-            let want = IndexId::borrow(&first_kept);
-            let positions = path_pos.get_or_insert_with(|| {
-                let mut map = std::collections::HashMap::new();
-                for (pos, &i) in active_path.iter().enumerate() {
-                    // First occurrence holds: `insert` overwrites and a later
-                    // duplicate must not win the hide start.
-                    map.entry(&indices[i].id).or_insert(pos);
-                }
-                map
-            });
-            if let Some(&start) = positions.get(&want) {
-                if start < marker_pos {
-                    hidden.extend(active_path[start..marker_pos].iter().copied());
-                }
+        let (Some(&start), Some(&marker)) = (slots.get(&first_kept), slots.get(&checkpoint.marker))
+        else {
+            continue;
+        };
+        if start < marker {
+            for slot in start..marker {
+                hidden.insert(slot);
             }
         }
     }
     hidden
 }
 
-fn top_level_tree_nodes(indices: &[EventIndex], by_id: &HashMap<&IndexId, usize>) -> Vec<usize> {
-    indices
-        .iter()
-        .enumerate()
-        .filter(|&(_, entry)| {
-            if !is_tree_node(entry.kind) {
+fn top_level_tree_nodes(index: &TreeIndex) -> Vec<usize> {
+    (0..index.len())
+        .filter(|&position| {
+            if !is_tree_node(index.kind(position)) {
                 return false;
             }
-            let mut parent = entry.parent_id.as_ref();
-            while let Some(id) = parent {
-                let Some(&index) = by_id.get(id) else {
-                    break;
-                };
-                if is_tree_node(indices[index].kind) {
+            let mut parent = index.parent(position);
+            let mut steps = 0usize;
+            while let Some(ancestor) = parent {
+                if is_tree_node(index.kind(ancestor)) {
                     return false;
                 }
-                parent = indices[index].parent_id.as_ref();
+                if steps > index.len() {
+                    return false;
+                }
+                steps += 1;
+                parent = index.parent(ancestor);
             }
             true
         })
-        .map(|(index, _)| index)
         .collect()
 }
 
 #[allow(clippy::too_many_lines)]
 fn build_tree_rows_inner(
-    indices: &[EventIndex],
-    leaf_id: Option<&str>,
+    index: &TreeIndex,
+    leaf: Option<u32>,
     cursor: &SessionCursor,
     hydrate: bool,
     retain_prefill: bool,
-    hydrate_only: Option<&std::collections::HashSet<usize>>,
+    hydrate_only: Option<&HashSet<usize>>,
 ) -> Vec<TreeRow> {
     let native_tools = if hydrate && hydrate_only.is_none() {
-        build_native_tool_map(indices, cursor)
+        build_native_tool_map(index, cursor)
     } else {
         HashMap::new()
     };
-    let mut children_by_parent: HashMap<&IndexId, Vec<usize>> = HashMap::new();
-    let mut by_id: HashMap<&IndexId, usize> = HashMap::new();
-    for (i, ix) in indices.iter().enumerate() {
-        // Cursor records reuse `id` to carry the selected leaf, so including
-        // them would shadow the real leaf event (they are appended last) and
-        // truncate the active path to the record, which has no parent.
-        if ix.kind != IndexKind::Cursor && !ix.id.is_empty() {
-            by_id.insert(&ix.id, i);
-        }
-        if let Some(p) = ix.parent_id.as_ref() {
-            if !p.is_empty() {
-                children_by_parent.entry(p).or_default().push(i);
-            }
-        }
+    let active_path = index.active_path(leaf).unwrap_or_default();
+    let mut active_set = PositionSet::with_len(index.len());
+    for &position in &active_path {
+        active_set.insert(position as usize);
     }
-    let active_path: Vec<usize> = leaf_id
-        .filter(|id| !id.is_empty())
-        .map_or_else(Vec::new, |id| active_path_from_index(indices, &by_id, id));
-    let active_set: std::collections::HashSet<usize> = active_path.iter().copied().collect();
-    let hidden_checkpoint = hidden_checkpoint_indices(indices, &active_path, cursor);
+    let hidden = hidden_path_positions(index, &active_path);
     let trunk: Vec<usize> = active_path
         .iter()
-        .copied()
-        .filter(|i| !hidden_checkpoint.contains(i))
-        .filter(|&i| is_tree_node(indices[i].kind))
+        .enumerate()
+        .filter(|(slot, _)| !hidden.contains(*slot))
+        .map(|(_, &position)| position as usize)
+        .filter(|&position| is_tree_node(index.kind(position)))
         .collect();
 
     let n = trunk.len();
     let mut out = Vec::new();
     let ctx = TreeCtx {
-        indices,
-        children_by_parent: &children_by_parent,
-        by_id: &by_id,
+        index,
         cursor,
-        native_tools: std::cell::RefCell::new(native_tools),
+        native_tools: RefCell::new(native_tools),
         lazy_native_tools: false,
         hydrate,
         retain_prefill,
         hydrate_only,
     };
-    for (pos, &idx) in trunk.iter().enumerate() {
+    let connectors: [Arc<str>; 2] = [
+        Arc::from("\u{251c}\u{2500} "),
+        Arc::from("\u{2514}\u{2500} "),
+    ];
+    for (pos, &position) in trunk.iter().enumerate() {
         let is_last = pos == n - 1;
-        let connector = if is_last {
-            "\u{2514}\u{2500} "
-        } else {
-            "\u{251c}\u{2500} "
-        };
         let child_indent = if is_last { "   " } else { "\u{2502}  " };
-        push_tree_row(&ctx, idx, connector, active_set.contains(&idx), &mut out);
+        push_tree_row(
+            &ctx,
+            position,
+            Arc::clone(&connectors[usize::from(is_last)]),
+            active_set.contains(position),
+            &mut out,
+        );
         let mut branches: Vec<usize> = Vec::new();
-        if indices[idx].kind == IndexKind::UserPrompt {
-            if let Some(te_idx) = find_turn_outcome(idx, indices, &children_by_parent) {
-                if !active_set.contains(&te_idx) {
-                    branches.push(te_idx);
+        if index.kind(position) == IndexKind::UserPrompt {
+            if let Some(outcome) = find_turn_outcome(position, index) {
+                if !active_set.contains(outcome) {
+                    branches.push(outcome);
                 }
             }
         }
-        let user_branches: Vec<usize> = children_by_parent
-            .get(&indices[idx].id)
-            .into_iter()
-            .flatten()
+        let user_branches: Vec<usize> = index
+            .children(position)
+            .iter()
             .copied()
-            .filter(|&i| indices[i].kind == IndexKind::UserPrompt && !active_set.contains(&i))
+            .filter(|&child| {
+                index.kind(child as usize) == IndexKind::UserPrompt
+                    && !active_set.contains(child as usize)
+            })
+            .map(|child| child as usize)
             .collect();
         branches.extend(user_branches);
         if !branches.is_empty() {
@@ -279,20 +292,19 @@ fn build_tree_rows_inner(
         }
     }
     if trunk.is_empty() && out.is_empty() {
-        let roots = top_level_tree_nodes(indices, &by_id);
+        let roots = top_level_tree_nodes(index);
         render_branch_subtree(&ctx, &roots, "", &mut out);
     }
     out
 }
 
 fn build_native_tool_map(
-    indices: &[EventIndex],
+    index: &TreeIndex,
     cursor: &SessionCursor,
 ) -> HashMap<String, Vec<(String, String)>> {
-    let offsets: Vec<u64> = indices
-        .iter()
-        .filter(|entry| entry.kind == IndexKind::NativeTool)
-        .map(|entry| entry.offset)
+    let offsets: Vec<u64> = (0..index.len())
+        .filter(|&position| index.kind(position) == IndexKind::NativeTool)
+        .map(|position| index.offset(position))
         .collect();
     let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let Ok(summaries) = cursor.native_tool_summaries(&offsets) else {
@@ -306,24 +318,24 @@ fn build_native_tool_map(
 
 fn load_native_tools_for_turn(
     ctx: &TreeCtx<'_>,
-    tool_result_index: usize,
+    tool_result: usize,
     tool_use_id: &str,
 ) -> Vec<(String, String)> {
     let mut offsets = Vec::new();
-    let mut current = tool_result_index;
-    let mut visited = std::collections::HashSet::new();
+    let mut current = tool_result;
+    let mut visited = HashSet::new();
     while visited.insert(current) {
-        let Some(children) = ctx.children_by_parent.get(&ctx.indices[current].id) else {
-            break;
-        };
-        let Some(&next) = children
+        let Some(&next) = ctx
+            .index
+            .children(current)
             .iter()
-            .find(|&&child| ctx.indices[child].kind != IndexKind::UserPrompt)
+            .find(|&&child| ctx.index.kind(child as usize) != IndexKind::UserPrompt)
         else {
             break;
         };
-        match ctx.indices[next].kind {
-            IndexKind::NativeTool => offsets.push(ctx.indices[next].offset),
+        let next = next as usize;
+        match ctx.index.kind(next) {
+            IndexKind::NativeTool => offsets.push(ctx.index.offset(next)),
             IndexKind::TurnEnd | IndexKind::TurnFailed | IndexKind::TurnCancelled => break,
             _ => {}
         }
@@ -339,20 +351,8 @@ fn load_native_tools_for_turn(
         .collect()
 }
 
-/// Active path (root-first indices) from a leaf id, using the lightweight
-/// index instead of fully-loaded events.
-#[must_use]
-pub fn active_path_from_index(
-    indices: &[EventIndex],
-    by_id: &HashMap<&IndexId, usize>,
-    leaf_id: &str,
-) -> Vec<usize> {
-    super::store::lineage_path(indices, by_id, leaf_id)
-}
-
 fn render_branch_subtree(ctx: &TreeCtx, roots: &[usize], prefix: &str, out: &mut Vec<TreeRow>) {
-    let indices = ctx.indices;
-    let children_by_parent = ctx.children_by_parent;
+    let index = ctx.index;
     let n = roots.len();
     for (pos, &root) in roots.iter().enumerate() {
         let is_last = pos == n - 1;
@@ -362,10 +362,10 @@ fn render_branch_subtree(ctx: &TreeCtx, roots: &[usize], prefix: &str, out: &mut
             "\u{251c}\u{2500} "
         };
         let child_indent = format!("{prefix}{}", if is_last { "   " } else { "\u{2502}  " });
-        let chain = walk_chain(root, indices, children_by_parent);
-        let chain_set: std::collections::HashSet<usize> = chain.iter().copied().collect();
+        let chain = walk_chain(root, index);
+        let chain_set: HashSet<usize> = chain.iter().copied().collect();
         let cn = chain.len();
-        for (cpos, &idx) in chain.iter().enumerate() {
+        for (cpos, &position) in chain.iter().enumerate() {
             let cprefix = if cpos == 0 {
                 format!("{prefix}{connector}")
             } else {
@@ -383,21 +383,24 @@ fn render_branch_subtree(ctx: &TreeCtx, roots: &[usize], prefix: &str, out: &mut
                 "{child_indent}{}",
                 if cpos == cn - 1 { "   " } else { "\u{2502}  " }
             );
-            push_tree_row(ctx, idx, &cprefix, false, out);
+            push_tree_row(ctx, position, Arc::from(cprefix.as_str()), false, out);
             let mut sub_branches: Vec<usize> = Vec::new();
-            if indices[idx].kind == IndexKind::UserPrompt {
-                if let Some(te_idx) = find_turn_outcome(idx, indices, children_by_parent) {
-                    if !chain_set.contains(&te_idx) {
-                        sub_branches.push(te_idx);
+            if index.kind(position) == IndexKind::UserPrompt {
+                if let Some(outcome) = find_turn_outcome(position, index) {
+                    if !chain_set.contains(&outcome) {
+                        sub_branches.push(outcome);
                     }
                 }
             }
-            let user_children: Vec<usize> = children_by_parent
-                .get(&indices[idx].id)
-                .into_iter()
-                .flatten()
+            let user_children: Vec<usize> = index
+                .children(position)
+                .iter()
                 .copied()
-                .filter(|&i| indices[i].kind == IndexKind::UserPrompt && !chain_set.contains(&i))
+                .filter(|&child| {
+                    index.kind(child as usize) == IndexKind::UserPrompt
+                        && !chain_set.contains(&(child as usize))
+                })
+                .map(|child| child as usize)
                 .collect();
             sub_branches.extend(user_children);
             if !sub_branches.is_empty() {
@@ -408,49 +411,42 @@ fn render_branch_subtree(ctx: &TreeCtx, roots: &[usize], prefix: &str, out: &mut
 }
 
 #[must_use]
-pub fn find_next_user_prompt(
-    start: usize,
-    indices: &[EventIndex],
-    children_by_parent: &HashMap<&IndexId, Vec<usize>>,
-) -> Option<usize> {
-    let children = children_by_parent.get(&indices[start].id)?;
-    if let Some(&u) = children
+pub fn find_next_user_prompt(start: usize, index: &TreeIndex) -> Option<usize> {
+    let children = index.children(start);
+    if let Some(&prompt) = children
         .iter()
-        .find(|&&i| indices[i].kind == IndexKind::UserPrompt)
+        .find(|&&child| index.kind(child as usize) == IndexKind::UserPrompt)
     {
-        return Some(u);
+        return Some(prompt as usize);
     }
-    let comp = children
+    let compaction = children
         .iter()
         .copied()
-        .find(|&i| indices[i].kind == IndexKind::Compaction)?;
-    let comp_children = children_by_parent.get(&indices[comp].id)?;
-    comp_children
+        .find(|&child| index.kind(child as usize) == IndexKind::Compaction)?;
+    index
+        .children(compaction as usize)
         .iter()
         .copied()
-        .find(|&i| indices[i].kind == IndexKind::UserPrompt)
+        .find(|&child| index.kind(child as usize) == IndexKind::UserPrompt)
+        .map(|child| child as usize)
 }
 
 #[must_use]
-pub fn walk_chain(
-    start: usize,
-    indices: &[EventIndex],
-    children_by_parent: &HashMap<&IndexId, Vec<usize>>,
-) -> Vec<usize> {
+pub fn walk_chain(start: usize, index: &TreeIndex) -> Vec<usize> {
     let mut chain = vec![start];
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = HashSet::new();
     visited.insert(start);
-    let mut cur = start;
+    let mut current = start;
     loop {
-        let next = if indices[cur].kind == IndexKind::UserPrompt {
-            find_turn_outcome(cur, indices, children_by_parent)
+        let next = if index.kind(current) == IndexKind::UserPrompt {
+            find_turn_outcome(current, index)
         } else {
-            find_next_user_prompt(cur, indices, children_by_parent)
+            find_next_user_prompt(current, index)
         };
         match next {
-            Some(n) if visited.insert(n) => {
-                chain.push(n);
-                cur = n;
+            Some(next) if visited.insert(next) => {
+                chain.push(next);
+                current = next;
             }
             _ => break,
         }
@@ -469,52 +465,47 @@ type TreeRowFields = (String, String, String);
 /// `TurnEnd` and `Compaction` are deliberately *not* handled here: `TurnEnd`
 /// reverts to itself only conceptually and each path expresses it inline, and
 /// `Compaction` resolves differently per path (skeleton has no checkpoint
-/// details, hydrated consults `by_id`). Those stay local to the callers so the
-/// shared rule never has to know about them.
-fn parent_branch_point(ix: &EventIndex) -> String {
-    match ix.kind {
-        IndexKind::UserPrompt | IndexKind::TurnFailed | IndexKind::TurnCancelled => ix
-            .parent_id
-            .as_ref()
-            .map(IndexId::to_event_id)
+/// details, hydrated consults the checkpoint positions). Those stay local to
+/// the callers so the shared rule never has to know about them.
+fn parent_branch_point(index: &TreeIndex, position: usize) -> String {
+    match index.kind(position) {
+        IndexKind::UserPrompt | IndexKind::TurnFailed | IndexKind::TurnCancelled => index
+            .parent(position)
+            .map(|parent| index.id(parent).to_event_id())
             .unwrap_or_default(),
-        _ => ix.id.to_event_id(),
+        _ => index.id(position).to_event_id(),
     }
 }
 
-fn skeleton_tree_row(ix: &EventIndex) -> Option<TreeRowFields> {
-    let label = match ix.kind {
+/// The placeholder a row shows until its label is hydrated. The picker
+/// renders this instead of carrying the text on every skeleton row, where one
+/// allocation per row would scale with the transcript.
+#[must_use]
+pub fn loading_label(kind: IndexKind) -> &'static str {
+    match kind {
         IndexKind::UserPrompt => "user: loading\u{2026}",
         IndexKind::ToolResult => "tool: loading\u{2026}",
         IndexKind::TurnEnd => "agent: loading\u{2026}",
         IndexKind::TurnFailed => "agent: loading\u{2026} (failed)",
         IndexKind::TurnCancelled => "agent: loading\u{2026} (cancelled)",
         IndexKind::Compaction => "compact: loading\u{2026}",
-        _ => return None,
+        _ => "",
     }
-    .to_string();
-    let branch_point = match ix.kind {
-        // The skeleton path has no checkpoint details, so a compaction reverts
-        // to its parent; the hydrated path resolves it through `by_id`.
-        IndexKind::Compaction => ix
-            .parent_id
-            .as_ref()
-            .map(IndexId::to_event_id)
-            .unwrap_or_default(),
-        _ => parent_branch_point(ix),
-    };
-    Some((label, String::new(), branch_point))
 }
 
-fn tool_result_tree_row(ctx: &TreeCtx, idx: usize) -> TreeRowFields {
-    let ix = &ctx.indices[idx];
-    let (name, tool_use_id, content, is_error) =
-        load_tool_result(idx, ctx.indices, ctx.by_id, ctx.cursor);
+fn skeleton_tree_row(index: &TreeIndex, position: usize) -> Option<TreeRowFields> {
+    // Neither the label nor the revert target is read before hydration, and
+    // confirming a row requires hydration first, so a skeleton stores no text.
+    is_tree_node(index.kind(position)).then(|| (String::new(), String::new(), String::new()))
+}
+
+fn tool_result_tree_row(ctx: &TreeCtx, position: usize) -> TreeRowFields {
+    let (name, tool_use_id, content, is_error) = load_tool_result(position, ctx.index, ctx.cursor);
     let marker = if is_error { "\u{2717} " } else { "" };
     let label = if name == "exec" {
         let mut tools = ctx.native_tools.borrow().get(&tool_use_id).cloned();
         if tools.is_none() && ctx.lazy_native_tools {
-            let loaded = load_native_tools_for_turn(ctx, idx, &tool_use_id);
+            let loaded = load_native_tools_for_turn(ctx, position, &tool_use_id);
             ctx.native_tools
                 .borrow_mut()
                 .insert(tool_use_id.clone(), loaded.clone());
@@ -533,21 +524,34 @@ fn tool_result_tree_row(ctx: &TreeCtx, idx: usize) -> TreeRowFields {
     } else {
         format!("tool: {marker}{name}: {}", one_line(&content))
     };
-    (label, String::new(), ix.id.to_event_id())
+    (label, String::new(), ctx.index.id(position).to_event_id())
 }
 
-fn compaction_tree_row(ctx: &TreeCtx, ix: &EventIndex) -> TreeRowFields {
-    let (summarized, kept, checkpointed, first_kept) =
-        load_compaction_details(ctx.cursor, ix.offset);
-    let branch_point = if checkpointed && !first_kept.is_empty() {
-        ctx.by_id
-            .get(&IndexId::parse(first_kept))
-            .and_then(|&i| ctx.indices[i].parent_id.as_ref().map(IndexId::to_event_id))
+fn compaction_tree_row(ctx: &TreeCtx, position: usize) -> TreeRowFields {
+    let (summarized, kept, _, _) = load_compaction_details(ctx.cursor, ctx.index.offset(position));
+    // The index already resolved which event this checkpoint keeps; looking
+    // it up here would rescan the whole tree once per visible marker.
+    let checkpoint = ctx
+        .index
+        .checkpoints()
+        .iter()
+        .find(|checkpoint| checkpoint.marker as usize == position);
+    let kept_parent = checkpoint
+        .filter(|checkpoint| checkpoint.checkpointed_tail && checkpoint.names_first_kept)
+        .and_then(|checkpoint| checkpoint.first_kept);
+    let branch_point = if checkpoint
+        .is_some_and(|checkpoint| checkpoint.checkpointed_tail && checkpoint.names_first_kept)
+    {
+        // A hovered checkpoint reverts to the parent of the event it keeps. An
+        // unresolvable kept event leaves no revert target, as before.
+        kept_parent
+            .and_then(|kept| ctx.index.parent(kept as usize))
+            .map(|parent| ctx.index.id(parent).to_event_id())
             .unwrap_or_default()
     } else {
-        ix.parent_id
-            .as_ref()
-            .map(IndexId::to_event_id)
+        ctx.index
+            .parent(position)
+            .map(|parent| ctx.index.id(parent).to_event_id())
             .unwrap_or_default()
     };
     (
@@ -557,11 +561,11 @@ fn compaction_tree_row(ctx: &TreeCtx, ix: &EventIndex) -> TreeRowFields {
     )
 }
 
-fn hydrated_tree_row(ctx: &TreeCtx, idx: usize) -> Option<TreeRowFields> {
-    let ix = &ctx.indices[idx];
-    match ix.kind {
+fn hydrated_tree_row(ctx: &TreeCtx, position: usize) -> Option<TreeRowFields> {
+    let index = ctx.index;
+    match index.kind(position) {
         IndexKind::UserPrompt => {
-            let prompt = load_prompt_text(ctx.cursor, ix.offset);
+            let prompt = load_prompt_text(ctx.cursor, index.offset(position));
             let prefill = if ctx.retain_prefill {
                 prompt.clone()
             } else {
@@ -570,12 +574,12 @@ fn hydrated_tree_row(ctx: &TreeCtx, idx: usize) -> Option<TreeRowFields> {
             Some((
                 format!("user: {}", one_line(&prompt)),
                 prefill,
-                parent_branch_point(ix),
+                parent_branch_point(index, position),
             ))
         }
-        IndexKind::ToolResult => Some(tool_result_tree_row(ctx, idx)),
+        IndexKind::ToolResult => Some(tool_result_tree_row(ctx, position)),
         IndexKind::TurnEnd => {
-            let preview = load_assistant_preview(idx, ctx.indices, ctx.by_id, ctx.cursor);
+            let preview = load_assistant_preview(position, index, ctx.cursor);
             let preview = if preview.is_empty() {
                 "(turn end)".to_string()
             } else {
@@ -584,19 +588,19 @@ fn hydrated_tree_row(ctx: &TreeCtx, idx: usize) -> Option<TreeRowFields> {
             Some((
                 format!("agent: {preview}"),
                 String::new(),
-                ix.id.to_event_id(),
+                index.id(position).to_event_id(),
             ))
         }
         IndexKind::TurnFailed => Some((
             format!(
                 "agent: {} (failed)",
-                one_line(&load_failed_error(ctx.cursor, ix.offset))
+                one_line(&load_failed_error(ctx.cursor, index.offset(position)))
             ),
             String::new(),
-            parent_branch_point(ix),
+            parent_branch_point(index, position),
         )),
         IndexKind::TurnCancelled => {
-            let preview = load_assistant_preview(idx, ctx.indices, ctx.by_id, ctx.cursor);
+            let preview = load_assistant_preview(position, index, ctx.cursor);
             let preview = if preview.is_empty() {
                 "(cancelled)".to_string()
             } else {
@@ -605,39 +609,44 @@ fn hydrated_tree_row(ctx: &TreeCtx, idx: usize) -> Option<TreeRowFields> {
             Some((
                 format!("agent: {preview}"),
                 String::new(),
-                parent_branch_point(ix),
+                parent_branch_point(index, position),
             ))
         }
-        IndexKind::Compaction => Some(compaction_tree_row(ctx, ix)),
+        IndexKind::Compaction => Some(compaction_tree_row(ctx, position)),
         _ => None,
     }
 }
 
-fn push_tree_row(ctx: &TreeCtx, idx: usize, prefix: &str, is_active: bool, out: &mut Vec<TreeRow>) {
+fn push_tree_row(
+    ctx: &TreeCtx,
+    position: usize,
+    prefix: Arc<str>,
+    is_active: bool,
+    out: &mut Vec<TreeRow>,
+) {
     if ctx
         .hydrate_only
-        .is_some_and(|sources| !sources.contains(&idx))
+        .is_some_and(|sources| !sources.contains(&position))
     {
         return;
     }
-    let ix = &ctx.indices[idx];
     let fields = if ctx.hydrate {
-        hydrated_tree_row(ctx, idx)
+        hydrated_tree_row(ctx, position)
     } else {
-        skeleton_tree_row(ix)
+        skeleton_tree_row(ctx.index, position)
     };
     let Some((label, prefill, branch_point)) = fields else {
         return;
     };
     out.push(TreeRow {
-        prefix: prefix.to_string(),
-        label,
-        prefill,
-        branch_point,
+        prefix,
+        label: label.into_boxed_str(),
+        prefill: prefill.into_boxed_str(),
+        branch_point: branch_point.into_boxed_str(),
         is_active,
-        source_index: idx,
-        source_offset: ix.offset,
-        source_kind: ix.kind,
+        source_index: position as u32,
+        source_offset: ctx.index.offset(position),
+        source_kind: ctx.index.kind(position),
         hydrated: ctx.hydrate,
     });
 }
@@ -656,56 +665,50 @@ pub fn is_tree_node(kind: IndexKind) -> bool {
 }
 
 #[must_use]
-pub fn find_turn_outcome(
-    start: usize,
-    indices: &[EventIndex],
-    children_by_parent: &HashMap<&IndexId, Vec<usize>>,
-) -> Option<usize> {
-    let mut cur = start;
-    let mut visited = std::collections::HashSet::new();
+pub fn find_turn_outcome(start: usize, index: &TreeIndex) -> Option<usize> {
+    let mut current = start;
+    let mut visited = HashSet::new();
     loop {
-        if !visited.insert(cur) {
+        if !visited.insert(current) {
             return None;
         }
-        match indices[cur].kind {
+        match index.kind(current) {
             IndexKind::TurnEnd | IndexKind::TurnFailed | IndexKind::TurnCancelled => {
-                return Some(cur);
+                return Some(current);
             }
             _ => {}
         }
-        let children = children_by_parent.get(&indices[cur].id)?;
-        cur = *children
+        current = index
+            .children(current)
             .iter()
-            .find(|&&i| indices[i].kind != IndexKind::UserPrompt)?;
+            .copied()
+            .find(|&child| index.kind(child as usize) != IndexKind::UserPrompt)?
+            as usize;
     }
 }
 
 #[must_use]
 pub fn load_assistant_preview(
-    turn_end_idx: usize,
-    indices: &[EventIndex],
-    by_id: &HashMap<&IndexId, usize>,
+    turn_end: usize,
+    index: &TreeIndex,
     cursor: &SessionCursor,
 ) -> String {
-    let mut cur = turn_end_idx;
-    let mut visited = std::collections::HashSet::new();
-    while let Some(parent_id) = indices[cur].parent_id.as_ref() {
-        if !visited.insert(cur) {
+    let mut current = turn_end;
+    let mut visited = HashSet::new();
+    while let Some(parent) = index.parent(current) {
+        if !visited.insert(current) {
             break;
         }
-        let Some(&pidx) = by_id.get(parent_id) else {
-            break;
-        };
-        let pentry = &indices[pidx];
-        if pentry.kind == IndexKind::UserPrompt {
-            break;
-        }
-        if pentry.kind == IndexKind::AssistantMessage {
-            if let Some(text) = load_assistant_text(cursor, pentry.offset) {
-                return one_line(&text);
+        match index.kind(parent) {
+            IndexKind::UserPrompt => break,
+            IndexKind::AssistantMessage => {
+                if let Some(text) = load_assistant_text(cursor, index.offset(parent)) {
+                    return one_line(&text);
+                }
             }
+            _ => {}
         }
-        cur = pidx;
+        current = parent;
     }
     String::new()
 }
@@ -715,12 +718,12 @@ pub fn load_prompt_text(cursor: &SessionCursor, offset: u64) -> String {
     let Ok(ev) = cursor.display_event_at(offset) else {
         return String::new();
     };
-    if let SessionEventKind::Message(m) = ev.kind {
-        if m.role == Role::User {
-            return m
+    if let SessionEventKind::Message(message) = ev.kind {
+        if message.role == Role::User {
+            return message
                 .blocks
                 .iter()
-                .find_map(|b| match b {
+                .find_map(|block| match block {
                     ContentBlock::Text { text } => Some(text.clone()),
                     _ => None,
                 })
@@ -732,19 +735,17 @@ pub fn load_prompt_text(cursor: &SessionCursor, offset: u64) -> String {
 
 #[must_use]
 pub fn load_tool_result(
-    idx: usize,
-    indices: &[EventIndex],
-    by_id: &HashMap<&IndexId, usize>,
+    position: usize,
+    index: &TreeIndex,
     cursor: &SessionCursor,
 ) -> (String, String, String, bool) {
-    let ix = &indices[idx];
-    let Ok(ev) = cursor.display_event_at(ix.offset) else {
+    let Ok(ev) = cursor.display_event_at(index.offset(position)) else {
         return (String::new(), String::new(), String::new(), false);
     };
-    let SessionEventKind::Message(m) = ev.kind else {
+    let SessionEventKind::Message(message) = ev.kind else {
         return (String::new(), String::new(), String::new(), false);
     };
-    let Some(block) = m.blocks.iter().find_map(|b| match b {
+    let Some(block) = message.blocks.iter().find_map(|block| match block {
         ContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -756,17 +757,14 @@ pub fn load_tool_result(
         return (String::new(), String::new(), String::new(), false);
     };
     let (tool_use_id, content, is_error) = block;
-    let name = ix
-        .parent_id
-        .as_ref()
-        .and_then(|pid| by_id.get(pid).copied())
-        .and_then(|pidx| {
-            let pentry = &indices[pidx];
-            let pev = cursor.display_event_at(pentry.offset).ok()?;
-            let SessionEventKind::Message(pm) = pev.kind else {
+    let name = index
+        .parent(position)
+        .and_then(|parent| {
+            let parent_event = cursor.display_event_at(index.offset(parent)).ok()?;
+            let SessionEventKind::Message(message) = parent_event.kind else {
                 return None;
             };
-            pm.blocks.iter().find_map(|b| match b {
+            message.blocks.iter().find_map(|block| match block {
                 ContentBlock::ToolUse { id, name, .. } if id == &tool_use_id => Some(name.clone()),
                 _ => None,
             })
@@ -778,13 +776,13 @@ pub fn load_tool_result(
 #[must_use]
 pub fn load_assistant_text(cursor: &SessionCursor, offset: u64) -> Option<String> {
     let ev = cursor.display_event_at(offset).ok()?;
-    let SessionEventKind::Message(m) = ev.kind else {
+    let SessionEventKind::Message(message) = ev.kind else {
         return None;
     };
-    if m.role != Role::Assistant {
+    if message.role != Role::Assistant {
         return None;
     }
-    m.blocks.iter().find_map(|b| match b {
+    message.blocks.iter().find_map(|block| match block {
         ContentBlock::Text { text } => Some(text.clone()),
         _ => None,
     })

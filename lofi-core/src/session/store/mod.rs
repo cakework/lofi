@@ -16,8 +16,10 @@ pub use append::CompactionCounts;
 #[cfg(test)]
 pub(crate) use append::{append_compaction, append_events};
 pub(crate) use cursor::JobOwner;
-pub use cursor::{lineage_path, SessionCursor, SessionSnapshot, SessionTreeSnapshot};
-pub use index::{EventIndex, IndexId, IndexKind, SessionIndexEntry};
+pub use cursor::{
+    lineage_path, SessionCursor, SessionSnapshot, SessionTreeIndex, SessionTreeSnapshot,
+};
+pub use index::{EventIndex, IndexId, IndexKind, SessionIndexEntry, TreeCheckpoint, TreeIndex};
 pub use listing::{SessionEntry, SessionFile, SessionStore};
 
 use index::index_kind_for_event;

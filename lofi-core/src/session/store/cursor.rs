@@ -12,11 +12,12 @@ use super::append::{
 use super::index::{
     compaction_index_suffix, load_compaction_path, load_display_event_range,
     load_display_events_at, load_event_at, load_event_range, load_event_values, load_events_at,
-    load_index, load_index_range, load_indexed_path, load_linear_session_index,
+    load_index, load_index_range, load_indexed_path, load_linear_session_index, load_tree_index,
     session_index_from_lineage, visit_display_events, visit_events,
 };
 use super::{
     short_id, EventIndex, IndexId, IndexKind, RecoveryMessage, SessionIndexEntry, SessionMeta,
+    TreeIndex,
 };
 
 #[derive(Debug)]
@@ -38,6 +39,17 @@ pub struct SessionTreeSnapshot {
     pub meta: SessionMeta,
     pub index: Vec<EventIndex>,
     pub leaf_id: Option<String>,
+    pub file_size: u64,
+}
+
+/// The same full-tree view in positional form. This is what the `/tree`
+/// picker holds: it needs the graph, not the per-event structs, so its
+/// footprint stays flat instead of growing with a heap allocation per parent.
+#[derive(Debug, Clone)]
+pub struct SessionTreeIndex {
+    pub meta: SessionMeta,
+    pub index: TreeIndex,
+    pub leaf_pos: Option<u32>,
     pub file_size: u64,
 }
 
@@ -247,6 +259,23 @@ impl SessionCursor {
             meta,
             index,
             leaf_id: leaf.clone(),
+            file_size,
+        })
+    }
+
+    /// Atomically index the full transcript tree in positional form together
+    /// with this cursor's selected head.
+    /// # Errors
+    /// Returns an error when indexing fails or the selected head is absent.
+    pub fn tree_index(&self) -> Result<SessionTreeIndex> {
+        let leaf = self.lock_leaf();
+        let (meta, index, file_size) = load_tree_index(&self.path)?;
+        let leaf_pos = index.resolve_leaf(leaf.as_deref())?;
+        index.active_path(leaf_pos)?;
+        Ok(SessionTreeIndex {
+            meta,
+            index,
+            leaf_pos,
             file_size,
         })
     }

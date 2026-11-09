@@ -180,7 +180,7 @@ impl App {
                 };
                 for (index, mut entry) in rows {
                     self.tree_picker_pending.remove(&index);
-                    entry.prefill.clear();
+                    entry.prefill = Box::default();
                     if let Some(row) = picker.entries.get_mut(index) {
                         *row = entry;
                     }

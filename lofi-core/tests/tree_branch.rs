@@ -54,14 +54,20 @@ fn turn_end() -> SessionEvent {
     }
 }
 
+fn row_prefixes(cursor: &lofi_core::session::store::SessionCursor) -> Result<Vec<String>> {
+    let index = cursor.tree_index()?;
+    Ok(build_tree_rows(&index.index, index.leaf_pos, cursor)
+        .into_iter()
+        .map(|r| r.prefix.to_string())
+        .collect())
+}
+
 fn row_labels(cursor: &lofi_core::session::store::SessionCursor) -> Result<Vec<String>> {
-    let snap = cursor.tree_snapshot()?;
-    Ok(
-        build_tree_rows(&snap.index, snap.leaf_id.as_deref(), cursor)
-            .into_iter()
-            .map(|r| r.label)
-            .collect(),
-    )
+    let index = cursor.tree_index()?;
+    Ok(build_tree_rows(&index.index, index.leaf_pos, cursor)
+        .into_iter()
+        .map(|r| r.label.into_string())
+        .collect())
 }
 
 /// Shared two-branch topology rooted at p1: trunk continues into branch A
@@ -146,5 +152,52 @@ fn tree_lists_all_root_sibling_branches() -> Result<()> {
             "missing {expect}: {labels:?}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn trunk_rows_draw_a_branch_connector_until_the_last_row() -> Result<()> {
+    let dir = tempdir()?;
+    let store = SessionStore::new(dir.path().join("s"));
+    let cursor = store.create_cursor(Path::new("/x"), &"m".into())?;
+    let mut one = vec![user_ev("p1"), assistant_ev("a1"), turn_end()];
+    cursor.append_events(&mut one)?;
+    let mut two = vec![user_ev("p2"), assistant_ev("a2"), turn_end()];
+    cursor.append_events(&mut two)?;
+
+    // Assistant rows are not tree nodes, so the trunk is p1, t1, p2, t2.
+    let prefixes = row_prefixes(&cursor)?;
+    assert_eq!(
+        prefixes,
+        vec![
+            "\u{251c}\u{2500} ",
+            "\u{251c}\u{2500} ",
+            "\u{251c}\u{2500} ",
+            "\u{2514}\u{2500} "
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn branch_rows_hang_off_the_trunk_row_they_fork_from() -> Result<()> {
+    let dir = tempdir()?;
+    let (cursor, a_tip, _b_tip) = two_branch_fixture(&dir)?;
+    cursor.branch_from(a_tip)?;
+
+    // The fork hangs off t1, which is not the last trunk row, so its subtree
+    // indents under a continuing trunk line.
+    let prefixes = row_prefixes(&cursor)?;
+    let expected = vec![
+        "\u{251c}\u{2500} ",
+        "\u{251c}\u{2500} ",
+        "\u{2502}  \u{2514}\u{2500} ",
+        "\u{2502}     \u{251c}\u{2500} ",
+        "\u{2502}     \u{251c}\u{2500} ",
+        "\u{2502}     \u{2514}\u{2500} ",
+        "\u{251c}\u{2500} ",
+        "\u{2514}\u{2500} ",
+    ];
+    assert_eq!(prefixes, expected);
     Ok(())
 }
