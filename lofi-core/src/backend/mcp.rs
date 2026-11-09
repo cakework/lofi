@@ -70,6 +70,33 @@ impl Bridge {
     }
 }
 
+/// The executable the child spawns: a path to the pinned image inside `dir`,
+/// which no later rebuild can take away or re-point. The caller's own path is
+/// kept only where nothing was pinned, or where `dir` cannot execute files.
+pub(super) fn bridge_executable(
+    executable: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let path = crate::state::running_image_path(executable, dir).map_err(|error| {
+        let message = if executable.exists() {
+            format!(
+                "could not prepare the running lofi image in {} for the exec \
+                 bridge: {error}",
+                dir.display()
+            )
+        } else {
+            format!(
+                "the running lofi binary {} was replaced by a rebuild, and no \
+                 path to it could be prepared: {error}; restart the session to \
+                 run the new build",
+                executable.display()
+            )
+        };
+        Error::State(message)
+    })?;
+    Ok(path.unwrap_or_else(|| executable.to_path_buf()))
+}
+
 /// Refuse a path that a rebuild took away. The kernel reports a replaced
 /// binary as `... (deleted)`, which no child can spawn: the agent backend
 /// would come up with no tools instead of a clear error.
@@ -224,6 +251,16 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("was replaced by a rebuild"), "{error}");
+    }
+
+    #[test]
+    fn an_unpinned_process_keeps_its_own_path() {
+        // Nothing pins an image in this binary, so the child keeps the path it
+        // was given. The pinned ladder is covered in state.rs.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(super::bridge_executable(&exe, dir.path()).unwrap(), exe);
+        assert!(!dir.path().join("lofi").exists());
     }
 
     #[test]

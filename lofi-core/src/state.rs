@@ -335,6 +335,205 @@ fn parse_grants(bytes: &[u8]) -> Vec<WorkspaceGrant> {
     }
 }
 
+/// The running image, held open before a rebuild can replace it. The kernel
+/// reports a replaced binary as a path that is gone, which no child can
+/// spawn; the open image outlives that.
+///
+/// The open has to happen early. On network and FUSE filesystems, such as a
+/// virtiofs home, re-opening `/proc/self/exe` after the unlink fails with
+/// `ESTALE`, while a descriptor taken beforehand keeps reading every byte.
+#[cfg(target_os = "linux")]
+static RUNNING_IMAGE: std::sync::Mutex<Option<PinnedImage>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+struct PinnedImage {
+    image: std::fs::File,
+    /// The most recent copy, which later sessions link instead of writing the
+    /// image again. It is only a source hint: once its session takes the copy
+    /// away, the next session writes one.
+    copy: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedImage {
+    /// A path to the pinned image inside `dir`, linked when that is free and
+    /// written otherwise. A link shares the inode, so it outlives the session
+    /// that wrote it and no later rebuild can change what it points at, while
+    /// the install path stays a name a rebuild can take away or re-point.
+    ///
+    /// `None` only where `dir` cannot run a file at all: there the caller's
+    /// own path is the one chance the child has, and it is kept while it still
+    /// holds the running image.
+    /// # Errors
+    /// [`Error::Io`] when the image cannot be read, written, or marked
+    /// executable, and [`Error::State`] when `dir` refuses to execute files
+    /// and the caller's path no longer holds the image.
+    fn path_in(&mut self, executable: &Path, dir: &Path) -> Result<Option<PathBuf>> {
+        use std::io::{Seek as _, SeekFrom};
+
+        // A file in `dir` is only worth preparing where it can be run. Where
+        // it cannot, keeping the caller's path beats an error, and is all that
+        // is left once a rebuild has taken it.
+        if is_noexec(dir) {
+            return without_exec(dir, shares_inode(&self.image, executable));
+        }
+        let path = dir.join("lofi");
+        if let Some(copy) = &self.copy {
+            if std::fs::hard_link(copy, &path).is_ok() {
+                self.copy = Some(path.clone());
+                return Ok(Some(path));
+            }
+        }
+        // Linking the file at the install path costs nothing, and covers the
+        // whole time before the first rebuild. The link is judged afterwards:
+        // a rebuild can swap the file between the link and the check, and the
+        // child must not end up running that new build against this process's
+        // bridge.
+        if std::fs::hard_link(executable, &path).is_ok() {
+            if is_linked_image(&self.image, &path) {
+                self.copy = Some(path.clone());
+                return Ok(Some(path));
+            }
+            // The link caught another build, so it was this call that made the
+            // path: the copy below takes it back.
+            std::fs::remove_file(&path)?;
+        }
+        // The handle is shared, so every copy starts from its beginning.
+        self.image.seek(SeekFrom::Start(0))?;
+        let copy = copy_image(&mut self.image, dir)?;
+        self.copy = Some(copy.clone());
+        Ok(Some(copy))
+    }
+}
+
+/// The path the child gets when `dir` cannot execute files: the caller's own
+/// while that still holds the image, and an error once a rebuild took it.
+#[cfg(target_os = "linux")]
+fn without_exec(dir: &Path, caller_holds_image: bool) -> Result<Option<PathBuf>> {
+    if caller_holds_image {
+        return Ok(None);
+    }
+    Err(Error::State(format!(
+        "the session directory {} is on a noexec mount, so the running image \
+         cannot be executed from it",
+        dir.display()
+    )))
+}
+
+/// Whether `dir` sits on a mount that refuses to execute files. A mount that
+/// cannot be asked is treated as executable, so the copy speaks for itself.
+#[cfg(target_os = "linux")]
+fn is_noexec(dir: &Path) -> bool {
+    use nix::sys::statvfs::{statvfs, FsFlags};
+
+    match statvfs(dir) {
+        Ok(stat) => stat.flags().contains(FsFlags::ST_NOEXEC),
+        Err(_) => false,
+    }
+}
+
+/// Whether the file just linked at `path` is the image `handle` holds open. A
+/// symlink is refused: it names no inode of its own, so a rebuild could
+/// re-point it.
+#[cfg(target_os = "linux")]
+fn is_linked_image(handle: &std::fs::File, path: &Path) -> bool {
+    let (Ok(image), Ok(file)) = (handle.metadata(), std::fs::symlink_metadata(path)) else {
+        return false;
+    };
+    !file.file_type().is_symlink() && same_inode(&image, &file)
+}
+
+/// Whether `path` resolves to the image `handle` holds open.
+#[cfg(target_os = "linux")]
+fn shares_inode(handle: &std::fs::File, path: &Path) -> bool {
+    let (Ok(image), Ok(file)) = (handle.metadata(), std::fs::metadata(path)) else {
+        return false;
+    };
+    same_inode(&image, &file)
+}
+
+/// Whether two handles name one file.
+#[cfg(target_os = "linux")]
+fn same_inode(image: &std::fs::Metadata, file: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    (image.dev(), image.ino()) == (file.dev(), file.ino())
+}
+
+/// The pinned image slot, shared by every session in this process.
+#[cfg(target_os = "linux")]
+fn running_image() -> std::sync::MutexGuard<'static, Option<PinnedImage>> {
+    RUNNING_IMAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hold the running image open, so a later rebuild cannot take its
+/// `/proc/self/exe` away. Elsewhere the open is not possible and the caller
+/// keeps using its own path, which a rebuild replaces rather than removes.
+pub fn pin_running_image() {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(image) = std::fs::File::open("/proc/self/exe") {
+            let mut slot = running_image();
+            if slot.is_none() {
+                *slot = Some(PinnedImage { image, copy: None });
+            }
+        }
+    }
+}
+
+/// A path to the running image inside `dir`, for a child that spawns it: a
+/// rebuild can take the caller's own path away, and can swap the build behind
+/// it before the child execs.
+///
+/// `None` when nothing was pinned, and when `dir` cannot execute files while
+/// the caller's own path still holds the pinned image: the caller then keeps
+/// its own path.
+/// # Errors
+/// [`Error::Io`] when the image cannot be read, written, or marked
+/// executable, and [`Error::State`] when `dir` refuses to execute files.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+pub(crate) fn running_image_path(executable: &Path, dir: &Path) -> Result<Option<PathBuf>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut slot = running_image();
+        let Some(pinned) = slot.as_mut() else {
+            return Ok(None);
+        };
+        pinned.path_in(executable, dir)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (executable, dir);
+        Ok(None)
+    }
+}
+
+/// Write an open image into `dir` as a private executable file. A held fd
+/// reads on after its path is gone, which is what a rebuild leaves behind.
+#[cfg(target_os = "linux")]
+fn copy_image(image: &mut std::fs::File, dir: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let path = dir.join("lofi");
+    // The session dir is fresh, so the copy claims the path rather than
+    // replacing one: a file already there is a bug worth an error, and
+    // truncating a link to the shared image would empty it for every session.
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)?;
+    std::io::copy(image, &mut out)?;
+    // Closing is enough: the page cache already holds the bytes for the child
+    // that execs the copy, and fsyncing tens of megabytes would land on every
+    // session open.
+    drop(out);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(path)
+}
+
 pub(crate) struct SessionTempDir {
     path: PathBuf,
     /// The workspace-key directory that groups this workspace's leases. It
@@ -534,6 +733,17 @@ mod tests {
 
     use super::*;
 
+    /// A test temp dir runs files on most hosts, but `/tmp` is noexec on some,
+    /// and the ladder prepares nothing there.
+    #[cfg(target_os = "linux")]
+    fn skip_without_exec(dir: &Path) -> bool {
+        if is_noexec(dir) {
+            eprintln!("skipping: {} is on a noexec mount", dir.display());
+            return true;
+        }
+        false
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn paths_under_xdg_state_home() {
@@ -617,6 +827,122 @@ mod tests {
 
         std::env::remove_var("LOFI_STATE_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A pinned image over a small file, so the tests stay cheap and own all
+    /// of their state instead of the process-global slot.
+    #[cfg(target_os = "linux")]
+    fn pinned(path: &Path) -> PinnedImage {
+        PinnedImage {
+            image: std::fs::File::open(path).unwrap(),
+            copy: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_noexec_dir_keeps_the_callers_path_only_while_it_holds_the_image() {
+        // No mount is needed: the branch is asked directly, because a test
+        // cannot mount a noexec filesystem.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(without_exec(dir.path(), true).unwrap().is_none());
+        let error = without_exec(dir.path(), false).unwrap_err().to_string();
+        assert!(error.contains("noexec"), "{error}");
+        assert!(error.contains(&dir.path().display().to_string()), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_untouched_install_path_is_linked_without_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed");
+        std::fs::write(&installed, b"image").unwrap();
+        let mut pinned = pinned(&installed);
+
+        let session = tempfile::tempdir().unwrap();
+        if skip_without_exec(session.path()) {
+            return;
+        }
+        let path = pinned.path_in(&installed, session.path()).unwrap().unwrap();
+        // The link shares the inode, so no copy was written for the session.
+        assert_eq!(inode(&path), inode(&installed));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rebuild_at_the_install_path_is_not_what_the_child_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image");
+        std::fs::write(&image, b"running build").unwrap();
+        let mut pinned = pinned(&image);
+        // What a rebuild leaves at the install path: another build, another
+        // inode.
+        let installed = dir.path().join("lofi");
+        std::fs::write(&installed, b"new build!!").unwrap();
+
+        let session = tempfile::tempdir().unwrap();
+        if skip_without_exec(session.path()) {
+            return;
+        }
+        let path = pinned.path_in(&installed, session.path()).unwrap().unwrap();
+        assert_ne!(inode(&path), inode(&installed));
+        assert_eq!(std::fs::read(&path).unwrap(), b"running build");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_copy_is_written_again_once_its_lease_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image");
+        std::fs::write(&image, b"image").unwrap();
+        let mut pinned = pinned(&image);
+        // The install path is gone, as it is after a rebuild.
+        let gone = dir.path().join("lofi (deleted)");
+
+        let first = tempfile::tempdir().unwrap();
+        if skip_without_exec(first.path()) {
+            return;
+        }
+        let first_copy = pinned.path_in(&gone, first.path()).unwrap().unwrap();
+        assert_eq!(std::fs::read(&first_copy).unwrap(), b"image");
+        // The next session links that copy rather than writing its own.
+        let second = tempfile::tempdir().unwrap();
+        let second_copy = pinned.path_in(&gone, second.path()).unwrap().unwrap();
+        assert_eq!(inode(&first_copy), inode(&second_copy));
+
+        // The session holding the most recent copy takes it away, so the next
+        // one has to read the pinned handle again, from its beginning.
+        let linked = inode(&second_copy);
+        drop(second);
+        let third = tempfile::tempdir().unwrap();
+        let third_copy = pinned.path_in(&gone, third.path()).unwrap().unwrap();
+        assert_ne!(inode(&third_copy), linked);
+        assert_eq!(std::fs::read(&third_copy).unwrap(), b"image");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_image_copies_after_its_path_is_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("image");
+        std::fs::write(&source, b"#!/bin/sh\nprintf image\n").unwrap();
+        let mut image = std::fs::File::open(&source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+
+        let path = copy_image(&mut image, dir.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"#!/bin/sh\nprintf image\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     fn scratch_lease(group: &std::path::Path) -> SessionTempDir {

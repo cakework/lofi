@@ -180,6 +180,10 @@ enum PolicyCommand {
 /// # Errors
 /// Returns command parsing, configuration, I/O, or agent startup failures.
 pub async fn run_cli() -> anyhow::Result<()> {
+    // A rebuild replaces this binary while it keeps running, and the kernel
+    // then reports the path as gone. Pin the image before any work can race
+    // the open.
+    lofi_core::state::pin_running_image();
     let cli = Cli::parse();
     let root = std::env::current_dir().context("determine working directory")?;
 

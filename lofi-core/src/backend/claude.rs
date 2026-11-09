@@ -104,19 +104,33 @@ const FIXED_ARGS: [&str; 22] = [
 /// Private inputs of one child process: the system prompt and the bridge
 /// configuration. Neither may travel in argv: a single argv entry is limited
 /// to about 128 KiB, and every local user can read argv from /proc while the
-/// bridge token grants tool execution.
+/// bridge token grants tool execution. The lease also keeps alive the copy of
+/// the running image that the child spawns, so it must outlive the child.
 struct PrivateFiles {
     _dir: crate::state::SessionTempDir,
     system_prompt: std::path::PathBuf,
     mcp_config: std::path::PathBuf,
 }
 
-fn private_files(root: &Path, system_prompt: &str, mcp: &Value) -> Result<PrivateFiles> {
-    if system_prompt.trim().is_empty() {
-        return Err(Error::Config("empty Claude Code system prompt".into()));
-    }
-    let dir = crate::state::create_session_tmp_dir(root)?;
-    dir.ensure()?;
+/// The MCP config the child reads: the bridge's command, args and environment.
+fn mcp_config(bridge: &Bridge) -> Result<Value> {
+    let env: serde_json::Map<String, Value> = bridge.config["env"]
+        .as_array()
+        .ok_or_else(|| Error::State("missing exec bridge environment".into()))?
+        .iter()
+        .filter_map(|entry| Some((entry["name"].as_str()?.into(), entry["value"].clone())))
+        .collect();
+    Ok(json!({"mcpServers":{"lofi":{
+        "type":"stdio", "command":bridge.config["command"],
+        "args":bridge.config["args"], "env":env
+    }}}))
+}
+
+fn private_files(
+    dir: crate::state::SessionTempDir,
+    system_prompt: &str,
+    mcp: &Value,
+) -> Result<PrivateFiles> {
     let prompt = dir.path().join("system-prompt.md");
     std::fs::write(&prompt, system_prompt)?;
     crate::state::ensure_private_file(&prompt)?;
@@ -201,24 +215,32 @@ impl ClaudeSession {
         if command.trim().is_empty() {
             return Err(Error::Config("empty Claude Code command".into()));
         }
+        if system_prompt.trim().is_empty() {
+            return Err(Error::Config("empty Claude Code system prompt".into()));
+        }
         let id = match resume {
             Some(id) => uuid::Uuid::parse_str(id)
                 .map_err(|_| Error::State("invalid Claude Code session ID".into()))?,
             None => uuid::Uuid::new_v4(),
         }
         .to_string();
-        let bridge = Bridge::start(executor, executable).await?;
-        let env: serde_json::Map<String, Value> = bridge.config["env"]
-            .as_array()
-            .ok_or_else(|| Error::State("missing exec bridge environment".into()))?
-            .iter()
-            .filter_map(|entry| Some((entry["name"].as_str()?.into(), entry["value"].clone())))
-            .collect();
-        let mcp = json!({"mcpServers":{"lofi":{
-            "type":"stdio", "command":bridge.config["command"],
-            "args":bridge.config["args"], "env":env
-        }}});
-        let files = private_files(root, system_prompt, &mcp)?;
+        // A rebuild can take the path away, or swap the build behind it, while
+        // this build keeps running. The path handed to the child is settled
+        // here, and settling it can write the whole image, which must not block
+        // the runtime. The lease travels with the work, so a dropped future
+        // cannot remove the directory the image is being written into.
+        let dir = crate::state::create_session_tmp_dir(root)?;
+        dir.ensure()?;
+        let installed = executable.to_path_buf();
+        let (dir, executable) = tokio::task::spawn_blocking(move || {
+            let path = super::mcp::bridge_executable(&installed, dir.path());
+            (dir, path)
+        })
+        .await
+        .map_err(|error| Error::State(format!("preparing the exec bridge: {error}")))?;
+        let executable = executable?;
+        let bridge = Bridge::start(executor, &executable).await?;
+        let files = private_files(dir, system_prompt, &mcp_config(&bridge)?)?;
         let mut process = Command::new(command);
         process.args(FIXED_ARGS);
         process.arg("--mcp-config").arg(&files.mcp_config);
