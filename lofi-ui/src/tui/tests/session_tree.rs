@@ -1033,10 +1033,12 @@ fn tree_shows_tool_result_nodes() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn tree_exec_label_shows_native_tools() {
-    // user -> assistant(exec ToolUse) -> tool_result -> native_tool(read) ->
-    // native_tool(edit) -> native_tool(read) -> assistant(text) -> turn_end
-    // /tree must show the exec tool result as `exec: read demo.txt, edit demo.txt, read demo.txt`
-    // instead of the raw exec result.
+    // user -> assistant(exec ToolUse) -> turn_usage -> native_tool(write) ->
+    // native_tool(edit) -> native_tool(read) -> tool_result -> assistant(text)
+    // -> turn_end, the order the recorder writes for a sandboxed call.
+    // /tree must show the exec tool result as
+    // `exec: write demo.txt, edit demo.txt, read demo.txt` instead of the raw
+    // exec result.
     use lofi_core::session::store::SessionStore;
     use lofi_types::{ContentBlock, NativeToolRecord, Role};
     let dir = tempfile::tempdir().unwrap();
@@ -1065,17 +1067,11 @@ fn tree_exec_label_shows_native_tools() {
             }],
             kind: PromptKind::default(),
         }),
-        SessionEventKind::Message(Message {
-            origin: None,
-            role: Role::Tool,
-            blocks: vec![ContentBlock::ToolResult {
-                tool_use_id: "exec_0".into(),
-                content: "exec result".into(),
-                is_error: false,
-                images: Vec::new(),
-            }],
-            kind: PromptKind::default(),
-        }),
+        SessionEventKind::TurnUsage {
+            elapsed_ms: 50,
+            cost: 0.0,
+            usage: Usage::default(),
+        },
         SessionEventKind::NativeTool(NativeToolRecord {
             parent: "exec_0".into(),
             call_id: 0,
@@ -1099,6 +1095,17 @@ fn tree_exec_label_shows_native_tools() {
             args: "demo.txt".into(),
             result: "ok".into(),
             is_error: false,
+        }),
+        SessionEventKind::Message(Message {
+            origin: None,
+            role: Role::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "exec_0".into(),
+                content: "exec result".into(),
+                is_error: false,
+                images: Vec::new(),
+            }],
+            kind: PromptKind::default(),
         }),
         SessionEventKind::Message(Message {
             origin: None,

@@ -316,32 +316,14 @@ fn build_native_tool_map(
     map
 }
 
-fn load_native_tools_for_turn(
-    ctx: &TreeCtx<'_>,
-    tool_result: usize,
+/// Summaries for the nested calls recorded under `tool_use_id`, in the
+/// order the tools ran.
+fn load_native_tool_summaries(
+    cursor: &SessionCursor,
+    natives: &[u64],
     tool_use_id: &str,
 ) -> Vec<(String, String)> {
-    let mut offsets = Vec::new();
-    let mut current = tool_result;
-    let mut visited = HashSet::new();
-    while visited.insert(current) {
-        let Some(&next) = ctx
-            .index
-            .children(current)
-            .iter()
-            .find(|&&child| ctx.index.kind(child as usize) != IndexKind::UserPrompt)
-        else {
-            break;
-        };
-        let next = next as usize;
-        match ctx.index.kind(next) {
-            IndexKind::NativeTool => offsets.push(ctx.index.offset(next)),
-            IndexKind::TurnEnd | IndexKind::TurnFailed | IndexKind::TurnCancelled => break,
-            _ => {}
-        }
-        current = next;
-    }
-    let Ok(summaries) = ctx.cursor.native_tool_summaries(&offsets) else {
+    let Ok(summaries) = cursor.native_tool_summaries(natives) else {
         return Vec::new();
     };
     summaries
@@ -500,15 +482,15 @@ fn skeleton_tree_row(index: &TreeIndex, position: usize) -> Option<TreeRowFields
 }
 
 fn tool_result_tree_row(ctx: &TreeCtx, position: usize) -> TreeRowFields {
-    let (name, tool_use_id, content, is_error) = load_tool_result(position, ctx.index, ctx.cursor);
-    let marker = if is_error { "\u{2717} " } else { "" };
-    let label = if name == "exec" {
-        let mut tools = ctx.native_tools.borrow().get(&tool_use_id).cloned();
+    let row = load_tool_row(position, ctx.index, ctx.cursor);
+    let marker = if row.is_error { "\u{2717} " } else { "" };
+    let label = if row.name == "exec" {
+        let mut tools = ctx.native_tools.borrow().get(&row.tool_use_id).cloned();
         if tools.is_none() && ctx.lazy_native_tools {
-            let loaded = load_native_tools_for_turn(ctx, position, &tool_use_id);
+            let loaded = load_native_tool_summaries(ctx.cursor, &row.natives, &row.tool_use_id);
             ctx.native_tools
                 .borrow_mut()
-                .insert(tool_use_id.clone(), loaded.clone());
+                .insert(row.tool_use_id.clone(), loaded.clone());
             tools = Some(loaded);
         }
         if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
@@ -519,10 +501,10 @@ fn tool_result_tree_row(ctx: &TreeCtx, position: usize) -> TreeRowFields {
                 .join(", ");
             format!("exec: {marker}{}", one_line(&summary))
         } else {
-            format!("exec: {marker}{}", one_line(&content))
+            format!("exec: {marker}{}", one_line(&row.content))
         }
     } else {
-        format!("tool: {marker}{name}: {}", one_line(&content))
+        format!("tool: {marker}{}: {}", row.name, one_line(&row.content))
     };
     (label, String::new(), ctx.index.id(position).to_event_id())
 }
@@ -733,44 +715,101 @@ pub fn load_prompt_text(cursor: &SessionCursor, offset: u64) -> String {
     String::new()
 }
 
-#[must_use]
-pub fn load_tool_result(
+struct ToolRow {
+    /// Name of the call that issued the result, or `?` when the nearest
+    /// assistant message in the same turn has no matching `tool_use` block.
+    name: String,
+    tool_use_id: String,
+    content: String,
+    is_error: bool,
+    /// Offsets of the `native_tool` records written between the issuing call
+    /// and this result, in the order the tools ran.
+    natives: Vec<u64>,
+}
+
+fn load_tool_row(position: usize, index: &TreeIndex, cursor: &SessionCursor) -> ToolRow {
+    let mut row = ToolRow {
+        name: String::new(),
+        tool_use_id: String::new(),
+        content: String::new(),
+        is_error: false,
+        natives: Vec::new(),
+    };
+    let Ok(event) = cursor.display_event_at(index.offset(position)) else {
+        return row;
+    };
+    let SessionEventKind::Message(message) = event.kind else {
+        return row;
+    };
+    let Some((tool_use_id, content, is_error)) =
+        message.blocks.iter().find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => Some((tool_use_id.clone(), content.clone(), *is_error)),
+            _ => None,
+        })
+    else {
+        return row;
+    };
+    let issuing = issuing_call(position, index, cursor, &tool_use_id);
+    row.name = issuing.name.unwrap_or_else(|| "?".to_string());
+    row.tool_use_id = tool_use_id;
+    row.content = content;
+    row.is_error = is_error;
+    row.natives = issuing.natives;
+    row
+}
+
+struct IssuingCall {
+    name: Option<String>,
+    natives: Vec<u64>,
+}
+
+/// A sandboxed call writes one `native_tool` record per nested tool before it
+/// returns, so its result hangs off the last of those rather than off the
+/// assistant message that issued the call. Walk to the nearest assistant
+/// message, which the recorder writes directly above them, and stop at the
+/// turn start so a result never borrows a name from an earlier turn.
+fn issuing_call(
     position: usize,
     index: &TreeIndex,
     cursor: &SessionCursor,
-) -> (String, String, String, bool) {
-    let Ok(ev) = cursor.display_event_at(index.offset(position)) else {
-        return (String::new(), String::new(), String::new(), false);
+    tool_use_id: &str,
+) -> IssuingCall {
+    let mut natives = Vec::new();
+    let mut name = None;
+    let mut current = index.parent(position);
+    for _ in 0..index.len() {
+        let Some(parent) = current else {
+            break;
+        };
+        match index.kind(parent) {
+            IndexKind::NativeTool => natives.push(index.offset(parent)),
+            IndexKind::AssistantMessage => {
+                name = tool_use_name(cursor, index.offset(parent), tool_use_id);
+                break;
+            }
+            IndexKind::UserPrompt => break,
+            _ => {}
+        }
+        current = index.parent(parent);
+    }
+    natives.reverse();
+    IssuingCall { name, natives }
+}
+
+fn tool_use_name(cursor: &SessionCursor, offset: u64, tool_use_id: &str) -> Option<String> {
+    let event = cursor.display_event_at(offset).ok()?;
+    let SessionEventKind::Message(message) = event.kind else {
+        return None;
     };
-    let SessionEventKind::Message(message) = ev.kind else {
-        return (String::new(), String::new(), String::new(), false);
-    };
-    let Some(block) = message.blocks.iter().find_map(|block| match block {
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-            ..
-        } => Some((tool_use_id.clone(), content.clone(), *is_error)),
+    message.blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolUse { id, name, .. } if id == tool_use_id => Some(name.clone()),
         _ => None,
-    }) else {
-        return (String::new(), String::new(), String::new(), false);
-    };
-    let (tool_use_id, content, is_error) = block;
-    let name = index
-        .parent(position)
-        .and_then(|parent| {
-            let parent_event = cursor.display_event_at(index.offset(parent)).ok()?;
-            let SessionEventKind::Message(message) = parent_event.kind else {
-                return None;
-            };
-            message.blocks.iter().find_map(|block| match block {
-                ContentBlock::ToolUse { id, name, .. } if id == &tool_use_id => Some(name.clone()),
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| "?".to_string());
-    (name, tool_use_id, content, is_error)
+    })
 }
 
 #[must_use]
