@@ -99,6 +99,7 @@ impl App {
             thinking_picker: None,
             policy_picker: None,
             paths_picker: None,
+            executor: None,
             paths: None,
             policy_override: None,
             auto_mode_configured: false,

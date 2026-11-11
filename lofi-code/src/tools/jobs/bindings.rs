@@ -5,7 +5,7 @@
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -54,7 +54,7 @@ impl BuiltinTools {
     #[allow(clippy::too_many_lines)]
     pub async fn job_spawn(&self, args: Value) -> Result<Value> {
         let cmd = require_str("jobSpawn", &args, "cmd")?;
-        let timeout_ms = args.get("timeoutMs").and_then(Value::as_u64);
+        let asked_ms = args.get("timeoutMs").and_then(Value::as_u64);
 
         // Notifications at spawn. Default: terminal only. `notify: false`
         // silences everything; `notifyIntervalMs` (clamped to the floor)
@@ -105,6 +105,15 @@ impl BuiltinTools {
         {
             return Err(Error::Tool("jobSpawn: run cancelled".into()));
         }
+
+        // Read after the policy check: an approval prompt can hold the call
+        // for minutes, and the job's clock starts when it may run. A job is a
+        // background process: it is bound by the timeout it came with and by
+        // nothing else, so it outlives the call that spawned it. A bound too
+        // large to represent is no deadline, not a panic.
+        let timeout_ms = asked_ms;
+        let deadline =
+            timeout_ms.and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)));
 
         // Bound one subagent's process tree; the session itself is
         // uncapped here (its jobs end with the turn or the session).
@@ -199,6 +208,18 @@ impl BuiltinTools {
         if tty {
             command.env("TERM", "xterm-256color");
         }
+        // The log file, the pty and the command can outlast what the run had
+        // left, so the clock is read again here: a process that would start
+        // spent never starts.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // The log file was opened for a job that never starts: leave no
+            // empty file behind.
+            let _ = std::fs::remove_file(&log_path);
+            return Ok(json!({
+                "ok": false,
+                "error": "jobSpawn: the deadline passed before the job started",
+            }));
+        }
         let mut child = command.spawn()?;
         let pid = child.id();
 
@@ -290,7 +311,7 @@ impl BuiltinTools {
             Arc::downgrade(&self.jobs.inner),
             handle,
             child,
-            timeout_ms,
+            deadline,
             generation,
             driver_master,
             self.bash_env.clone(),
@@ -308,7 +329,7 @@ impl BuiltinTools {
             tokio::spawn(driver);
         }
 
-        Ok(json!({
+        let out = json!({
             "ok": true,
             "id": short_id(id),
             "state": "running",
@@ -321,7 +342,8 @@ impl BuiltinTools {
             "cols": cols,
             "rows": rows,
             "idleMs": idle_ms,
-        }))
+        });
+        Ok(out)
     }
 
     /// Current state, timestamps, exit status, and limits. Session-scoped:

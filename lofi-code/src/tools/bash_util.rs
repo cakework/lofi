@@ -66,6 +66,38 @@ pub async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
     Ok((buf, false))
 }
 
+/// Read to the pipe end, appending as the data arrives.
+///
+/// The bytes belong to `sink`, not to the future doing the reading: a command
+/// the clock cuts drops that future, and what it read is still there to report.
+#[allow(clippy::missing_errors_doc)]
+pub async fn read_capped_into<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    sink: &std::sync::Mutex<Vec<u8>>,
+    cap: usize,
+) -> std::io::Result<()> {
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = r.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let full = {
+            let mut buf = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let room = cap.saturating_sub(buf.len());
+            let take = n.min(room);
+            buf.extend_from_slice(&tmp[..take]);
+            take < n
+        };
+        if full {
+            drain(r).await?;
+            return Ok(());
+        }
+    }
+}
+
 async fn drain<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<()> {
     let mut tmp = [0u8; 8192];
     loop {

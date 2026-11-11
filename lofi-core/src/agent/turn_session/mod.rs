@@ -515,6 +515,7 @@ pub async fn run(
                         error = %error,
                         "request failed; retry scheduled"
                     );
+                    let delay = plan.delay;
                     // Cancellable backoff: stop promptly for Ctrl-C or a closed
                     // consumer instead of waiting out the retry delay and
                     // issuing another request.
@@ -522,7 +523,7 @@ pub async fn run(
                         biased;
                         () = io.cancel().wait() => false,
                         () = io.events().closed() => false,
-                        () = tokio::time::sleep(plan.delay) => true,
+                        () = tokio::time::sleep(delay) => true,
                     };
                     if !ready {
                         // The retry never ran: close the pair the start opened,

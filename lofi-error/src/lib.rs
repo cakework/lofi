@@ -99,6 +99,43 @@ pub enum Error {
     /// public `Agent::run` boundary.
     #[error("cancelled: consumer closed")]
     Cancelled,
+
+    /// The guest stopped at one of the bounds the run gave it. The message is
+    /// what the call site reported before this variant existed; `status`
+    /// names the bound in the vocabulary a run, a job and bash already use, so
+    /// an exec result says the same word its siblings do. `logs` is what the
+    /// guest printed before the bound stopped it: a failing result keeps what
+    /// it reached.
+    #[error("{message}")]
+    SandboxStopped {
+        status: &'static str,
+        message: String,
+        logs: Option<String>,
+    },
+}
+
+impl Error {
+    /// The output a stopped guest printed before it stopped, when the bound
+    /// that stopped it could see the log buffer.
+    #[must_use]
+    pub fn logs(&self) -> Option<&str> {
+        match self {
+            Self::SandboxStopped { logs, .. } => logs.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The status word a result reports, in the vocabulary a run, a job and
+    /// bash share: `completed`, `failed`, `cancelled`, `timed_out`,
+    /// `blocked`.
+    #[must_use]
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::SandboxStopped { status, .. } => status,
+            _ => "failed",
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

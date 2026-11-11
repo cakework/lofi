@@ -476,7 +476,7 @@ async fn exec_reports_unawaited_bash_failure() {
     assert_eq!(res.errors[0]["tool"], json!("bash"));
     assert_eq!(res.errors[0]["result"]["ok"], json!(false));
     assert_eq!(res.errors[0]["result"]["code"], json!(7));
-    assert_eq!(res.errors[0]["result"]["status"], json!("exited"));
+    assert_eq!(res.errors[0]["result"]["status"], json!("failed"));
 }
 
 #[tokio::test]

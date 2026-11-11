@@ -355,17 +355,24 @@ impl std::fmt::Debug for ExecCtx {
 
 #[derive(Debug, Clone)]
 pub struct ExecOptions {
+    /// CPU allowance: time the guest spends running, with gaps between
+    /// interpreter ticks capped. Bounds a spin loop, not a slow tool.
     pub timeout: Duration,
+    /// Wall-clock instant this call must be over by: the `timeoutMs` the call
+    /// set, if any. Await-heavy guest code ticks rarely, so the CPU allowance
+    /// cannot bound it.
+    pub deadline: Option<std::time::Instant>,
     /// Maximum cumulative bytes copied from the guest result into host JSON.
     /// The agent sets this to its model-visible result cap so oversized values
     /// are truncated before a second full-sized representation is allocated.
     pub max_value_bytes: usize,
     /// Optional external cancellation flag. When set to `true`, the `QuickJS`
     /// interrupt handler breaks out of any running synchronous guest code and
-    /// [`exec`](fn.exec.html) returns [`Error::Sandbox`] with a
-    /// "cancelled" message. Without this, a tight `while (true) {}` loop
-    /// blocks inside native `ctx.eval` and cannot be preempted by tokio's
-    /// task-abort mechanism — the interrupt handler is the only way in.
+    /// [`exec`](fn.exec.html) returns [`Error::SandboxStopped`] with status
+    /// `"cancelled"`, carrying the logs the guest printed. Without this, a
+    /// tight `while (true) {}` loop blocks inside native `ctx.eval` and
+    /// cannot be preempted by tokio's task-abort mechanism — the interrupt
+    /// handler is the only way in.
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -373,6 +380,7 @@ impl Default for ExecOptions {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_GUEST_TIMEOUT,
+            deadline: None,
             max_value_bytes: JS_TO_JSON_MAX_BYTES,
             cancel: None,
         }

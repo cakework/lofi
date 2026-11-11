@@ -31,6 +31,11 @@ pub fn exec_tool_input_schema() -> serde_json::Value {
             "strings": {
                 "type": "object",
                 "description": "Named string constants exposed as the global `lofi_strings` object."
+            },
+            "timeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Wall-clock timeout for this call in milliseconds. It bounds this call: a command, a wait or a foreground child it starts is cut to it, and no further tool call starts once it is spent. Nothing is bounded without one, and a background job or a spawned child outlives the call, so it keeps the timeout it was given."
             }
         },
         "required": ["code", "description"]

@@ -3,6 +3,7 @@
 mod api;
 mod compact;
 mod config;
+mod deadline;
 mod decision;
 mod id;
 mod message;
@@ -18,6 +19,7 @@ pub mod text;
 pub use api::*;
 pub use compact::*;
 pub use config::*;
+pub use deadline::*;
 pub use decision::*;
 pub use id::{parse_short_id, short_id, IdSpace};
 pub use message::*;

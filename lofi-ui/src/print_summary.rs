@@ -116,10 +116,18 @@ impl PrintSummary {
                 self.status = Status::Cancelled;
                 self.cost = *cost;
             }
-            // The turn stopped at the context cap without settling; the
-            // caller fails the run, and the record keeps the spend so far.
-            AgentEvent::ContextPressure { cost, .. } => {
+            // The turn stopped at the context cap without settling: the
+            // record keeps the spend so far, and names the run complete only
+            // when the model had already stopped on its own.
+            AgentEvent::ContextPressure { resume, cost, .. } => {
                 self.cost = *cost;
+                // A turn that stopped on its own had nothing left to continue:
+                // the cap only kept its kept context from being compacted, and
+                // the run is complete. A turn that asked to resume is cut
+                // short, and the caller fails it.
+                if !resume {
+                    self.status = Status::Completed;
+                }
             }
             AgentEvent::Error(message) => {
                 self.status = Status::Failed;
@@ -141,6 +149,9 @@ impl PrintSummary {
                 "service_tier": model.service_tier.as_str(),
             })
         });
+        // The stop names itself when nothing else failed the run; a later
+        // failure keeps its own error, which the record exists to carry.
+        let error = self.error.clone();
         serde_json::json!({
             "ok": self.status == Status::Completed,
             "status": self.status.as_str(),
@@ -154,7 +165,7 @@ impl PrintSummary {
             "stop_reason": self.stop_reason.and_then(|reason| serde_json::to_value(reason).ok()),
             "session": self.session,
             "duration_ms": wall_ms,
-            "error": self.error,
+            "error": error,
         })
     }
 
@@ -358,6 +369,21 @@ mod tests {
         assert_eq!(record["error"], json!("interrupted"), "{record}");
     }
 
+    #[test]
+    fn a_stop_at_the_context_cap_reports_a_completed_run() {
+        let mut summary = summary();
+        summary.note(&AgentEvent::ContextPressure {
+            resume: false,
+            elapsed_ms: 40,
+            cost: 0.3,
+            usage: Usage::default(),
+        });
+
+        let record = summary.record(40);
+        assert_eq!(record["ok"], json!(true), "{record}");
+        assert_eq!(record["status"], json!("completed"), "{record}");
+        assert_eq!(record["error"], json!(null), "{record}");
+    }
     #[test]
     fn a_run_that_never_settled_reports_incomplete() {
         let mut summary = summary();

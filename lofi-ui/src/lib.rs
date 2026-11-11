@@ -695,7 +695,13 @@ async fn run_print_turn(
             // flush is not silently swallowed.
             match (&mut consumer).await {
                 Ok(()) => agent_res.map(|_| ()),
-                Err(e) => Err(e),
+                // A run that failed after the drain is reported with its own
+                // error: the consumer's latch states the stop that came first,
+                // and would hide the failure that ended the run behind it.
+                Err(e) => match agent_res {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(e),
+                },
             }
         }
     };

@@ -447,7 +447,9 @@ fn a_deny_rule_and_yolo_have_process_level_wire_behavior() {
     denied.wait_for("denied policy answer", WAIT);
     assert!(!fixture.workspace.join("target").exists());
     let requests = server.requests();
-    assert!(requests[1].body.contains("denied"));
+    // The status word, not the prompt's own "denied": this must fail if the
+    // command ran.
+    assert!(requests[1].body.contains(r#"\"status\":\"blocked\""#));
 
     std::fs::write(
         fixture.config.parent().unwrap().join("policy.toml"),

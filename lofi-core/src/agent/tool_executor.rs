@@ -475,6 +475,8 @@ impl ToolExecutor {
         self
     }
 
+    /// The prompt this executor's run reads. Every backend that builds a
+    /// prompt asks here rather than assembling one of its own.
     #[must_use]
     pub(crate) fn system_prompt(&self) -> String {
         super::model::assemble_system_prompt(
@@ -630,6 +632,34 @@ impl ToolExecutor {
                 .await?;
                 continue;
             }
+            // The call's own bound: what it asked, as an absolute instant, so
+            // the prompt, the compile, and every tool it starts come out of it
+            // instead of adding to it. Nothing above the call bounds it.
+            if input
+                .get("timeoutMs")
+                .filter(|asked| !asked.is_null())
+                .is_some_and(|asked| asked.as_u64().is_none_or(|ms| ms == 0))
+            {
+                reject(
+                    call,
+                    &mut results,
+                    id,
+                    failed_result(
+                        "exec: timeoutMs must be a positive integer",
+                        "failed",
+                        None,
+                        None,
+                    ),
+                    dispatch,
+                )
+                .await?;
+                continue;
+            }
+            let exec_deadline = exec_timeout_ms(input).and_then(|ms| {
+                std::time::Instant::now().checked_add(std::time::Duration::from_millis(ms))
+            });
+            // The bound this call's tools run under: the call's own `timeoutMs`.
+            let clock = exec_deadline.map_or(lofi_types::Deadline::NONE, lofi_types::Deadline::at);
             // The ToolInput event must land before we invoke the sandbox;
             // if the consumer is gone, stop instead of running tools (which
             // may shell out or mutate files) for a dead receiver.
@@ -728,6 +758,10 @@ impl ToolExecutor {
                 let watch = self.confirm_watch.clone();
                 let root = self.root.clone();
                 let config_grants = self.grants.clone();
+                // The instant this call's clock closes the prompt: the same
+                // one the tool refuses an answer after, so the countdown the
+                // user reads ends where the ask does.
+                let deny_at = clock.instant();
                 Arc::new(move |approval: lofi_code::DirApproval| {
                     let tx = tx.clone();
                     let counter = counter.clone();
@@ -739,7 +773,8 @@ impl ToolExecutor {
                         // stored-grant reads it does first are instantaneous
                         // next to the wait for an answer.
                         let _open = watch.open(&approval.dir.display().to_string());
-                        approve_outside_dir(&root, approval, &config_grants, &tx, &counter).await
+                        approve_outside_dir(&root, approval, &config_grants, &tx, &counter, deny_at)
+                            .await
                     })
                         as std::pin::Pin<
                             Box<
@@ -756,12 +791,20 @@ impl ToolExecutor {
             // what the call started, and asks that same hook to fold the runs
             // it spawned.
             let child_spend = Arc::new(Mutex::new(ChildSpend::default()));
+            // The wall clock this call is under, handed to the tools it
+            // starts: a command is clamped to what the call has left instead
+            // of to a constant that has to stay below it by hand. A call with
+            // no `timeoutMs` arms nothing, and its tools keep their own timeouts.
+            // This is not the guest's CPU budget below: awaited time costs no
+            // CPU, so the two clocks bound different things.
             let subagent: Option<lofi_code::SubagentFn> = self.subagent.clone().map(|hook| {
                 let spend = child_spend.clone();
+                let wait_clock = clock;
                 Arc::new(move |op: lofi_code::SubagentOp, args: serde_json::Value| {
                     let hook = hook.clone();
                     let spend = spend.clone();
                     Box::pin(async move {
+                        let (args, cut) = clamp_child(op, args, wait_clock);
                         // A resume installs the new run's totals over the
                         // entry's, so what the background run this call
                         // started billed is read before the hook replaces it.
@@ -784,7 +827,18 @@ impl ToolExecutor {
                             }
                             _ => None,
                         };
-                        let out = hook(op, args).await;
+                        let mut out = hook(op, args).await;
+                        // The allowance this child asked for, when the call
+                        // cut it: a parent can tell a child that ran out from
+                        // one that was cut short.
+                        if let Some(asked) = cut {
+                            if let Some(map) = out.as_object_mut() {
+                                map.insert(
+                                    "requestedTimeoutMs".to_string(),
+                                    serde_json::json!(asked),
+                                );
+                            }
+                        }
                         let mut spend = lock(&spend);
                         match op {
                             // Only an admitted spawn returns an id: a
@@ -843,11 +897,22 @@ impl ToolExecutor {
                 // so the gate judges this call's commands with this call's
                 // intent however the call's future is dropped or queued.
                 intent: Some(description.clone()),
+                // A prompt must not outlive the run that raised it, so the
+                // wait is cut to what the call has left. A spent clock leaves
+                // the shortest wait there is rather than a disabled
+                // auto-deny.
                 approval_timeout: self
                     .auto_mode_config
                     .as_ref()
                     .and_then(|config| config.shell_policy.auto_mode.as_ref())
-                    .and_then(lofi_types::AutoModeConfig::approval_timeout),
+                    .and_then(lofi_types::AutoModeConfig::approval_timeout)
+                    .map(|wait| {
+                        clock
+                            .remaining(std::time::Instant::now())
+                            .map_or(wait, |left| {
+                                wait.min(left).max(std::time::Duration::from_millis(1))
+                            })
+                    }),
                 policy_override: self.policy_override.clone(),
                 skills_dir: self.skills_dir.clone(),
                 memory: self.memory.clone(),
@@ -865,7 +930,12 @@ impl ToolExecutor {
                     &code,
                     exec_ctx,
                     ExecOptions {
+                        // The guest's own allowance stays as it was: it counts
+                        // CPU, so raising it to a long run cap would let a
+                        // spin loop run for hours. The wall budget is the
+                        // separate bound the caller named.
                         timeout: lofi_code::DEFAULT_GUEST_TIMEOUT,
+                        deadline: exec_deadline,
                         max_value_bytes: MAX_EXEC_RESULT_BYTES,
                         cancel: cancel.cloned(),
                     },
@@ -918,6 +988,13 @@ impl ToolExecutor {
                             let is_error = !r.errors.is_empty();
                             let mut output = serde_json::Map::new();
                             output.insert("ok".into(), serde_json::Value::Bool(!is_error));
+                            // One vocabulary with a run, a job and a bash call.
+                            output.insert(
+                                "status".into(),
+                                serde_json::Value::String(
+                                    if is_error { "failed" } else { "completed" }.into(),
+                                ),
+                            );
                             if is_error {
                                 output.insert("errors".into(), serde_json::Value::Array(r.errors));
                             }
@@ -933,13 +1010,13 @@ impl ToolExecutor {
                             if r.value_truncated {
                                 output.insert("truncated".into(), serde_json::Value::Bool(true));
                             }
-                            let content = serde_json::to_string(&output)
-                                .unwrap_or_else(|_| "{\"ok\":true}".to_string());
-                            (cap_exec_result(&content), is_error, img)
+                            (cap_exec_envelope(output), is_error, img)
                         }
                         Err(error) => (
                             cap_exec_result(&failed_result(
                                 &error.to_string(),
+                                error.status(),
+                                error.logs(),
                                 subagent_usage.as_ref(),
                             )),
                             true,
@@ -948,7 +1025,12 @@ impl ToolExecutor {
                     }
                 }
                 Err(e) => (
-                    cap_exec_result(&failed_result(&e.to_string(), subagent_usage.as_ref())),
+                    cap_exec_result(&failed_result(
+                        &e.to_string(),
+                        e.status(),
+                        e.logs(),
+                        subagent_usage.as_ref(),
+                    )),
                     true,
                     None,
                 ),
@@ -1060,6 +1142,17 @@ pub(super) fn upgrade_exec_image(
     Ok(Some(lofi_types::ToolResultImage { bytes, media_type }))
 }
 
+/// Clears a directory prompt's `active` flag when the ask ends. The UI drops
+/// a prompt only while that flag stays true, so an exec call its deadline drops
+/// mid-ask must still close its modal.
+struct ActivePrompt(Arc<AtomicBool>);
+
+impl Drop for ActivePrompt {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Asks the user to grant one directory tree for use outside the workspace
 /// root, and remembers the grant in the per-workspace state file so later
 /// sessions do not ask again. A remembered grant that already allows the
@@ -1072,6 +1165,7 @@ async fn approve_outside_dir(
     config_grants: &[lofi_code::GrantedDir],
     tx: &tokio::sync::mpsc::UnboundedSender<ConfirmRequest>,
     counter: &Arc<AtomicU64>,
+    deny_at: Option<std::time::Instant>,
 ) -> Option<lofi_code::GrantedDir> {
     // A grant that already covers the requested directory answers at once,
     // whatever its width: the prompt's unit is the project root, and a
@@ -1120,6 +1214,8 @@ async fn approve_outside_dir(
         });
     let id = counter.fetch_add(1, Ordering::SeqCst);
     let (resp_tx, resp_rx) = oneshot::channel();
+    let active = Arc::new(AtomicBool::new(true));
+    let _closes = ActivePrompt(active.clone());
     let req = ConfirmRequest {
         id,
         command: approval.dir.display().to_string(),
@@ -1133,8 +1229,8 @@ async fn approve_outside_dir(
             requested: approval.requested,
             current,
         })),
-        active: Arc::new(AtomicBool::new(true)),
-        deny_at: Arc::new(Mutex::new(None)),
+        active,
+        deny_at: Arc::new(Mutex::new(deny_at)),
         respond: resp_tx,
     };
     if tx.send(req).is_err() {
@@ -1152,9 +1248,13 @@ async fn approve_outside_dir(
     } else {
         approval.dir
     };
+    // An answer that lands after the call's clock closed the prompt is
+    // reported but not kept: the call refuses the work it was asked for, so
+    // the access it asked for must not outlive it.
+    let late = deny_at.is_some_and(|end| std::time::Instant::now() >= end);
     // The grant is reused only by this call's retry; a failed save means
     // the next request asks again.
-    if let Some(state) = &state {
+    if let Some(state) = state.as_ref().filter(|_| !late) {
         let _ = state.remember_grant(&dir, access);
     }
     Some(lofi_code::GrantedDir { dir, access })
@@ -1201,17 +1301,119 @@ impl ChildSpend {
     }
 }
 
-/// The failed body of an exec result. A program that threw after its
-/// children spent money still reports that spend.
-fn failed_result(message: &str, subagents: Option<&serde_json::Value>) -> String {
-    match subagents {
-        Some(usage) => serde_json::json!({
+/// A bound ending `left` from now, as a call's own `timeout_ms` states it.
+#[cfg(test)]
+fn clock(left: std::time::Duration) -> lofi_types::Deadline {
+    lofi_types::Deadline::at(std::time::Instant::now() + left)
+}
+
+fn clamp_child(
+    op: lofi_code::SubagentOp,
+    mut args: serde_json::Value,
+    clock: lofi_types::Deadline,
+) -> (serde_json::Value, Option<u64>) {
+    // A wait or a mailbox receive must not block past the call that awaits
+    // them, and a foreground child must not outlive it either, so each takes
+    // what is left. A spawned run outlives the call that started it, so its
+    // own timeout stands as given and one that sets none stays unbounded: it
+    // is left alone below. Each kind names its bound with its own key.
+    let (key, child, fill) = match op {
+        lofi_code::SubagentOp::Run => ("timeout_ms", true, true),
+        lofi_code::SubagentOp::Wait => ("timeout_ms", false, true),
+        // A wait that names nothing waits for the run; a receive that names
+        // nothing returns at once, so its absent bound stays absent.
+        lofi_code::SubagentOp::MailboxReceive => ("wait_ms", false, false),
+        _ => return (args, None),
+    };
+    let Some(left) = clock.remaining(std::time::Instant::now()) else {
+        return (args, None);
+    };
+    let asked = match args.get(key) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(asked) => match asked.as_u64() {
+            Some(asked) => Some(asked),
+            // A value that is not a positive integer is the hook's to report.
+            None => return (args, None),
+        },
+    };
+    if asked.is_none() && !fill {
+        return (args, None);
+    }
+    // A spent clock still asks the hook: a wait resolves at once on a run
+    // that has ended, and a child starts and expires rather than hanging.
+    // Zero would be read as an invalid argument.
+    // Rounded up, like every bound taken from the clock: a wait that ends a
+    // millisecond before the wall reads as its own outcome instead of the
+    // budget that cut it.
+    let left = u64::try_from(left.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let used = asked.map_or(left, |asked| asked.min(left));
+    // A wait returns the run's own shape, so the cap it was cut to is not the
+    // wait's to report: the run it names already said what it was given.
+    let cut = if child {
+        asked.filter(|asked| *asked > left)
+    } else {
+        None
+    };
+    if let Some(map) = args.as_object_mut() {
+        map.insert(key.to_string(), serde_json::json!(used));
+        // What the caller asked for, so the run reports the allowance it
+        // was cut from and not only what it was left with.
+        if let Some(asked) = cut {
+            map.insert("requested_timeout_ms".to_string(), serde_json::json!(asked));
+        }
+    }
+    (args, cut)
+}
+
+/// The failed body of an exec result, in the shape a successful call uses: a
+/// program that threw after its children spent money still reports that
+/// spend, and `status` names what stopped it in the vocabulary runs, jobs and
+/// bash share.
+fn failed_result(
+    message: &str,
+    status: &str,
+    logs: Option<&str>,
+    subagents: Option<&serde_json::Value>,
+) -> String {
+    // The thrown message and the logs are the unbounded fields, and escaping
+    // can outgrow the limit on its own, so the body is measured as it is
+    // built: a cut body would lose the keys that sort after them, `status`
+    // and `subagents` among them.
+    let mut keep_message = message.len();
+    let mut keep_logs = logs.map_or(0, str::len);
+    loop {
+        let message_end = message.floor_char_boundary(keep_message);
+        let mut body = serde_json::json!({
             "ok": false,
-            "errors": [message],
-            "subagents": usage,
-        })
-        .to_string(),
-        None => message.to_string(),
+            "status": status,
+            "errors": [&message[..message_end]],
+        });
+        if let Some(usage) = subagents {
+            body["subagents"] = usage.clone();
+        }
+        if let Some(logs) = logs {
+            let logs_end = logs.floor_char_boundary(keep_logs);
+            body["logs"] = serde_json::Value::String(logs[..logs_end].to_string());
+        }
+        // A cut field says so, the way a cut envelope does: the part that was
+        // dropped is the most recent progress, and a reader cannot tell a
+        // short log from a trimmed one.
+        if message_end < message.len() || logs.is_some_and(|logs| keep_logs < logs.len()) {
+            body["truncated"] = serde_json::Value::Bool(true);
+        }
+        let text = body.to_string();
+        if text.len() <= MAX_EXEC_RESULT_BYTES || (message_end == 0 && keep_logs == 0) {
+            return text;
+        }
+        // Halve whichever field is taking the room, so a large message does
+        // not cost the logs and the other way around.
+        if keep_logs > 0 && keep_logs >= keep_message {
+            keep_logs /= 2;
+        } else {
+            keep_message /= 2;
+        }
     }
 }
 
@@ -1221,10 +1423,128 @@ mod tests {
 
     use super::*;
 
+    /// The guest's own return value escapes too: a value that fits the raw
+    /// budget can outgrow the limit once serialized, and it used to pass
+    /// through uncut.
+    #[test]
+    fn an_oversized_exec_value_is_cut_and_says_so() {
+        let mut output = serde_json::Map::new();
+        output.insert("ok".into(), true.into());
+        output.insert("status".into(), "completed".into());
+        output.insert(
+            "value".into(),
+            "\0".repeat(MAX_EXEC_RESULT_BYTES / 2).into(),
+        );
+
+        let text = cap_exec_envelope(output);
+
+        assert!(text.len() <= MAX_EXEC_RESULT_BYTES, "{} bytes", text.len());
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("a trimmed envelope stays JSON");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["truncated"], true, "a cut body has to say so");
+    }
+
+    /// An escaped object key is payload too: it gets cut rather than the
+    /// status giving up its room for it.
+    #[test]
+    fn an_oversized_object_key_is_cut_before_the_status() {
+        let mut payload = serde_json::Map::new();
+        payload.insert("\0".repeat(MAX_EXEC_RESULT_BYTES / 2), 1.into());
+        let mut output = serde_json::Map::new();
+        output.insert("ok".into(), true.into());
+        output.insert("status".into(), "completed".into());
+        output.insert("value".into(), serde_json::Value::Object(payload));
+
+        let text = cap_exec_envelope(output);
+
+        assert!(text.len() <= MAX_EXEC_RESULT_BYTES, "{} bytes", text.len());
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("a trimmed envelope stays JSON");
+        assert_eq!(value["status"], "completed", "the status keeps its word");
+        assert_eq!(value["truncated"], true, "a cut body has to say so");
+    }
+
+    /// Many short strings outgrow the limit together, each escaping to six
+    /// times its length. Trimming them one per pass would serialize the whole
+    /// envelope once per string, so the top half-length band is cut in one
+    /// pass.
+    #[test]
+    fn many_short_escaped_strings_are_trimmed_together() {
+        let mut output = serde_json::Map::new();
+        output.insert("ok".into(), true.into());
+        output.insert("status".into(), "completed".into());
+        output.insert(
+            "value".into(),
+            serde_json::Value::Array(
+                (0..9000)
+                    .map(|_| serde_json::Value::String("\0".repeat(20)))
+                    .collect(),
+            ),
+        );
+
+        let started = std::time::Instant::now();
+        let text = cap_exec_envelope(output);
+
+        assert!(text.len() <= MAX_EXEC_RESULT_BYTES, "{} bytes", text.len());
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("a trimmed envelope stays JSON");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["truncated"], true, "a cut body has to say so");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "trimming took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The logs escape when serialized, so text that fits the sandbox's raw
+    /// budget can outgrow the envelope. Trimming must keep the JSON and the
+    /// keys that follow the logs, `status` among them.
+    #[test]
+    fn an_oversized_exec_envelope_keeps_its_status() {
+        let mut output = serde_json::Map::new();
+        output.insert("ok".into(), false.into());
+        output.insert("status".into(), "failed".into());
+        output.insert("logs".into(), "\n".repeat(MAX_EXEC_RESULT_BYTES / 2).into());
+
+        let text = cap_exec_envelope(output);
+
+        assert!(text.len() <= MAX_EXEC_RESULT_BYTES, "{} bytes", text.len());
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("a trimmed envelope stays JSON");
+        assert_eq!(value["status"], "failed");
+    }
+
     fn state_env() -> tempfile::TempDir {
         let state_home = tempfile::tempdir().unwrap();
         std::env::set_var("LOFI_STATE_HOME", state_home.path());
         state_home
+    }
+
+    #[tokio::test]
+    async fn a_dropped_directory_ask_closes_its_prompt() {
+        let ws = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmRequest>();
+        let mut ask = Box::pin(approve_outside_dir(
+            ws.path(),
+            dir_approval("/data/dir", lofi_types::Access::Read),
+            &[],
+            &tx,
+            &counter,
+            None,
+        ));
+        let req = tokio::select! {
+            req = rx.recv() => req.unwrap(),
+            answered = &mut ask => panic!("the ask answered itself: {answered:?}"),
+        };
+        assert!(req.active.load(Ordering::Relaxed));
+        drop(ask);
+        assert!(
+            !req.active.load(Ordering::Relaxed),
+            "a dropped ask must close its modal"
+        );
     }
 
     fn dir_approval(dir: &str, requested: lofi_types::Access) -> lofi_code::DirApproval {
@@ -1271,6 +1591,7 @@ mod tests {
             &[],
             &tx,
             &counter,
+            None,
         )
         .await;
         responder.await.unwrap();
@@ -1293,6 +1614,7 @@ mod tests {
                 &[],
                 &tx,
                 &counter,
+                None,
             ),
         )
         .await
@@ -1356,6 +1678,7 @@ mod tests {
             &[],
             &tx,
             &counter,
+            None,
         )
         .await;
         responder.await.unwrap();
@@ -1376,6 +1699,7 @@ mod tests {
                 &[],
                 &tx,
                 &counter,
+                None,
             ),
         )
         .await
@@ -1388,6 +1712,68 @@ mod tests {
             })
         );
         assert!(rx.try_recv().is_err());
+
+        std::env::remove_var("LOFI_STATE_HOME");
+    }
+
+    /// An answer that lands after the call's clock closed the prompt is
+    /// reported so the tool can refuse the work, but the access it asked for
+    /// is not kept past the call that asked.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_grant_answered_after_the_wall_is_not_remembered() {
+        let _lock = state::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _state_home = state_env();
+        let ws = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        let write = lofi_types::Access::Write;
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap_or_else(std::time::Instant::now);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmRequest>();
+        let responder = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            req.respond
+                .send(ConfirmResponse::Grant {
+                    access: write,
+                    narrow: false,
+                })
+                .unwrap();
+        });
+        let granted = approve_outside_dir(
+            ws.path(),
+            project_approval("/data/repo", None),
+            &[],
+            &tx,
+            &counter,
+            Some(past),
+        )
+        .await;
+        responder.await.unwrap();
+        assert!(
+            granted.is_some(),
+            "the answer reaches the tool, which refuses"
+        );
+
+        // Nothing was kept: the next request asks again.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmRequest>();
+        let asked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            approve_outside_dir(
+                ws.path(),
+                project_approval("/data/repo", None),
+                &[],
+                &tx,
+                &counter,
+                None,
+            ),
+        )
+        .await;
+        assert!(asked.is_err(), "a late grant is not remembered");
+        assert!(rx.try_recv().is_ok(), "the next request asks");
 
         std::env::remove_var("LOFI_STATE_HOME");
     }
@@ -1419,6 +1805,7 @@ mod tests {
             &[],
             &tx,
             &counter,
+            None,
         )
         .await;
         responder.await.unwrap();
@@ -1440,6 +1827,7 @@ mod tests {
                 &[],
                 &tx,
                 &counter,
+                None,
             ),
         )
         .await
@@ -1469,6 +1857,7 @@ mod tests {
             &[],
             &tx,
             &counter,
+            None,
         )
         .await;
         responder.await.unwrap();
@@ -1509,6 +1898,7 @@ mod tests {
                 &config,
                 &tx,
                 &counter,
+                None,
             ),
         )
         .await
@@ -1546,6 +1936,7 @@ mod tests {
             &config,
             &tx,
             &counter,
+            None,
         )
         .await;
         responder.await.unwrap();
@@ -1583,6 +1974,7 @@ mod tests {
                 &[],
                 &tx,
                 &counter,
+                None,
             )
             .await;
             responder.await.unwrap();
@@ -1596,5 +1988,229 @@ mod tests {
         );
 
         std::env::remove_var("LOFI_STATE_HOME");
+    }
+
+    #[test]
+    fn a_wait_takes_the_time_the_run_has_left() {
+        let (args, cut) = clamp_child(
+            lofi_code::SubagentOp::Wait,
+            serde_json::json!({ "id": "a" }),
+            clock(Duration::from_secs(30)),
+        );
+
+        let wait = args["timeout_ms"].as_u64().unwrap();
+        assert!(
+            (29_000..=30_000).contains(&wait),
+            "the wait takes what the run has left: {args}"
+        );
+        assert_eq!(cut, None, "a wait the caller did not bound was not cut");
+    }
+
+    #[test]
+    fn a_mailbox_receive_waits_no_longer_than_the_call() {
+        let clock = clock(Duration::from_secs(3));
+        let (args, cut) = clamp_child(
+            lofi_code::SubagentOp::MailboxReceive,
+            serde_json::json!({ "limit": 5, "wait_ms": 10_000 }),
+            clock,
+        );
+
+        let wait = args["wait_ms"].as_u64().unwrap();
+        assert!(
+            (2_000..=3_000).contains(&wait),
+            "the receive must end with the call, not block past it: {args}"
+        );
+        assert_eq!(cut, None, "a receive names no cap of its own");
+        assert_eq!(args["limit"], serde_json::json!(5));
+
+        // A receive that named no wait is a poll: filling the bound in would
+        // make it block for the call instead.
+        let (poll, _) = clamp_child(
+            lofi_code::SubagentOp::MailboxReceive,
+            serde_json::json!({ "limit": 5 }),
+            clock,
+        );
+        assert_eq!(poll["wait_ms"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_spent_clock_still_asks_for_a_short_wait() {
+        let (args, _) = clamp_child(
+            lofi_code::SubagentOp::Wait,
+            serde_json::json!({ "id": "a" }),
+            clock(Duration::ZERO),
+        );
+
+        assert_eq!(
+            args["timeout_ms"],
+            serde_json::json!(1),
+            "zero would be read as an invalid argument: {args}"
+        );
+    }
+
+    #[test]
+    fn a_wait_that_is_not_a_number_is_left_to_the_hook() {
+        let clock = clock(Duration::from_secs(30));
+
+        for asked in [
+            serde_json::json!("bad"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(0),
+        ] {
+            let (args, _) = clamp_child(
+                lofi_code::SubagentOp::Wait,
+                serde_json::json!({ "id": "a", "timeout_ms": asked }),
+                clock,
+            );
+            assert_eq!(args["timeout_ms"], asked, "{args}");
+        }
+    }
+
+    #[test]
+    fn a_child_reports_what_its_caller_asked_for_when_the_cap_cut_it() {
+        let clock = clock(Duration::from_mins(1));
+
+        let (args, cut) = clamp_child(
+            lofi_code::SubagentOp::Run,
+            serde_json::json!({ "prompt": "x", "timeout_ms": 600_000 }),
+            clock,
+        );
+        let (unset, _) = clamp_child(
+            lofi_code::SubagentOp::Run,
+            serde_json::json!({ "prompt": "x" }),
+            clock,
+        );
+
+        assert_eq!(cut, Some(600_000));
+        assert_eq!(
+            args["requested_timeout_ms"],
+            serde_json::json!(600_000),
+            "the run states the allowance it was cut from, not only what it was left: {args}"
+        );
+        assert!(
+            unset.get("requested_timeout_ms").is_none(),
+            "a caller that set no timeout has none to report: {unset}"
+        );
+    }
+
+    #[test]
+    fn an_uncapped_run_leaves_a_wait_alone() {
+        let (args, _) = clamp_child(
+            lofi_code::SubagentOp::Wait,
+            serde_json::json!({ "id": "a" }),
+            lofi_types::Deadline::NONE,
+        );
+
+        assert_eq!(args, serde_json::json!({ "id": "a" }), "{args}");
+    }
+
+    #[test]
+    fn a_wait_is_clamped_to_the_run_and_not_stretched_by_it() {
+        let clock = clock(Duration::from_secs(2));
+
+        let (asked, cut) = clamp_child(
+            lofi_code::SubagentOp::Wait,
+            serde_json::json!({ "id": "a", "timeout_ms": 900_000 }),
+            clock,
+        );
+        let (short, _) = clamp_child(
+            lofi_code::SubagentOp::Wait,
+            serde_json::json!({ "id": "a", "timeout_ms": 500 }),
+            clock,
+        );
+
+        assert!(
+            asked["timeout_ms"].as_u64().unwrap() <= 2_000,
+            "a wait longer than the run has would block past it: {asked}"
+        );
+        assert_eq!(
+            cut, None,
+            "a wait returns the run's own shape, so its timeout is not the run's cap"
+        );
+        assert_eq!(short["timeout_ms"], serde_json::json!(500));
+    }
+
+    #[test]
+    fn a_spawned_child_keeps_its_own_timeout() {
+        let clock = clock(Duration::from_mins(1));
+
+        let (asked, cut) = clamp_child(
+            lofi_code::SubagentOp::Spawn,
+            serde_json::json!({ "prompt": "x", "timeout_ms": 600_000 }),
+            clock,
+        );
+        let (unset, uncut) = clamp_child(
+            lofi_code::SubagentOp::Spawn,
+            serde_json::json!({ "prompt": "x" }),
+            clock,
+        );
+
+        assert_eq!(
+            asked["timeout_ms"],
+            serde_json::json!(600_000),
+            "a spawned run outlives the call that started it: {asked}"
+        );
+        assert_eq!(cut, None, "the call's bound is not the child's");
+        assert!(
+            unset.get("timeout_ms").is_none(),
+            "a spawn that set no timeout stays unbounded: {unset}"
+        );
+        assert_eq!(uncut, None, "a child that set no timeout was not cut");
+    }
+
+    #[test]
+    fn a_foreground_child_takes_what_the_call_has_left() {
+        let clock = clock(Duration::from_mins(1));
+
+        let (run, cut) = clamp_child(
+            lofi_code::SubagentOp::Run,
+            serde_json::json!({ "prompt": "x" }),
+            clock,
+        );
+        let (asked, asked_cut) = clamp_child(
+            lofi_code::SubagentOp::Run,
+            serde_json::json!({ "prompt": "x", "timeout_ms": 600_000 }),
+            clock,
+        );
+
+        let run_ms = run["timeout_ms"].as_u64().unwrap();
+        assert!(
+            run_ms > 0 && run_ms <= 60_000,
+            "a foreground run ends with the call that awaits it: {run}"
+        );
+        assert_eq!(cut, None, "the call's bound is not a timeout to report");
+        assert_eq!(
+            asked["timeout_ms"],
+            serde_json::json!(60_000),
+            "a timeout longer than the call is cut to it: {asked}"
+        );
+        assert_eq!(
+            asked_cut,
+            Some(600_000),
+            "the allowance it asked for is reported"
+        );
+    }
+
+    #[test]
+    fn a_call_that_runs_nothing_is_left_alone() {
+        let clock = clock(Duration::from_secs(2));
+
+        for op in [
+            lofi_code::SubagentOp::Kill,
+            lofi_code::SubagentOp::Status,
+            lofi_code::SubagentOp::List,
+        ] {
+            let (args, cut) = clamp_child(
+                op,
+                serde_json::json!({ "id": "a", "timeout_ms": 900_000 }),
+                clock,
+            );
+            assert_eq!(
+                args,
+                serde_json::json!({ "id": "a", "timeout_ms": 900_000 })
+            );
+            assert_eq!(cut, None);
+        }
     }
 }

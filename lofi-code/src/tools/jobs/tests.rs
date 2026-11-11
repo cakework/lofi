@@ -73,6 +73,11 @@ async fn wait_for_log(tools: &BuiltinTools, id: &str, needle: &str) {
     }
 }
 
+/// A bound ending `left` from now: what an exec's own `timeoutMs` states.
+fn clock(left: Duration) -> lofi_types::Deadline {
+    lofi_types::Deadline::at(std::time::Instant::now() + left)
+}
+
 #[test]
 fn tick_skips_when_log_unchanged() {
     let f = tempfile::NamedTempFile::new().unwrap();
@@ -450,6 +455,103 @@ fn kill_not_in_disables_notify_before_killing() {
     assert!(!job.notify.enabled);
 }
 
+#[tokio::test]
+async fn a_job_keeps_the_allowance_it_was_given() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_dir, tools) = tools_with_cancel(cancel);
+    // The call that spawns the job has less time than the job asked for: a
+    // job outlives its call, so the timeout stands as it was given.
+    let tools = tools.with_clock(clock(Duration::from_secs(30)));
+
+    let spawned = tools
+        .job_spawn(json!({
+            "cmd": "sleep 30",
+            "notify": false,
+            "timeoutMs": 900_000,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(spawned["timeoutMs"], json!(900_000), "{spawned}");
+    assert!(spawned.get("requestedTimeoutMs").is_none(), "{spawned}");
+    let id = spawned["id"].as_str().unwrap().to_owned();
+    let status = tools.job_status(json!({ "id": id })).await.unwrap();
+    assert_eq!(status["timeoutMs"], json!(900_000), "{status}");
+    tools.job_kill(json!({ "id": id })).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_job_whose_own_timeout_has_already_passed_never_starts() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (dir, tools) = tools_with_cancel(cancel);
+
+    // No clock at all, so the job's own zero timeout is what refuses it, and
+    // nothing is registered: it is not a job that starts and ends at once.
+    let out = tools
+        .job_spawn(json!({ "cmd": "sleep 10", "notify": false, "timeoutMs": 0 }))
+        .await
+        .unwrap();
+
+    assert_eq!(out["ok"], json!(false), "{out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("deadline passed")),
+        "{out}"
+    );
+    let listed = tools.job_list(json!({})).await.unwrap();
+    assert_eq!(listed["jobs"], json!([]), "{listed}");
+    // The log the refused spawn opened is gone with it: a job that never
+    // starts leaves nothing behind.
+    let logs: Vec<_> = std::fs::read_dir(dir.path().join("lofi-tmp"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("lofi-job-"))
+        .collect();
+    assert!(logs.is_empty(), "a refused spawn left {logs:?}");
+}
+
+#[tokio::test]
+async fn a_job_reports_no_requested_timeout_when_the_run_cut_nothing() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_dir, tools) = tools_with_cancel(cancel);
+
+    // No clock, so the caller's timeout stands as it was given: the key is
+    // absent, not null, because its absence is how a reader tells an
+    // ordinary job from a shortened one.
+    let spawned = tools
+        .job_spawn(json!({ "cmd": "true", "notify": false, "timeoutMs": 60_000 }))
+        .await
+        .unwrap();
+    assert!(spawned.get("requestedTimeoutMs").is_none(), "{spawned}");
+    let id = spawned["id"].as_str().unwrap().to_owned();
+    let status = tools.job_status(json!({ "id": id })).await.unwrap();
+    assert!(status.get("requestedTimeoutMs").is_none(), "{status}");
+}
+
+#[tokio::test]
+async fn a_job_outlives_the_call_that_started_it() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_dir, tools) = tools_with_cancel(cancel);
+    // The call has two seconds left and the job names no allowance: nothing
+    // of the call's reaches it, so it keeps running and only a kill ends it.
+    let tools = tools.with_clock(clock(Duration::from_secs(2)));
+
+    let spawned = tools
+        .job_spawn(json!({ "cmd": "sleep 30", "notify": false }))
+        .await
+        .unwrap();
+    assert_eq!(spawned["ok"], json!(true), "{spawned}");
+    assert!(spawned["timeoutMs"].is_null(), "{spawned}");
+    let id = spawned["id"].as_str().unwrap().to_owned();
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let status = tools.job_status(json!({ "id": id })).await.unwrap();
+    assert_eq!(status["state"], json!("running"), "{status}");
+    tools.job_kill(json!({ "id": id })).await.unwrap();
+}
+
 fn tools_with_cancel(cancel: Arc<AtomicBool>) -> (tempfile::TempDir, BuiltinTools) {
     tools_with_env(cancel, crate::BashEnv::default())
 }
@@ -762,7 +864,7 @@ async fn job_spawn_refuses_backgrounding_without_a_suggestion() {
         .await
         .unwrap();
     assert_eq!(blocked["ok"], json!(false));
-    assert_eq!(blocked["status"], json!("denied"));
+    assert_eq!(blocked["status"], json!("blocked"));
     let output = blocked["output"].as_str().unwrap();
     assert!(output.contains("bare & is not allowed"), "output: {output}");
     assert!(!output.contains("jobSpawn"), "output: {output}");

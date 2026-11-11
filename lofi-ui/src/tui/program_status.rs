@@ -490,6 +490,8 @@ fn one_line(text: &str, max: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     fn encoded(phase: Phase, msg: Option<&str>) -> Option<String> {
@@ -503,6 +505,31 @@ mod tests {
 
     fn base64(text: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(text)
+    }
+
+    fn model() -> lofi_types::RunModel {
+        lofi_types::RunModel {
+            provider: "p".to_string(),
+            id: "m".to_string(),
+            selected: "m".to_string(),
+            ..lofi_types::RunModel::default()
+        }
+    }
+
+    fn turn_end() -> AgentEvent {
+        AgentEvent::TurnEnd {
+            model: model(),
+            elapsed_ms: 1_000,
+            cost: 0.0,
+            usage: lofi_types::Usage::default(),
+            stop_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_turn_that_finished_still_reports_done() {
+        let settled = settled(&turn_end()).expect("the turn ends");
+        assert_eq!(settled.phase, Phase::Done);
     }
 
     #[test]

@@ -159,6 +159,141 @@ async fn the_recorded_tool_use_carries_the_capped_description() {
     assert!(description.ends_with(" [...truncated]"));
 }
 
+/// A thrown message can outgrow the result cap on its own: it is trimmed
+/// like the logs, so the body still parses and still names its status.
+#[tokio::test]
+async fn a_thrown_message_larger_than_the_result_cap_keeps_its_status() {
+    let dir = tempdir().unwrap();
+    let executor = crate::agent::tool_executor::ToolExecutor::new(
+        dir.path(),
+        &lofi_types::Config::default(),
+        &[],
+    )
+    .unwrap();
+
+    let result = executor
+        .execute(
+            lofi_code::EXEC_TOOL_NAME,
+            &serde_json::json!({
+                "code": "throw new Error('\\\\n'.repeat(300 * 1024));",
+                "description": "throw a message past the result cap",
+            }),
+            crate::agent::tool_executor::ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+
+    let text = match &result {
+        ContentBlock::ToolResult { content, .. } => content.clone(),
+        other => panic!("expected a tool result: {other:?}"),
+    };
+    assert!(
+        text.len() <= MAX_EXEC_RESULT_BYTES,
+        "the body stays within the limit: {} bytes",
+        text.len()
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("the body is still JSON: {e}"));
+    assert_eq!(
+        body["status"],
+        serde_json::json!("failed"),
+        "{}",
+        &text[..400.min(text.len())]
+    );
+    assert!(
+        body["errors"][0].as_str().is_some_and(|e| !e.is_empty()),
+        "the message it threw survives the trim"
+    );
+}
+// A stopped script that printed near the log cap still reports `status`: the
+// body is measured as it is built, so the cap cannot cut the keys that sort
+// after `logs`.
+#[tokio::test]
+async fn a_stopped_exec_keeps_its_status_when_its_logs_are_large() {
+    let dir = tempdir().unwrap();
+    let executor = crate::agent::tool_executor::ToolExecutor::new(
+        dir.path(),
+        &lofi_types::Config::default(),
+        &[],
+    )
+    .unwrap();
+
+    let result = executor
+        .execute(
+            lofi_code::EXEC_TOOL_NAME,
+            &serde_json::json!({
+                "code": "print('x'.repeat(300 * 1024)); await lofi.sleep(30); return 1",
+                "description": "print a lot then sleep past the budget",
+                "timeoutMs": 300,
+            }),
+            crate::agent::tool_executor::ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+
+    let text = match &result {
+        ContentBlock::ToolResult { content, .. } => content.clone(),
+        other => panic!("expected a tool result: {other:?}"),
+    };
+    assert!(
+        text.len() <= MAX_EXEC_RESULT_BYTES,
+        "the body stays within the limit: {} bytes",
+        text.len()
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("the body is still JSON: {e}"));
+    assert_eq!(body["status"], serde_json::json!("timed_out"), "{text}");
+    assert!(
+        body["logs"].as_str().is_some_and(|logs| !logs.is_empty()),
+        "the logs it reached survive the trim"
+    );
+    assert_eq!(
+        body["truncated"],
+        serde_json::json!(true),
+        "a trimmed body says so: {text}"
+    );
+}
+
+// The call's own wall budget reaches the guest, which reads it and plans with
+// it: a script that sleeps past its budget is cut rather than run to its end.
+#[tokio::test]
+async fn an_exec_budget_cuts_a_guest_that_would_outlive_it() {
+    let dir = tempdir().unwrap();
+    let executor = crate::agent::tool_executor::ToolExecutor::new(
+        dir.path(),
+        &lofi_types::Config::default(),
+        &[],
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let error = executor
+        .execute(
+            lofi_code::EXEC_TOOL_NAME,
+            &serde_json::json!({
+                "code": "await lofi.sleep(30); return 1",
+                "description": "sleep past the budget",
+                "timeoutMs": 300,
+            }),
+            crate::agent::tool_executor::ToolCallContext::default(),
+        )
+        .await;
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the guest outlived the budget it was given"
+    );
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("wall-clock"),
+        "the report names the budget that ended it: {text}"
+    );
+    assert!(
+        text.contains("timed_out"),
+        "the result says what stopped it in the shared vocabulary: {text}"
+    );
+}
+
 #[test]
 fn exec_label_trims_and_rejects_blank() {
     assert_eq!(exec_label("  do thing  "), Some("do thing".to_string()));

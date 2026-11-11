@@ -110,6 +110,9 @@ pub struct BuiltinTools {
     /// How long an auto-mode ask prompt waits for the user before auto mode
     /// denies it on its own. `None` disables the auto-deny.
     approval_timeout: Option<std::time::Duration>,
+    /// The bound this exec's work runs under: the call's own `timeoutMs`,
+    /// carried into every tool it starts.
+    clock: lofi_types::Deadline,
     /// Session-scoped `/policy` override shared with the owning agent so a
     /// dialog pick applies to every later exec in the session.
     policy_override: crate::policy::PolicyOverride,
@@ -196,6 +199,7 @@ impl BuiltinTools {
             auto_mode,
             intent: None,
             approval_timeout: None,
+            clock: lofi_types::Deadline::NONE,
             policy_override: crate::policy::PolicyOverride::default(),
             skills_dir,
             memory: None,
@@ -364,6 +368,13 @@ impl BuiltinTools {
         self
     }
 
+    /// Clamps every command this bundle starts to what the exec has left.
+    #[must_use]
+    pub fn with_clock(mut self, clock: lofi_types::Deadline) -> Self {
+        self.clock = clock;
+        self
+    }
+
     #[must_use]
     pub fn skills_dir(&self) -> Option<&Path> {
         self.skills_dir.as_deref()
@@ -496,14 +507,33 @@ impl BuiltinTools {
                 let Some(candidate) = grant_candidate(Path::new(p)) else {
                     return Err(err);
                 };
-                let Some(granted) = approve(crate::DirApproval {
-                    dir: candidate.dir.clone(),
-                    narrow: candidate.narrow.clone(),
-                    marker: candidate.marker,
-                    requested,
-                })
-                .await
-                .filter(|g| {
+                // A prompt does not outlive the call it was raised for: the
+                // clock's own instant closes it, the way it closes an ask for
+                // a command. An answer landing there is refused rather than
+                // acted on, so a stopped guest cannot lay down a write its
+                // result does not mention.
+                let bound = self.clock.instant();
+                // The bound closing the prompt is the call's story, not a
+                // user who walked away.
+                let out_of_budget = || {
+                    Error::Tool(format!(
+                        "the call's deadline passed before approval: {OUTSIDE_ROOT_ERROR}: {p}"
+                    ))
+                };
+                let answer = tokio::select! {
+                    biased;
+                    answer = approve(crate::DirApproval {
+                        dir: candidate.dir.clone(),
+                        narrow: candidate.narrow.clone(),
+                        marker: candidate.marker,
+                        requested,
+                    }) => Some(answer),
+                    () = bash::wait_until(bound) => None,
+                };
+                let Some(answer) = answer else {
+                    return Err(out_of_budget());
+                };
+                let Some(granted) = answer.filter(|g| {
                     // narrow, when present, lies below the project root, so
                     // one comparison covers both units the prompt offered.
                     let unit = candidate.narrow.as_ref().unwrap_or(&candidate.dir);
@@ -515,6 +545,9 @@ impl BuiltinTools {
                         candidate.dir.display()
                     )));
                 };
+                if bound.is_some_and(|end| std::time::Instant::now() >= end) {
+                    return Err(out_of_budget());
+                }
                 roots.push(granted.dir);
                 resolve_for_read(&roots[0], &roots[1..], p)
             }
@@ -539,7 +572,13 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    /// A bound ending `left` from now.
+    fn clock(left: Duration) -> lofi_types::Deadline {
+        lofi_types::Deadline::at(std::time::Instant::now() + left)
+    }
 
     fn tools() -> (tempfile::TempDir, BuiltinTools) {
         let dir = tempdir().unwrap();
@@ -1072,7 +1111,7 @@ mod tests {
         assert_eq!(v["command"], json!("echo hello"));
         assert_eq!(v["directory"], json!(tools.root().display().to_string()));
         assert_eq!(v["signal"], Value::Null);
-        assert_eq!(v["status"], json!("exited"));
+        assert_eq!(v["status"], json!("completed"));
         assert!(v["duration_ms"].as_u64().is_some());
     }
 
@@ -1081,7 +1120,7 @@ mod tests {
         let (_dir, tools) = tools();
         let v = tools.bash(json!({ "cmd": "sleep 0.1" })).await.unwrap();
         assert_eq!(v["ok"], json!(false));
-        assert_eq!(v["status"], json!("denied"));
+        assert_eq!(v["status"], json!("blocked"));
         assert_eq!(v["duration_ms"], json!(0));
         let output = v["output"].as_str().unwrap();
         assert!(output.contains("End the turn"), "output: {output}");
@@ -1111,7 +1150,7 @@ mod tests {
             .bash(json!({ "cmd": "codex --help", "timeoutMs": 5000 }))
             .await
             .unwrap();
-        assert_eq!(v["status"], json!("denied"));
+        assert_eq!(v["status"], json!("blocked"));
         assert!(v["output"].as_str().unwrap().contains("lofi.subagent"));
     }
 
@@ -1119,7 +1158,7 @@ mod tests {
     async fn bash_backgrounding_refusal_names_jobspawn() {
         let (_dir, tools) = tools();
         let v = tools.bash(json!({ "cmd": "sleep 30 &" })).await.unwrap();
-        assert_eq!(v["status"], json!("denied"));
+        assert_eq!(v["status"], json!("blocked"));
         let output = v["output"].as_str().unwrap();
         assert!(output.contains("bare & is not allowed"), "output: {output}");
         assert!(output.contains("jobSpawn"), "output: {output}");
@@ -1140,7 +1179,7 @@ mod tests {
                 .bash(json!({ "cmd": cmd, "steer": false }))
                 .await
                 .unwrap();
-            assert_eq!(v["status"], json!("denied"), "cmd: {cmd}");
+            assert_eq!(v["status"], json!("blocked"), "cmd: {cmd}");
             let output = v["output"].as_str().unwrap();
             assert!(output.contains(base), "cmd: {cmd}, output: {output}");
             assert!(!output.contains("jobSpawn"), "cmd: {cmd}, output: {output}");
@@ -1207,10 +1246,33 @@ mod tests {
         assert_eq!(v["ok"], json!(false));
         assert_eq!(v["output"], json!("<timeout>"));
         assert_eq!(v["code"], Value::Null);
-        assert_eq!(v["status"], json!("timeout"));
+        assert_eq!(v["status"], json!("timed_out"));
         assert_eq!(v["duration_ms"], json!(50));
         assert_eq!(v["signal"], Value::Null);
         assert_eq!(v["command"], json!("tail -f /dev/null"));
+    }
+
+    /// A command the clock cuts keeps what it printed: the readers own the
+    /// bytes, so dropping the timed future cannot take them back.
+    #[tokio::test]
+    async fn bash_timeout_keeps_the_output_it_reached() {
+        let (_dir, tools) = tools();
+        let v = tools
+            .bash(json!({
+                "cmd": "echo reached; tail -f /dev/null",
+                "timeoutMs": 200,
+                "steer": false,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(v["status"], json!("timed_out"));
+        let output = v["output"].as_str().unwrap();
+        assert!(output.starts_with("reached"), "{output}");
+        assert!(
+            output.contains("<timeout>"),
+            "a cut command has to say it was cut: {output}"
+        );
     }
 
     #[tokio::test]
@@ -1220,7 +1282,7 @@ mod tests {
         assert_eq!(v["ok"], json!(false));
         assert_eq!(v["code"], Value::Null);
         assert_eq!(v["signal"], json!(9));
-        assert_eq!(v["status"], json!("signaled"));
+        assert_eq!(v["status"], json!("failed"));
     }
 
     #[tokio::test]
@@ -1332,6 +1394,66 @@ mod tests {
             "got: {err}"
         );
         assert_eq!(*asked.lock().unwrap(), vec![outside_root]);
+    }
+
+    /// The clock closes a prompt the user never answers: it does not outlive
+    /// the call it was raised for, and the refusal reads as the call's deadline
+    /// rather than a user who walked away.
+    #[tokio::test]
+    async fn a_prompt_the_wall_closes_is_refused_with_the_deadline() {
+        let (_dir, tools) = tools();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("x.txt");
+        let open: crate::ApproveDirFn = Arc::new(|_approval| {
+            Box::pin(std::future::pending())
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<crate::GrantedDir>> + Send + Sync>,
+                >
+        });
+        let tools = tools
+            .with_clock(clock(Duration::from_millis(20)))
+            .with_approve_dir(Some(open));
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            tools.write(json!({ "path": target.to_string_lossy(), "text": "x" })),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a prompt does not outlive the call"))
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("the call's deadline passed before approval"),
+            "got: {err}"
+        );
+        assert!(!target.exists(), "a stopped call writes nothing");
+    }
+
+    /// An answer landing at the wall is refused rather than acted on: the
+    /// exec reports the stop, so a write it never mentions must not happen.
+    #[tokio::test]
+    async fn an_answer_after_the_wall_writes_nothing() {
+        let (_dir, tools) = tools();
+        let outside = tempdir().unwrap();
+        let granted = outside.path().canonicalize().unwrap();
+        let target = outside.path().join("x.txt");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let tools = tools
+            .with_clock(clock(Duration::ZERO))
+            .with_approve_dir(Some(recording_hook(Some(granted), asked)));
+
+        let err = tools
+            .write(json!({ "path": target.to_string_lossy(), "text": "x" }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("the call's deadline passed before approval"),
+            "got: {err}"
+        );
+        assert!(!target.exists(), "a stopped call writes nothing");
     }
 
     #[tokio::test]

@@ -204,11 +204,10 @@ impl BackendFactory {
             &self.env,
         )?;
         let support = self.support();
-        let system_prompt = crate::agent::assemble_system_prompt(
-            self.skills_dir.as_deref().and_then(std::path::Path::parent),
-            &self.root,
-        );
+        // The prompt is the executor's own: it states the tools and the exec
+        // contract, and the backend only carries it.
         let executor = executor.with_skills_dir(self.skills_dir.clone());
+        let system_prompt = executor.system_prompt();
         Ok(Arc::new(
             agent
                 .with_system_prompt(system_prompt)

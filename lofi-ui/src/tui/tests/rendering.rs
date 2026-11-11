@@ -210,7 +210,7 @@ fn rich_header_suffix_for_read_and_bash() {
                             "output": "file.txt",
                             "code": 0,
                             "duration_ms": 1500,
-                            "status": "exited",
+                            "status": "completed",
                         })
                         .to_string(),
                     ),

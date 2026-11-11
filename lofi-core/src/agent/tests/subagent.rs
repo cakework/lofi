@@ -1790,6 +1790,55 @@ async fn wait_timeout_reports_running_and_never_cancels() {
     assert_eq!(done["status"], json!("cancelled"), "{done}");
 }
 
+// A wait with no timeout of its own ends when the run does, not at a
+// constant: two virtual minutes pass and a run that is still working keeps it
+// waiting. The run's idle deadline is set past that, so only the wait's own
+// expiry could have ended it early.
+#[tokio::test(start_paused = true)]
+async fn a_wait_with_no_timeout_ends_only_when_the_run_does() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(NeverProvider);
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(
+        SubagentOp::Spawn,
+        json!({ "prompt": "hang", "idle_ms": 3_600_000 }),
+    )
+    .await;
+    let id = out["id"].as_str().unwrap().to_string();
+
+    let waiting = {
+        let hook = agent.subagent_hook().unwrap();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let out = hook(SubagentOp::Wait, json!({ "id": id })).await;
+            (out, started.elapsed())
+        })
+    };
+
+    // Virtual time advances only when nothing can run, so the wait is pending
+    // two minutes in: no constant of its own ends it.
+    tokio::time::sleep(Duration::from_mins(2)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a wait must not end at a constant of its own"
+    );
+
+    // It ends when the run does, and says how the run ended.
+    let killed = hook(SubagentOp::Kill, json!({ "id": id })).await;
+    assert_eq!(killed["ok"], json!(true), "{killed}");
+    let (done, waited) = waiting.await.unwrap();
+    assert_eq!(done["status"], json!("cancelled"), "{done}");
+    assert!(
+        waited >= Duration::from_mins(2),
+        "the wait resolved at the constant, not at the run: {waited:?}"
+    );
+}
+
 #[tokio::test]
 async fn kill_is_idempotent_and_reports_terminal_state() {
     let _env = env_lock();
@@ -1834,6 +1883,28 @@ async fn killing_a_run_drops_the_timers_it_armed() {
     let done = hook(SubagentOp::Wait, json!({ "id": id, "timeout_ms": 30_000 })).await;
     assert_eq!(done["status"], json!("cancelled"), "{done}");
 
+    assert_eq!(timers.pending_for(Some(&id)), 0);
+}
+
+#[tokio::test]
+async fn a_settled_run_drops_the_timers_it_armed() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(MockProvider::recording(vec![text_round("done")]));
+    let timers = agent.tool_executor().timers();
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Spawn, json!({ "prompt": "a" })).await;
+    let id = out["id"].as_str().unwrap().to_string();
+    timers.schedule_every(Some(&id), std::time::Duration::from_hours(1), None);
+    assert_eq!(timers.pending_for(Some(&id)), 1);
+
+    let done = hook(SubagentOp::Wait, json!({ "id": id, "timeout_ms": 30_000 })).await;
+    assert_eq!(done["status"], json!("completed"), "{done}");
+
+    // The run is gone: its reminders must not keep waking this session.
     assert_eq!(timers.pending_for(Some(&id)), 0);
 }
 
@@ -2960,8 +3031,83 @@ impl Provider for AskThenPendProvider {
     }
 }
 
+// A child's cap reaches the tools its exec starts: a job spawned inside the
+// child runs under the child's remaining time, not under the session's open
+// clock. Nothing but `arm_run_cap` in `start` puts a clock there.
+struct CappedJobProvider {
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl Provider for CappedJobProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        let round = match messages.last() {
+            _ if is_wrap_up(messages) => text_round("wrapped up"),
+            Some(m) if m.role == Role::User => exec_round(
+                "const job = await lofi.jobSpawn({ cmd: 'sleep 30', notify: false }); return { timeoutMs: job.timeoutMs };",
+            ),
+            _ => text_round("spawned"),
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+/// A child's own bound is its call's, not its run's: the job it spawns keeps
+/// its own timeout and outlives the call that started it.
 #[tokio::test]
-async fn a_run_waiting_on_a_prompt_settles_blocked() {
+async fn a_childs_job_outlives_the_childs_call() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(CappedJobProvider {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    // The job's log lands under the temp dir, which has to exist.
+    agent.tmp_dir = dir.path().to_path_buf();
+    // The child's executor is the template's, so this is the policy it runs
+    // under. This test is about the clock, not the policy.
+    agent.shell_policy = lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
+        yolo: true,
+        ..lofi_types::ShellPolicyConfig::default()
+    });
+    agent.provider = provider.clone();
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "timeout_ms": 5000 }),
+    )
+    .await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+
+    let requests = provider.requests.lock().unwrap();
+    let content = requests
+        .last()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .find_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the job spawn result travels in the transcript");
+    let value: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|e| panic!("{e}: {content}"));
+    assert!(
+        value["value"]["timeoutMs"].is_null(),
+        "the child names no bound on the job it starts: {content}"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_open_at_the_cap_blocks_the_run() {
     let _env = env_lock();
     let _state = StateEnv::new();
     let dir = tempdir().unwrap();
@@ -2973,17 +3119,81 @@ async fn a_run_waiting_on_a_prompt_settles_blocked() {
     let hook = agent.subagent_hook().unwrap();
 
     // The idle deadline is shorter than the cap, and the run is waiting on
-    // the prompt for longer than that: only the cap may stop it.
+    // the prompt for longer than that: only the cap may stop it. A prompt the
+    // user owes an answer to is the user's time, so the run is `blocked`
+    // rather than wrapped up: nothing was refused, the run ran out of time.
     let out = hook(
         SubagentOp::Run,
         json!({ "prompt": "a", "idle_ms": 300, "timeout_ms": 2_000 }),
     )
     .await;
     assert_eq!(out["status"], json!("blocked"), "{out}");
-    let error = out["error"].as_str().unwrap();
-    assert!(error.contains("echo blocked"), "{out}");
+    assert_eq!(out["stopped"], json!("cap"), "{out}");
     // The prompt reached the session: it was never answered.
     assert!(prompts.try_recv().is_ok(), "the child asked for approval");
+}
+
+// A wait no deadline cuts: a directory grant has no approval timeout, so the
+// cap is the only thing that ends it, and the prompt closes there.
+struct ReadOutsideProvider {
+    path: String,
+}
+
+#[async_trait]
+impl Provider for ReadOutsideProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamingEvent>>> {
+        let round = match messages.last() {
+            Some(_) if is_wrap_up(messages) => text_round("wrapped up"),
+            _ => exec_round(&format!(
+                "return await lofi.write({{ path: {:?}, text: \"x\" }})",
+                self.path
+            )),
+        };
+        Ok(Box::pin(stream::iter(round.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn a_run_waiting_on_a_grant_is_stopped_at_the_cap() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let path = outside.path().join("outside.txt");
+    std::fs::write(&path, "x").unwrap();
+    let (tx, mut prompts) = tokio::sync::mpsc::unbounded_channel();
+    let mut agent = agent_with(vec![], dir.path())
+        .with_confirm_tx(tx)
+        .with_subagent_support(support(dir.path()));
+    agent.provider = Arc::new(ReadOutsideProvider {
+        path: path.display().to_string(),
+    });
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(
+        SubagentOp::Run,
+        json!({ "prompt": "a", "idle_ms": 300, "timeout_ms": 2_000 }),
+    )
+    .await;
+    // The idle deadline is shorter than the cap, and the run is waiting on
+    // the request for longer than that: only the cap may stop it, and a
+    // prompt the user owes an answer to is the user's time, so the run
+    // reports `blocked` rather than a summary of work it never did.
+    assert_eq!(out["status"], json!("blocked"), "{out}");
+    assert_eq!(out["stopped"], json!("cap"), "{out}");
+    let prompt = prompts.try_recv().expect("the child asked for the grant");
+    assert!(
+        prompt
+            .command
+            .starts_with(&outside.path().display().to_string()),
+        "the run asked for the tree it reached for: {}",
+        prompt.command
+    );
 }
 
 #[tokio::test]
@@ -3180,6 +3390,11 @@ async fn a_wrap_up_adds_its_spend_to_the_run() {
     .await;
     assert_eq!(out["status"], json!("completed"), "{out}");
     assert_eq!(out["result"], json!("wrapped up"), "{out}");
+    // The run stopped at its cap and the summary is what settled it: a round
+    // that ends at the cap starts no further one, so the deadline is named
+    // here and the history is not read as an answer the child never gave.
+    assert_eq!(out["stopped"], json!("cap"), "{out}");
+    assert_eq!(out["cap_ms"], json!(300), "{out}");
     let cost = out["usage"]["cost"].as_f64().unwrap();
     assert!((cost - 4.5).abs() < 1e-9, "both turns are billed: {out}");
 }

@@ -142,7 +142,7 @@ async fn run_once_tool_call_executes_and_appends_result() {
     assert!(!*is_error);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(content).unwrap(),
-        serde_json::json!({ "ok": true, "value": 2 })
+        serde_json::json!({ "ok": true, "status": "completed", "value": 2 })
     );
 
     let finished = agent.run_once(&mut messages).await.unwrap();
@@ -161,7 +161,7 @@ async fn run_once_exec_without_return_reports_success_and_logs() {
     };
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(content).unwrap(),
-        serde_json::json!({ "ok": true, "logs": "done\n" })
+        serde_json::json!({ "ok": true, "status": "completed", "logs": "done\n" })
     );
 }
 
@@ -177,7 +177,7 @@ async fn run_once_exec_preserves_explicit_null_return() {
     };
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(content).unwrap(),
-        serde_json::json!({ "ok": true, "value": null })
+        serde_json::json!({ "ok": true, "status": "completed", "value": null })
     );
 }
 
@@ -193,7 +193,7 @@ async fn run_once_exec_without_return_or_logs_reports_success() {
     };
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(content).unwrap(),
-        serde_json::json!({ "ok": true })
+        serde_json::json!({ "ok": true, "status": "completed" })
     );
 }
 

@@ -441,7 +441,7 @@ return { read, bash, full, timedBash, escape, ambiguous };
     assert!(body.contains("outside"));
     assert!(body.contains("expected exactly one"));
     assert!(body.contains("shell-1"));
-    assert!(body.contains(r#"\"status\":\"timeout\""#));
+    assert!(body.contains(r#"\"status\":\"timed_out\""#));
     assert!(!fixture
         .workspace
         .parent()

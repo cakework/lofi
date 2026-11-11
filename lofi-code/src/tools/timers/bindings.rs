@@ -31,9 +31,13 @@ impl BuiltinTools {
     /// against the run's cancellation flag so a cancelled turn leaves the
     /// wait at once.
     ///
+    /// The wait is bounded by the call's clock, so a sleep that outlasts the
+    /// `exec` deadline throws at the wall rather than parking the guest.
+    ///
     /// # Errors
     /// Returns [`Error::Tool`] when `seconds` is not a non-negative number
-    /// within [`MAX_SLEEP_SECS`], or when the run is cancelled mid-sleep.
+    /// within [`MAX_SLEEP_SECS`], when the run is cancelled mid-sleep, or when
+    /// the call's time runs out first.
     pub async fn sleep(&self, seconds: Value) -> Result<Value> {
         let secs = seconds
             .as_f64()
@@ -52,16 +56,25 @@ impl BuiltinTools {
         let total = Duration::from_secs_f64(secs);
         if !total.is_zero() {
             let deadline = tokio::time::Instant::now() + total;
-            match self.cancel.clone() {
-                Some(cancel) => {
-                    tokio::select! {
-                        () = tokio::time::sleep_until(deadline) => {}
-                        () = wait_for_cancel(&cancel) => {
-                            return Err(Error::Tool("sleep: run cancelled".into()));
-                        }
-                    }
+            // A sleep that outlasts the call's clock would park the guest past
+            // the wall, where the host can only drop it once the grace runs
+            // out. Waking at the wall throws instead, so the guest unwinds on
+            // the instant its budget ended.
+            let wall = self.clock.instant();
+            let cancel = self.cancel.clone();
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {}
+                () = crate::tools::bash::wait_until(wall) => {
+                    return Err(Error::Tool("sleep: the call's time ran out".into()));
                 }
-                None => tokio::time::sleep_until(deadline).await,
+                () = async {
+                    match &cancel {
+                        Some(cancel) => wait_for_cancel(cancel).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    return Err(Error::Tool("sleep: run cancelled".into()));
+                }
             }
         }
         // A sleep that waits out a background job wastes the whole turn:

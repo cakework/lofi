@@ -358,6 +358,7 @@ pub(crate) async fn run_loop(
         // Session-scoped state, read through the executor both backends own.
         let executor = a.tool_executor();
         app.jobs = Some(executor.jobs());
+        app.executor = Some(executor.clone());
         // A resumed timer keeps the id the transcript lists, so the dialog
         // and `notifyCancel` manage the same timer the previous run scheduled.
         let timers = executor.timers();
@@ -637,6 +638,7 @@ pub(crate) async fn run_loop(
                                     app.system_prompt = new_agent.system_prompt().into();
                                     let executor = new_agent.tool_executor();
                                     app.jobs = Some(executor.jobs());
+                                    app.executor = Some(executor.clone());
                                     app.timers = Some(executor.timers());
                                     app.policy_override = Some(executor.policy_override());
                                     app.paths = Some(executor.paths());

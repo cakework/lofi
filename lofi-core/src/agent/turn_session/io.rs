@@ -452,7 +452,7 @@ pub struct Admission {
 }
 
 /// The frame the next exchange sends.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExchangeInput {
     /// The prompt text, or None for a silent continuation.
     pub text: Option<String>,
@@ -607,6 +607,20 @@ impl TurnIo {
             return Ok(());
         };
         cursor.record_turn_started()
+    }
+
+    /// Pin the system prompt the turn runs under, when it differs from the one
+    /// the transcript was opened with. Replay reads the latest pin, so the
+    /// recorded history then states what the live request stated.
+    pub fn record_system(&self, prompt: &str) -> Result<()> {
+        if !self.alive() {
+            return Ok(());
+        }
+        let Some(cursor) = self.cursor() else {
+            return Ok(());
+        };
+        cursor.append_system(prompt)?;
+        Ok(())
     }
 
     /// Hold a written range for the next publish.

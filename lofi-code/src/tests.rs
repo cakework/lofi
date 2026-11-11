@@ -446,7 +446,14 @@ async fn exec_sync_infinite_loop_times_out() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::Sandbox(ref m) if m.contains("CPU budget")),
+        matches!(
+            err,
+            Error::SandboxStopped {
+                status: "timed_out",
+                ref message,
+                ..
+            } if message.contains("CPU budget")
+        ),
         "{err:?}"
     );
 }
@@ -466,7 +473,14 @@ async fn exec_cpu_heavy_loop_times_out() {
     .await
     .unwrap_err();
     assert!(
-        matches!(err, Error::Sandbox(ref m) if m.contains("CPU budget")),
+        matches!(
+            err,
+            Error::SandboxStopped {
+                status: "timed_out",
+                ref message,
+                ..
+            } if message.contains("CPU budget")
+        ),
         "{err:?}"
     );
 }
@@ -497,7 +511,13 @@ async fn exec_sync_loop_can_be_cancelled() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::Sandbox(ref m) if m.contains("cancelled")),
+        matches!(
+            err,
+            Error::SandboxStopped {
+                status: "cancelled",
+                ..
+            }
+        ),
         "{err:?}"
     );
 }
@@ -872,7 +892,13 @@ async fn exec_subagent_cancel_returns_promptly() {
     .expect("exec did not return after cancellation")
     .unwrap_err();
     assert!(
-        matches!(err, Error::Sandbox(ref m) if m.contains("cancelled")),
+        matches!(
+            err,
+            Error::SandboxStopped {
+                status: "cancelled",
+                ..
+            }
+        ),
         "{err:?}"
     );
 }
@@ -1096,4 +1122,328 @@ async fn exec_tool_call_budget_aborts_await_loop() {
         matches!(err, Error::Sandbox(ref m) if m.contains("tool call budget")),
         "{err:?}"
     );
+}
+
+/// A job outlives the call that spawned it: the call's own deadline bounds
+/// the call, not the background process it starts.
+#[tokio::test]
+async fn exec_leaves_a_job_its_own_allowance() {
+    let dir = tempdir().unwrap();
+    let opts = ExecOptions {
+        deadline: Some(std::time::Instant::now() + Duration::from_secs(1)),
+        ..ExecOptions::default()
+    };
+
+    let res = exec(
+        "return await lofi.jobSpawn({ cmd: 'sleep 30' });",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        res.value
+            .get("timeoutMs")
+            .is_some_and(serde_json::Value::is_null),
+        "the call names no bound on the job it starts: {}",
+        res.value
+    );
+}
+
+/// A value that came back is not proof the guest finished: converting it runs
+/// guest code, and a getter can spin until the wall fires.
+#[tokio::test]
+async fn a_getter_the_wall_cut_reports_a_stop() {
+    let dir = tempdir().unwrap();
+    let opts = ExecOptions {
+        deadline: Some(std::time::Instant::now() + Duration::from_millis(300)),
+        ..ExecOptions::default()
+    };
+
+    let result = exec(
+        "print('progress'); return { a: 1, get b() { while (true) {} } };",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a partial object passed as a completed call");
+    };
+    let Error::SandboxStopped { status, logs, .. } = &error else {
+        panic!("not a stop: {error:?}");
+    };
+    assert_eq!(*status, "timed_out");
+    assert_eq!(
+        logs.as_deref(),
+        Some("progress\n"),
+        "the stop carries what the guest printed"
+    );
+}
+
+/// The grace after the wall exists to let the round the guest reached
+/// unwind; it is not a budget for new work. A script that catches the cut
+/// tool result and reaches for another tool is refused, so a file the cut
+/// said nothing about stays unwritten.
+#[tokio::test]
+async fn a_guest_the_wall_cut_cannot_start_another_tool() {
+    let dir = tempdir().unwrap();
+    let opts = ExecOptions {
+        deadline: Some(std::time::Instant::now() + Duration::from_millis(300)),
+        ..ExecOptions::default()
+    };
+
+    let result = exec(
+        "const cut = await lofi.bash({ cmd: 'sleep 5', steer: false });
+         await lofi.write({ path: 'late.txt', text: cut.status });
+         return 'finished';",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await;
+
+    assert!(
+        !dir.path().join("late.txt").exists(),
+        "the write landed after the wall cut the guest"
+    );
+    let Err(error) = result else {
+        panic!("a cut guest reported success");
+    };
+    let Error::SandboxStopped { status, .. } = &error else {
+        panic!("not a stop: {error:?}");
+    };
+    assert_eq!(*status, "timed_out");
+    assert!(
+        error.to_string().contains("wall-clock budget exceeded"),
+        "the report names the budget that refused the call: {error}"
+    );
+}
+
+/// A tool cut at the wall wakes the guest on the same instant the wall is
+/// due, so a guest that then returns a value ran past its budget. The value is
+/// not the call's result: a short continuation ticks the interrupt handler too
+/// rarely to be caught by anything but the clock.
+#[tokio::test]
+async fn a_guest_that_returns_past_the_wall_reports_the_stop() {
+    let dir = tempdir().unwrap();
+    let opts = ExecOptions {
+        deadline: Some(std::time::Instant::now() + Duration::from_millis(300)),
+        ..ExecOptions::default()
+    };
+
+    let result = exec(
+        "const cut = await lofi.bash({ cmd: 'sleep 5', steer: false });
+         return cut.status;",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("the cut call returned the guest's value as its result");
+    };
+    let Error::SandboxStopped { status, .. } = &error else {
+        panic!("not a stop: {error:?}");
+    };
+    assert_eq!(*status, "timed_out");
+}
+
+/// Swallowing the refusal a spent wall throws does not buy a success: the
+/// guest's return still lands after the instant its budget ended.
+#[tokio::test]
+async fn a_guest_that_swallows_the_post_wall_refusal_still_reports_the_stop() {
+    let dir = tempdir().unwrap();
+    let opts = ExecOptions {
+        deadline: Some(std::time::Instant::now() + Duration::from_millis(300)),
+        ..ExecOptions::default()
+    };
+
+    let result = exec(
+        "const cut = await lofi.bash({ cmd: 'sleep 5', steer: false });
+         try { await lofi.write({ path: 'late.txt', text: cut.status }); }
+         catch (e) { return 'swallowed'; }
+         return 'wrote';",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await;
+
+    assert!(
+        !dir.path().join("late.txt").exists(),
+        "the refused call ran anyway"
+    );
+    let Err(error) = result else {
+        panic!("a swallowed refusal reported success");
+    };
+    let Error::SandboxStopped { status, .. } = &error else {
+        panic!("not a stop: {error:?}");
+    };
+    assert_eq!(*status, "timed_out");
+}
+
+/// `lofi.sleep` obeys the call's clock. A sleep that spans the wall wakes at
+/// the wall and throws, so the call returns on the instant its budget ended
+/// instead of parking the guest until the grace it is dropped after expires.
+#[tokio::test]
+async fn a_sleep_that_spans_the_wall_wakes_at_the_wall() {
+    let dir = tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let opts = ExecOptions {
+        deadline: Some(started + Duration::from_millis(300)),
+        ..ExecOptions::default()
+    };
+
+    let result = exec(
+        "await lofi.sleep(5); return 'slept';",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await;
+
+    // The grace a parked guest is dropped after is one second; a sleep that
+    // ignores the clock spends it.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "the sleep parked the guest past the wall: {elapsed:?}"
+    );
+    let Err(error) = result else {
+        panic!("a cut sleep reported success");
+    };
+    let Error::SandboxStopped { status, .. } = &error else {
+        panic!("not a stop: {error:?}");
+    };
+    assert_eq!(*status, "timed_out");
+}
+
+/// A wall budget that has already run out ends the call at once, so a
+/// caller's deadline is never waited out by a guest that would not start.
+#[tokio::test]
+async fn a_spent_wall_budget_ends_the_call_at_once() {
+    let dir = tempdir().unwrap();
+    let opts = ExecOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..ExecOptions::default()
+    };
+
+    let started = std::time::Instant::now();
+    let Err(error) = exec("return 1;", &trusted_ctx(dir.path()), &opts).await else {
+        panic!("a spent budget returned a value");
+    };
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a spent budget is not waited out"
+    );
+    assert!(
+        error.to_string().contains("wall-clock"),
+        "the report names the budget that ended it: {error}"
+    );
+}
+
+#[tokio::test]
+async fn exec_reports_a_command_the_run_cancelled_as_cancelled() {
+    let dir = tempdir().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let opts = ExecOptions {
+        cancel: Some(cancel.clone()),
+        ..ExecOptions::default()
+    };
+
+    // Cancel only once the command is running: a flag set before the guest
+    // reaches `lofi.bash` ends the guest instead, which is a different report.
+    let flag = cancel.clone();
+    let marker = dir.path().join("started.txt");
+    tokio::spawn(async move {
+        for _ in 0..2_000 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        flag.store(true, Ordering::Relaxed);
+    });
+
+    let Err(error) = exec(
+        "return await lofi.bash({ cmd: 'echo started > started.txt; sleep 10', steer: false });",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await
+    else {
+        panic!("a cancelled run returned a value");
+    };
+
+    // A command the user stopped is not a slow one: the run's cancellation and
+    // the command's own deadline tear down the same way and say so differently.
+    assert!(
+        dir.path().join("started.txt").exists(),
+        "the command never started: {error}"
+    );
+    let Error::SandboxStopped { status, .. } = &error else {
+        panic!("not a stop: {error:?}");
+    };
+    assert_eq!(*status, "cancelled", "{error}");
+}
+
+/// A guest that catches the throw a cancelled tool puts into it has still
+/// been stopped: the value it returns is not a finished call.
+#[tokio::test]
+async fn exec_reports_a_cancelled_guest_that_caught_the_throw() {
+    let dir = tempdir().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let opts = ExecOptions {
+        cancel: Some(cancel.clone()),
+        ..ExecOptions::default()
+    };
+
+    let flag = cancel.clone();
+    let marker = dir.path().join("started.txt");
+    tokio::spawn(async move {
+        for _ in 0..2_000 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        flag.store(true, Ordering::Relaxed);
+    });
+
+    let result = exec(
+        "try { await lofi.bash({ cmd: 'echo started > started.txt; sleep 10', steer: false }); } catch (e) {}\n         return 7;",
+        &trusted_ctx(dir.path()),
+        &opts,
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a cancelled guest returned a value");
+    };
+    let Error::SandboxStopped { status, .. } = &error else {
+        panic!("not a stop: {error:?}");
+    };
+    assert_eq!(*status, "cancelled", "{error}");
+}
+
+#[tokio::test]
+async fn exec_starts_no_command_whose_own_timeout_has_already_passed() {
+    let dir = tempdir().unwrap();
+    let mut c = trusted_ctx(dir.path());
+    // No clock at all, so the run is not what refuses this: the command's own
+    // zero timeout is. A spawn from here fails, so an I/O error would report
+    // instead if the check ran after it.
+    c.root = dir.path().join("no-such-workdir");
+
+    let res = exec(
+        "return await lofi.bash({ cmd: 'echo hi', timeoutMs: 0, steer: false });",
+        &c,
+        &ExecOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(res.value["status"], json!("timed_out"), "{}", res.value);
+    assert_eq!(res.value["ok"], json!(false), "{}", res.value);
+    assert_eq!(res.value["duration_ms"], json!(0), "{}", res.value);
 }

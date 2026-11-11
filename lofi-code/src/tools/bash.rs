@@ -1,4 +1,4 @@
-use super::bash_util::{read_capped, PgrpKillGuard};
+use super::bash_util::{read_capped_into, PgrpKillGuard};
 use super::truncate::{format_size, truncate_tail_with};
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -11,23 +11,38 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
-/// Outcome the race produces: either both pipes drained and `wait` returned,
-/// or the join itself failed (pipe error or spawn-side I/O).
-type RaceInner = std::result::Result<
-    ((Vec<u8>, bool), (Vec<u8>, bool), std::process::ExitStatus),
-    std::io::Error,
->;
-/// Outer race result: `Err` when the timeout or cancel fired first, `Ok`
-/// wrapping the inner join outcome otherwise.
-type RaceOutcome = std::result::Result<RaceInner, tokio::time::error::Elapsed>;
+/// Outcome the race produces: both pipes drained and `wait` returned, or the
+/// join itself failed (pipe error or spawn-side I/O). The bytes read live in
+/// the caller's buffers, so the arms that cut the command still report them.
+type RaceInner = std::result::Result<std::process::ExitStatus, std::io::Error>;
+/// How the race ended: the child exited or the join failed, the deadline
+/// fired, or the run was cancelled under it. The last two tear down the same
+/// way but say different things, so a guest can tell a long command from one
+/// the user stopped.
+enum End {
+    Exited(RaceInner),
+    TimedOut,
+    Cancelled,
+}
+
+/// What the pipe readers collected: the merged, redacted text, and whether the
+/// pipe-level cap cut it. The buffers live outside the future the deadline
+/// drops, so the arms that cut the command report this too.
+struct Capture {
+    full: String,
+    pipe_capped: bool,
+}
 
 /// What an ask prompt came to. `TimedOut` carries its own message because
 /// the user never answered: the denial is the tool's, not the user's.
+/// `DeadlinePassed` is the call's own deadline closing the prompt, which is
+/// not the same story and must not read like a user who walked away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AskVerdict {
     Approved,
     Denied,
     TimedOut,
+    DeadlinePassed,
 }
 
 impl From<bool> for AskVerdict {
@@ -37,6 +52,17 @@ impl From<bool> for AskVerdict {
         } else {
             Self::Denied
         }
+    }
+}
+
+/// Clears a prompt's `active` flag when the ask ends. The UI drops a prompt
+/// only while that flag stays true, so an exec call its deadline drops mid-ask
+/// must still close its modal.
+struct ActivePrompt(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ActivePrompt {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -55,11 +81,7 @@ impl BuiltinTools {
         // allow list.
         let mode = self.policy_override.effective(self.auto_mode.is_some());
         if mode == lofi_types::BashApprovalMode::DenyAll {
-            return Some(self.blocked_result(
-                cmd,
-                "blocked by session policy: deny all commands",
-                "denied",
-            ));
+            return Some(self.blocked_result(cmd, "blocked by session policy: deny all commands"));
         }
         let decision = self.shell_policy.evaluate(cmd);
         let suffix = decision
@@ -72,7 +94,7 @@ impl BuiltinTools {
         // has no opt-out: it stays a refusal with and without steering.
         if steer && decision.action != lofi_types::PolicyAction::Deny {
             if let Some(msg) = super::steer::refusal_for(cmd, &self.shell_policy.wrappers) {
-                return Some(self.blocked_result(cmd, &msg, "denied"));
+                return Some(self.blocked_result(cmd, &msg));
             }
         }
         match decision.action {
@@ -83,7 +105,7 @@ impl BuiltinTools {
                     decision.reason_without_steering()
                 };
                 let output = format!("blocked by shell policy: {reason}{suffix}");
-                Some(self.blocked_result(cmd, &output, "denied"))
+                Some(self.blocked_result(cmd, &output))
             }
             lofi_types::PolicyAction::Ask => {
                 if mode == lofi_types::BashApprovalMode::AllowAll {
@@ -131,14 +153,24 @@ impl BuiltinTools {
                         } else {
                             format!("requires confirmation: {}{}", decision.reason, suffix)
                         };
-                        Some(self.blocked_result(cmd, &reason, "needs_confirmation"))
+                        Some(self.blocked_result(cmd, &reason))
                     }
                     // The user never came back, so the command is refused on
                     // the tool's own authority rather than left waiting.
                     AskVerdict::TimedOut => Some(self.blocked_result(
                         cmd,
                         &format!("approval timed out: {}{}", decision.reason, suffix),
-                        "denied",
+                    )),
+                    // The call's deadline passed under the wait: nothing was
+                    // refused, the call simply had no time left to ask in.
+                    AskVerdict::DeadlinePassed => Some(self.cut_short_result(
+                        cmd,
+                        "timed_out",
+                        &format!(
+                            "the call's deadline passed before approval: {}{}",
+                            decision.reason, suffix
+                        ),
+                        0,
                     )),
                 }
             }
@@ -146,9 +178,37 @@ impl BuiltinTools {
         }
     }
 
+    /// The one result shape for a command that did not live to exit: the call's
+    /// deadline left nothing to spawn with (`timed_out`), the command's own
+    /// `timeoutMs` fired, or the run was cancelled under it.
+    /// What a command the clock cut left behind: the output it reached, with
+    /// the cut marked after it. A command that printed nothing keeps the bare
+    /// marker the call has always reported.
+    fn reached_output(&self, capture: &Capture, marker: &str) -> String {
+        let shown = self.format_bash_output(&capture.full, capture.pipe_capped);
+        if shown.trim().is_empty() {
+            return marker.to_string();
+        }
+        format!("{shown}\n\n[{marker}: the command was cut here; this is the output it reached]")
+    }
+
+    fn cut_short_result(&self, cmd: &str, status: &str, output: &str, duration_ms: u64) -> Value {
+        json!({
+            "ok": false,
+            "output": output,
+            "code": Value::Null,
+            "command": cmd,
+            "directory": self.root.display().to_string(),
+            "signal": Value::Null,
+            "duration_ms": duration_ms,
+            "status": status,
+        })
+    }
+
     /// Shared result shape for a command that did not run (denied, steered,
-    /// or left un-confirmed).
-    fn blocked_result(&self, cmd: &str, output: &str, status: &str) -> Value {
+    /// or left un-confirmed). The status says only that policy held the
+    /// command back; the output names the rule, or that no answer came.
+    fn blocked_result(&self, cmd: &str, output: &str) -> Value {
         json!({
             "ok": false,
             "output": output,
@@ -157,7 +217,7 @@ impl BuiltinTools {
             "directory": self.root.display().to_string(),
             "signal": Value::Null,
             "duration_ms": 0,
-            "status": status,
+            "status": "blocked",
         })
     }
 
@@ -172,6 +232,7 @@ impl BuiltinTools {
         };
 
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _closes = ActivePrompt(active.clone());
         let reason = std::sync::Arc::new(std::sync::Mutex::new(
             crate::ConfirmReason::AutoEvaluating {
                 started_at: Instant::now(),
@@ -185,12 +246,16 @@ impl BuiltinTools {
             deny_at: deny_at.clone(),
         });
 
+        // Until the evaluation says the command needs an answer, the prompt
+        // carries no countdown and the wait for it is unbounded: a slow
+        // evaluator must not outlast the call it decides for, so the call's
+        // bound closes this phase the way it closes every other ask.
+        let bound = self.clock.instant();
         tokio::select! {
             biased;
             outcome = &mut evaluation => {
                 let outcome = guard_temp_escape(cmd, outcome);
                 let Some(decided) = Self::confirm_reason(outcome) else {
-                    active.store(false, std::sync::atomic::Ordering::Relaxed);
                     return AskVerdict::Approved;
                 };
                 *reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = decided;
@@ -198,10 +263,13 @@ impl BuiltinTools {
                 // fires at the moment the counter the user watches reaches 0.
                 // An answer landing in the same poll still wins: the human
                 // answered. A wait too large to represent is no deadline,
-                // not a panic when the ask is decided.
+                // not a panic when the ask is decided. A prompt raised late in
+                // the call is cut to the call's bound, which the wait was only
+                // measured against when the call started.
                 let deadline = self
-                    .approval_timeout
-                    .and_then(|wait| Instant::now().checked_add(wait));
+                    .clock
+                    .bind(self.approval_timeout, Instant::now())
+                    .instant();
                 *deny_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
                 let approved = if let Some(deadline) = deadline {
                     if let Ok(approved) =
@@ -210,19 +278,15 @@ impl BuiltinTools {
                     {
                         approved
                     } else {
-                        active.store(false, std::sync::atomic::Ordering::Relaxed);
-                        return AskVerdict::TimedOut;
+                        return self.ask_timeout(deadline);
                     }
                 } else {
                     response.await
                 };
-                active.store(false, std::sync::atomic::Ordering::Relaxed);
                 approved.into()
             }
-            approved = &mut response => {
-                active.store(false, std::sync::atomic::Ordering::Relaxed);
-                approved.into()
-            }
+            approved = &mut response => approved.into(),
+            () = wait_until(bound) => AskVerdict::DeadlinePassed,
         }
     }
 
@@ -253,12 +317,15 @@ impl BuiltinTools {
         timeout: Option<Duration>,
     ) -> AskVerdict {
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _closes = ActivePrompt(active.clone());
         let Some(confirm) = &self.confirm else {
             return AskVerdict::Denied;
         };
         // A wait too large to represent is no deadline, not a panic when the
-        // ask is decided.
-        let deadline = timeout.and_then(|wait| Instant::now().checked_add(wait));
+        // ask is decided. A prompt never outlives the call it belongs to, so
+        // the bound cuts it here the way it cuts the auto-mode one: the same
+        // stop must not read differently by which ask raised the prompt.
+        let deadline = self.clock.bind(timeout, Instant::now()).instant();
         let mut response = confirm(crate::ConfirmPrompt {
             command: cmd.to_string(),
             reason: std::sync::Arc::new(std::sync::Mutex::new(reason)),
@@ -270,15 +337,23 @@ impl BuiltinTools {
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut response)
                     .await
             else {
-                active.store(false, std::sync::atomic::Ordering::Relaxed);
-                return AskVerdict::TimedOut;
+                return self.ask_timeout(deadline);
             };
             approved
         } else {
             response.await
         };
-        active.store(false, std::sync::atomic::Ordering::Relaxed);
         approved.into()
+    }
+
+    /// What an unanswered prompt came to: the call's bound closing it, or the
+    /// approval timeout doing so.
+    fn ask_timeout(&self, deadline: Instant) -> AskVerdict {
+        if self.clock.instant() == Some(deadline) {
+            AskVerdict::DeadlinePassed
+        } else {
+            AskVerdict::TimedOut
+        }
     }
 
     /// Build the host-level `sh -c` invocation: stdin null (the TUI reader
@@ -301,29 +376,24 @@ impl BuiltinTools {
         command
     }
 
-    /// Map the race outcome into the JSON shape returned to the guest. The
-    /// three arms correspond to (a) child exited and both pipes drained, (b)
-    /// the join failed (pipe error or spawn-time I/O), and (c) the
-    /// outer timeout/cancel fired before either finished.
+    /// Map the race outcome into the JSON shape returned to the guest: the
+    /// child exited and both pipes drained, the join failed (pipe error or
+    /// spawn-time I/O), the deadline fired, or the run was cancelled. The last
+    /// two are the enum's own arms, because they differ only in what the
+    /// result says.
     fn bash_result_json(
         &self,
         cmd: &str,
         timeout_ms: u64,
         started: Instant,
         mut guard: PgrpKillGuard,
-        result: RaceOutcome,
+        result: End,
+        capture: &Capture,
     ) -> Result<Value> {
         match result {
-            Ok(Ok((out, err, status))) => {
+            End::Exited(Ok(status)) => {
                 guard.disarm();
-                let (out_bytes, out_truncated) = out;
-                let (err_bytes, err_truncated) = err;
-                let mut merged = out_bytes;
-                merged.extend_from_slice(&err_bytes);
-                let pipe_capped = out_truncated || err_truncated;
-                let mut full = String::from_utf8_lossy(&merged).into_owned();
-                self.bash_env.redact(&mut full);
-                let output = self.format_bash_output(&full, pipe_capped);
+                let output = self.format_bash_output(&capture.full, capture.pipe_capped);
                 #[allow(clippy::cast_possible_truncation)]
                 let duration_ms = started.elapsed().as_millis() as u64;
                 Ok(json!({
@@ -334,25 +404,26 @@ impl BuiltinTools {
                     "directory": self.root.display().to_string(),
                     "signal": status.signal(),
                     "duration_ms": duration_ms,
-                    "status": if status.signal().is_some() { "signaled" } else { "exited" },
+                    // One vocabulary with a run and a job: a signal death is a
+                    // failure the signal field explains.
+                    "status": if status.success() { "completed" } else { "failed" },
                 }))
             }
-            Ok(Err(e)) => {
+            End::Exited(Err(e)) => {
                 drop(guard);
                 Err(Error::Io(e))
             }
-            Err(_) => {
+            End::TimedOut => {
                 drop(guard);
-                Ok(json!({
-                    "ok": false,
-                    "output": "<timeout>",
-                    "code": Value::Null,
-                    "command": cmd,
-                    "directory": self.root.display().to_string(),
-                    "signal": Value::Null,
-                    "duration_ms": timeout_ms,
-                    "status": "timeout",
-                }))
+                let output = self.reached_output(capture, "<timeout>");
+                Ok(self.cut_short_result(cmd, "timed_out", &output, timeout_ms))
+            }
+            End::Cancelled => {
+                drop(guard);
+                #[allow(clippy::cast_possible_truncation)]
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let output = self.reached_output(capture, "<cancelled>");
+                Ok(self.cut_short_result(cmd, "cancelled", &output, duration_ms))
             }
         }
     }
@@ -361,16 +432,26 @@ impl BuiltinTools {
     /// Returns [`Error::Io`] only if the process cannot be spawned.
     pub async fn bash(&self, args: Value) -> Result<Value> {
         let cmd = require_str("bash", &args, "cmd")?;
-        let timeout_ms = args
+        let asked_ms = args
             .get("timeoutMs")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_BASH_TIMEOUT_MS);
         let steer = args.get("steer").and_then(Value::as_bool).unwrap_or(true);
-        let dur = Duration::from_millis(timeout_ms);
 
         if let Some(blocked) = self.check_policy(&cmd, steer).await {
             return Ok(blocked);
         }
+
+        // Read after the policy check: an approval prompt can hold the call
+        // for minutes, and the command's clock starts when it may run. A
+        // command never outlives the call it belongs to.
+        // An instant, not a countdown: the spawn and the pipe setup below come
+        // out of the command's time instead of adding to it. A bound too large
+        // to represent is no deadline, not a panic.
+        let end = self
+            .clock
+            .bind(Some(Duration::from_millis(asked_ms)), Instant::now())
+            .instant();
 
         // `bash` is intentionally host-level: it runs the user's project
         // commands and is *not* a security sandbox. The child env is resolved
@@ -385,6 +466,12 @@ impl BuiltinTools {
         // or future cancellation.
         let mut command = self.command_for(&cmd);
 
+        // Preparation can consume what was left: an approved call, the policy
+        // resolution and building the command all happen first, so the call may
+        // have spent its time by now. Nothing starts after that.
+        if end.is_some_and(|end| Instant::now() >= end) {
+            return Ok(self.cut_short_result(&cmd, "timed_out", "<timeout>", 0));
+        }
         let started = Instant::now();
         let mut child = command.spawn()?;
         let guard = PgrpKillGuard::new(child.id());
@@ -397,50 +484,76 @@ impl BuiltinTools {
             .take()
             .ok_or_else(|| Error::Tool("bash: stderr pipe unavailable".into()))?;
 
+        // The readers append into buffers this scope owns, so the deadline
+        // dropping the future cannot take back what the command printed.
+        let out = std::sync::Mutex::new(Vec::new());
+        let err = std::sync::Mutex::new(Vec::new());
+
         // Run reads and the child wait inside the timeout so a command that
         // closes its pipes early but keeps running (`exec >/dev/null 2>&1;
         // sleep 1000`) can't outlive `timeoutMs`. `MAX_BASH_OUTPUT_BYTES` is
         // the pipe-level memory safety cap; user-visible truncation is below.
-        let timed = Box::pin(tokio::time::timeout(dur, async move {
-            let (out, err, status) = tokio::try_join!(
-                read_capped(&mut stdout, MAX_BASH_OUTPUT_BYTES),
-                read_capped(&mut stderr, MAX_BASH_OUTPUT_BYTES),
+        let timed = Box::pin(async {
+            let ((), (), status) = tokio::try_join!(
+                read_capped_into(&mut stdout, &out, MAX_BASH_OUTPUT_BYTES),
+                read_capped_into(&mut stderr, &err, MAX_BASH_OUTPUT_BYTES),
                 child.wait(),
             )?;
-            Ok::<_, std::io::Error>((out, err, status))
-        }));
+            Ok::<_, std::io::Error>(status)
+        });
+        let run = async move {
+            match end {
+                Some(end) => {
+                    match tokio::time::timeout_at(tokio::time::Instant::from_std(end), timed).await
+                    {
+                        Ok(inner) => End::Exited(inner),
+                        Err(_) => End::TimedOut,
+                    }
+                }
+                None => End::Exited(timed.await),
+            }
+        };
 
         // Race the run against user cancellation: while the guest awaits the
         // process, no QuickJS bytecode ticks, so the sandbox interrupt handler
-        // can't observe `cancel`. Map cancel onto the same elapsed-timeout
-        // outcome — that tears down identically (kill the process group, which
-        // EOFs the pipes) and reports a non-ok result.
+        // can't observe `cancel`. Both ends tear down identically (kill the
+        // process group, which EOFs the pipes); they differ only in what the
+        // result says, so a cancelled command is not reported as a slow one.
         let result = match &self.cancel {
             Some(flag) => {
                 let cancel_wait = crate::tools::wait_for_cancel(flag);
                 tokio::pin!(cancel_wait);
                 tokio::select! {
                     biased;
-                    r = timed => r,
-                    () = &mut cancel_wait => {
-                        // `timeout(dur, pending())` always elapses; borrow the
-                        // error shape rather than name its type.
-                        match tokio::time::timeout(
-                            Duration::ZERO,
-                            std::future::pending::<RaceInner>(),
-                        )
-                        .await
-                        {
-                            Err(elapsed) => Err(elapsed),
-                            Ok(_) => unreachable!(),
-                        }
-                    }
+                    r = run => r,
+                    () = &mut cancel_wait => End::Cancelled,
                 }
             }
-            None => timed.await,
+            None => run.await,
         };
 
-        self.bash_result_json(&cmd, timeout_ms, started, guard, result)
+        let (out, err) = (
+            out.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            err.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        // A full buffer means the safety cap was hit: the reader kept draining
+        // the pipe and dropped the rest.
+        let pipe_capped = out.len() >= MAX_BASH_OUTPUT_BYTES || err.len() >= MAX_BASH_OUTPUT_BYTES;
+        let mut merged = out;
+        merged.extend_from_slice(&err);
+        let mut full = String::from_utf8_lossy(&merged).into_owned();
+        self.bash_env.redact(&mut full);
+
+        self.bash_result_json(
+            &cmd,
+            asked_ms,
+            started,
+            guard,
+            result,
+            &Capture { full, pipe_capped },
+        )
     }
 
     /// Tail-truncate `full` to the configured visible-output cap and, when
@@ -503,6 +616,15 @@ impl BuiltinTools {
         drop(f);
         std::fs::File::open(&self.tmp_dir)?.sync_all()?;
         Ok(path.to_string_lossy().into_owned())
+    }
+}
+
+/// Wait until `end`, or forever when the run has no cap to reach: a select
+/// arm that must never fire on its own still needs a future to poll.
+pub(super) async fn wait_until(end: Option<Instant>) {
+    match end {
+        Some(end) => tokio::time::sleep_until(tokio::time::Instant::from_std(end)).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -827,6 +949,103 @@ mod tests {
             .is_some());
     }
 
+    /// A bound ending `cap` from now: what cuts any prompt that would
+    /// otherwise wait longer.
+    fn capped_clock(cap: Duration) -> lofi_types::Deadline {
+        lofi_types::Deadline::at(std::time::Instant::now() + cap)
+    }
+
+    #[tokio::test]
+    async fn an_ask_the_call_cannot_afford_is_cut_at_its_deadline() {
+        let (_seen, confirm) = deny_at_recorder(Duration::from_hours(1), false);
+        let auto = asking_auto();
+        let (_dir, tools) = tools_with_auto(auto.clone(), confirm);
+        let tools = tools
+            .with_approval_timeout(Some(Duration::from_secs(30)))
+            .with_clock(capped_clock(Duration::from_millis(50)));
+
+        // The call's deadline is nearer than the approval timeout, so it is
+        // the one that closes the prompt: the verdict names the call, not a
+        // user who went away.
+        assert_eq!(
+            tools.auto_mode_decision("cp x /tmp/x", &auto).await,
+            AskVerdict::DeadlinePassed
+        );
+
+        // A timeout with no clock waits and denies as before.
+        let (_seen, confirm) = deny_at_recorder(Duration::from_hours(1), false);
+        let (_dir, tools) = tools_with_auto(auto.clone(), confirm);
+        let tools = tools.with_approval_timeout(Some(Duration::from_millis(50)));
+        assert_eq!(
+            tools.auto_mode_decision("cp x /tmp/x", &auto).await,
+            AskVerdict::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evaluation_that_never_decides_is_cut_at_the_call_deadline() {
+        // The prompt opens before the evaluator answers, and until it does the
+        // countdown is unset: a wait bounded only by the answer would outlive
+        // the call, which then settles it as blocked, for a decision nobody
+        // made.
+        let (_seen, confirm) = deny_at_recorder(Duration::from_hours(1), false);
+        let auto: crate::AutoModeFn = Arc::new(|_| Box::pin(future::pending()));
+        let (_dir, tools) = tools_with_auto(auto.clone(), confirm);
+        let tools = tools.with_clock(capped_clock(Duration::from_millis(50)));
+
+        assert_eq!(
+            tools.auto_mode_decision("cp x /tmp/x", &auto).await,
+            AskVerdict::DeadlinePassed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_prompt_is_cut_at_the_call_deadline_too() {
+        // An `[[ask]]` rule's prompt waits under the call's deadline, like the
+        // auto-mode one: for the same command at the same instant, a bounded
+        // call must not read one prompt kind as blocked and the other as
+        // spent.
+        let (_seen, confirm) = deny_at_recorder(Duration::from_hours(1), false);
+        let auto = asking_auto();
+        let (_dir, tools) = tools_with_auto(auto, confirm);
+        let tools = tools.with_clock(capped_clock(Duration::from_millis(50)));
+        assert_eq!(
+            tools
+                .confirm_decision(
+                    "cp x /tmp/x",
+                    crate::ConfirmReason::Policy {
+                        reason: "writes outside the workspace".to_string(),
+                    },
+                    None,
+                )
+                .await,
+            AskVerdict::DeadlinePassed
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_the_call_deadline_cut_reports_it_not_a_timeout() {
+        let confirm: crate::ConfirmFn = Arc::new(|_| Box::pin(future::pending()));
+        let auto = asking_auto();
+        let (_dir, tools) = tools_for_policy(
+            &lofi_types::ShellPolicyConfig::default(),
+            Some(confirm),
+            Some(auto),
+        );
+        let tools = tools
+            .with_policy_override(mode_override(lofi_types::BashApprovalMode::AskAuto))
+            .with_approval_timeout(Some(Duration::from_secs(30)))
+            .with_clock(capped_clock(Duration::from_millis(50)));
+
+        let res = tools.check_policy("cp x /tmp/x", true).await.unwrap();
+        assert_eq!(res["status"], json!("timed_out"));
+        let output = res["output"].as_str().unwrap();
+        assert!(
+            output.contains("the call's deadline passed before approval"),
+            "{output}"
+        );
+    }
+
     #[tokio::test]
     async fn answered_auto_ask_before_the_deadline_is_approved() {
         let (seen, confirm) = deny_at_recorder(Duration::from_millis(30), true);
@@ -885,9 +1104,74 @@ mod tests {
             .with_approval_timeout(Some(Duration::from_millis(50)));
 
         let res = tools.check_policy("cp x /tmp/x", true).await.unwrap();
-        assert_eq!(res["status"], json!("denied"));
+        assert_eq!(res["status"], json!("blocked"));
         let output = res["output"].as_str().unwrap();
         assert!(output.contains("approval timed out"));
+    }
+
+    /// A confirm fn that holds the prompt and records the flag the UI reads,
+    /// so a test can drop the ask mid-wait and see the prompt close.
+    fn held_prompt() -> (Arc<Mutex<Option<Arc<AtomicBool>>>>, crate::ConfirmFn) {
+        let seen = Arc::new(Mutex::new(None));
+        let confirm: crate::ConfirmFn = {
+            let seen = seen.clone();
+            Arc::new(move |prompt: crate::ConfirmPrompt| {
+                *seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prompt.active);
+                Box::pin(future::pending::<bool>())
+            })
+        };
+        (seen, confirm)
+    }
+
+    fn recorded_active(seen: &Arc<Mutex<Option<Arc<AtomicBool>>>>) -> Arc<AtomicBool> {
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_dropped_ask_closes_the_prompt_it_raised() {
+        // The call's deadline drops a guest mid-ask; the modal must not stay
+        // up for a call that no longer exists.
+        let (seen, confirm) = held_prompt();
+        let auto = asking_auto();
+        let (_dir, tools) = tools_with_auto(auto.clone(), confirm);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            tools.auto_mode_decision("cp x /tmp/x", &auto),
+        )
+        .await;
+        assert!(dropped.is_err(), "the ask is still waiting");
+        assert!(
+            !recorded_active(&seen).load(std::sync::atomic::Ordering::Relaxed),
+            "the prompt closes with the call that raised it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_manual_ask_closes_the_prompt_it_raised() {
+        let (seen, confirm) = held_prompt();
+        let auto = asking_auto();
+        let (_dir, tools) = tools_with_auto(auto, confirm);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            tools.confirm_decision(
+                "cp x /tmp/x",
+                crate::ConfirmReason::Policy {
+                    reason: "writes outside the workspace".to_string(),
+                },
+                None,
+            ),
+        )
+        .await;
+        assert!(dropped.is_err(), "the ask is still waiting");
+        assert!(
+            !recorded_active(&seen).load(std::sync::atomic::Ordering::Relaxed),
+            "the prompt closes with the call that raised it"
+        );
     }
 
     fn asking_auto() -> crate::AutoModeFn {
@@ -950,7 +1234,7 @@ mod tests {
         let (_dir, tools) = tools_with_cancel(cancel);
         let res = tools.bash(json!({ "cmd": "echo hi" })).await.unwrap();
         assert_eq!(res["ok"], json!(true), "got: {res}");
-        assert_eq!(res["status"], json!("exited"));
+        assert_eq!(res["status"], json!("completed"));
     }
     fn tools_for_policy(
         config: &lofi_types::ShellPolicyConfig,
@@ -972,7 +1256,6 @@ mod tests {
         );
         (dir, tools)
     }
-
     fn mode_override(mode: lofi_types::BashApprovalMode) -> crate::policy::PolicyOverride {
         let override_handle = crate::policy::PolicyOverride::default();
         override_handle.set(Some(mode));
@@ -1002,7 +1285,7 @@ mod tests {
             .check_policy("curl https://example.com", true)
             .await
             .unwrap();
-        assert_eq!(res["status"], json!("denied"));
+        assert_eq!(res["status"], json!("blocked"));
     }
 
     #[tokio::test]
@@ -1015,7 +1298,7 @@ mod tests {
         let tools =
             tools.with_policy_override(mode_override(lofi_types::BashApprovalMode::DenyAll));
         let res = tools.check_policy("echo hi", true).await.unwrap();
-        assert_eq!(res["status"], json!("denied"));
+        assert_eq!(res["status"], json!("blocked"));
     }
 
     #[tokio::test]
@@ -1176,7 +1459,7 @@ mod tests {
             .check_policy("git push origin main", true)
             .await
             .unwrap();
-        assert_eq!(res["status"], json!("denied"));
+        assert_eq!(res["status"], json!("blocked"));
         let output = res["output"].as_str().unwrap();
         assert!(
             output.starts_with(

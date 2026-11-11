@@ -32,6 +32,11 @@ const GUEST_MAX_STACK: usize = 1024 * 1024;
 const INTR_RUNNING: u8 = 0;
 const INTR_TIMEOUT: u8 = 1;
 const INTR_CANCELLED: u8 = 2;
+const INTR_WALL: u8 = 3;
+
+/// How long a guest whose wall-clock budget ran out may take to unwind after
+/// the interrupt flag is set, before the call is dropped.
+const WALL_GRACE: Duration = Duration::from_secs(1);
 
 const SUSPEND_THRESHOLD: Duration = Duration::from_millis(1);
 
@@ -39,7 +44,7 @@ pub(crate) const MAX_LOG_BYTES: usize = 1024 * 1024;
 const LOG_TRUNCATION_MARKER: &str = "\n<logs truncated>";
 
 const TRACK_FOREGROUND_TOOLS: &str = r#"
-    lofi => {
+    (lofi, stopped) => {
         const pending = new Set();
         const errors = [];
         const errorText = error =>
@@ -54,10 +59,19 @@ const TRACK_FOREGROUND_TOOLS: &str = r#"
         const MAX_CALLS = 4096;
         let calls = 0;
 
+        // A guest whose clock ran out is unwinding: the grace it gets is
+        // there to let the round it reached settle, not to start new work.
+        // The refusal rejects rather than throws, so a script that awaits the
+        // tool reads it the same way it reads any other refusal.
         for (const name of Object.keys(lofi)) {
             const tool = lofi[name];
             if (typeof tool !== "function") continue;
             lofi[name] = (...args) => {
+                if (stopped()) {
+                    return Promise.reject(
+                        new Error("the run is stopped: no further tool calls")
+                    );
+                }
                 calls += 1;
                 if (calls > MAX_CALLS) {
                     throw new Error(
@@ -102,6 +116,7 @@ const TRACK_FOREGROUND_TOOLS: &str = r#"
 async fn install_cpu_guard(
     rt: &AsyncRuntime,
     budget: Duration,
+    wall: Option<Instant>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Arc<AtomicU8> {
     let intr = Arc::new(AtomicU8::new(INTR_RUNNING));
@@ -119,6 +134,20 @@ async fn install_cpu_guard(
             }
         }
         let now = Instant::now();
+        // The caller's wall-clock budget is absolute, so a slow tool or a
+        // long await cannot buy the guest more of it.
+        if wall.is_some_and(|end| now >= end) {
+            // A bound that already stopped the guest keeps the word it
+            // stopped it with: the wall clock passing while a cancel unwinds
+            // does not turn a cancellation into a timeout.
+            let _ = intr_clone.compare_exchange(
+                INTR_RUNNING,
+                INTR_WALL,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            return true;
+        }
         let delta = now.saturating_duration_since(last_tick);
         last_tick = now;
         cpu_accumulated += delta.min(SUSPEND_THRESHOLD);
@@ -130,6 +159,69 @@ async fn install_cpu_guard(
     })))
     .await;
     intr
+}
+
+/// Record the wall the host saw pass on the interrupt flag: a guest that
+/// returns at or after its instant ran past the budget, whether the handler
+/// ticked or not. A cancel that landed first keeps its word.
+fn note_wall(intr: &Arc<AtomicU8>, end: Instant, cancel: Option<&Arc<AtomicBool>>) {
+    if Instant::now() < end {
+        return;
+    }
+    let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let _ = intr.compare_exchange(
+        INTR_RUNNING,
+        if cancelled { INTR_CANCELLED } else { INTR_WALL },
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
+
+/// Run the guest until it finishes or its wall budget ends, whichever is
+/// first. A guest awaiting a slow tool ticks rarely, so the interrupt handler
+/// alone cannot bound it; setting the flag first keeps a synchronous guest
+/// aborting on its next tick, and the grace lets the round it reached unwind.
+async fn guest_before_wall<F>(
+    guest: F,
+    intr: &Arc<AtomicU8>,
+    deadline: Option<Instant>,
+    cancel: Option<&Arc<AtomicBool>>,
+    over: impl Fn() -> Error,
+) -> Result<ExecResult>
+where
+    F: std::future::Future<Output = Result<ExecResult>>,
+{
+    let Some(end) = deadline else {
+        return guest.await;
+    };
+    tokio::pin!(guest);
+    let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(end));
+    tokio::pin!(sleep);
+    tokio::select! {
+        res = &mut guest => {
+            note_wall(intr, end, cancel);
+            // A tool the wall cut wakes the guest on the same instant the
+            // sleep is due, and a short continuation runs fewer steps than the
+            // interrupt handler needs to tick: without this the same cut would
+            // report `timed_out` or a value depending on which arm the runtime
+            // polled first.
+            res
+        }
+        () = &mut sleep => {
+            // A cancel that landed before the deadline keeps its word: the
+            // wall passing while the guest unwinds is not a timeout.
+            let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+            let _ = intr.compare_exchange(
+                INTR_RUNNING,
+                if cancelled { INTR_CANCELLED } else { INTR_WALL },
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            tokio::time::timeout(WALL_GRACE, &mut guest)
+                .await
+                .unwrap_or_else(|_| Err(over()))
+        }
+    }
 }
 
 /// - **Memory & stack** — `JS_SetMemoryLimit` and `JS_SetMaxStackSize` cap
@@ -145,14 +237,26 @@ async fn install_cpu_guard(
 ///   during awaited host work, so await-heavy loops accumulate budget
 ///   slowly; the tool-call cap in [`TRACK_FOREGROUND_TOOLS`] bounds those
 ///   instead.
+/// - **Wall budget** — `opts.deadline` bounds the same work by wall clock, so
+///   a guest that sits inside an awaited tool is cut at the caller's instant
+///   instead of whenever that tool returns. The host owns this value: it is
+///   already cut to the run's own cap.
 /// - **Cancellation** — if `opts.cancel` is provided, setting it to `true`
 ///   causes the same interrupt path and surfaces a distinct "cancelled"
 ///   error. This is how the UI's Ctrl+C breaks a sync loop that `handle
 ///   .abort()` alone cannot preempt.
+///
+/// A guest the clock stops is not a guest that failed: once the CPU
+/// allowance or the wall instant is spent, or the caller cancels, no further
+/// tool call starts, so the grace a cut guest gets to unwind cannot lay down
+/// work the result does not mention.
 /// # Errors
-/// Returns [`Error::Sandbox`] for compile failures, CPU-budget exhaustion,
-/// cancellation, guest exceptions, or tool errors that propagate as thrown
-/// exceptions.
+/// Returns [`Error::SandboxStopped`] with status `"timed_out"` when the CPU
+/// allowance or the wall budget ran out, and `"cancelled"` when the caller's
+/// flag stopped it; both carry the logs the guest printed. Returns
+/// [`Error::Sandbox`] for compile failures, guest exceptions, and tool errors
+/// that propagate as thrown exceptions.
+#[allow(clippy::too_many_lines)]
 pub async fn exec(src: &str, ctx: &ExecCtx, opts: &ExecOptions) -> Result<ExecResult> {
     let js = compile_ts(src)?;
 
@@ -166,8 +270,13 @@ pub async fn exec(src: &str, ctx: &ExecCtx, opts: &ExecOptions) -> Result<ExecRe
     rt.set_memory_limit(GUEST_MEMORY_LIMIT).await;
     rt.set_max_stack_size(GUEST_MAX_STACK).await;
 
-    let intr = install_cpu_guard(&rt, opts.timeout, opts.cancel.clone()).await;
+    let intr = install_cpu_guard(&rt, opts.timeout, opts.deadline, opts.cancel.clone()).await;
 
+    // The tools this guest starts run under the bound this call was given:
+    // the call's own `timeoutMs`, and nothing above it.
+    let tool_clock = opts
+        .deadline
+        .map_or(lofi_types::Deadline::NONE, lofi_types::Deadline::at);
     let tools = Arc::new(
         BuiltinTools::with_skills_dir(
             ctx.root.clone(),
@@ -182,6 +291,7 @@ pub async fn exec(src: &str, ctx: &ExecCtx, opts: &ExecOptions) -> Result<ExecRe
         .with_policy_override(ctx.policy_override.clone())
         .with_intent(ctx.intent.clone())
         .with_approval_timeout(ctx.approval_timeout)
+        .with_clock(tool_clock)
         .with_approve_dir(ctx.approve_dir.clone())
         .with_grants(ctx.grants.clone())
         .with_cancel(opts.cancel.clone())
@@ -200,7 +310,16 @@ pub async fn exec(src: &str, ctx: &ExecCtx, opts: &ExecOptions) -> Result<ExecRe
     let models = ctx.models.clone();
     let logs = Arc::new(Mutex::new(String::new()));
 
-    let outcome = async {
+    // The allowance this call was given, read before the guest starts: the
+    // deadline is an instant, so once it has passed it has nothing left to
+    // report. What the guest printed before the bound stopped it travels with
+    // the stop, so a cut script still shows the progress it reached.
+    let wall_ms = opts.deadline.map_or(0, |end| {
+        u64::try_from(end.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX)
+    });
+    let over_logs = logs.clone();
+    let guest_intr = intr.clone();
+    let guest = async {
         async_with!(&actx => |ctx| {
             // QuickJS can fault while building an error backtrace after its
             // heap limit is exhausted. The harness never exposes guest stacks.
@@ -222,6 +341,9 @@ pub async fn exec(src: &str, ctx: &ExecCtx, opts: &ExecOptions) -> Result<ExecRe
                 models,
                 &logs,
                 opts.max_value_bytes,
+                opts.deadline,
+                &guest_intr,
+                opts.cancel.as_ref(),
             )
             .map_err(|e| Error::Sandbox(format!("install: {e}")))?;
             let promise: Promise = ctx
@@ -241,20 +363,71 @@ pub async fn exec(src: &str, ctx: &ExecCtx, opts: &ExecOptions) -> Result<ExecRe
             convert_exec_result(&value, &errors, &logs, &tools, opts.max_value_bytes)
         })
         .await
-    }
+    };
+    let outcome = guest_before_wall(guest, &intr, opts.deadline, opts.cancel.as_ref(), || {
+        stopped(
+            &over_logs,
+            "timed_out",
+            format!("guest wall-clock budget exceeded ({wall_ms}ms)"),
+        )
+    })
     .await;
 
     let reason = intr.load(Ordering::Relaxed);
-    match outcome {
-        Ok(r) => Ok(r),
-        Err(e) => match reason {
-            INTR_TIMEOUT => Err(Error::Sandbox(format!(
-                "guest CPU budget exceeded ({}ms)",
-                opts.timeout.as_millis()
-            ))),
-            INTR_CANCELLED => Err(Error::Sandbox("guest cancelled".to_string())),
-            _ => Err(e),
-        },
+    // Conversion runs guest code: a getter can spin until the wall fires and
+    // the property it was building is dropped, so a value that came back is
+    // no proof that the guest finished inside its bound.
+    // A guest blocked in an awaited tool cannot see the interrupt handler
+    // tick, so the tool throws into it instead. A caller's own flag is a stop
+    // whether or not the guest swallowed that throw and returned a value.
+    let interrupted = interrupted(reason, opts, &over_logs, wall_ms).or_else(|| {
+        opts.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            .then(|| stopped(&over_logs, "cancelled", "guest cancelled".to_string()))
+    });
+    match interrupted {
+        Some(error) => Err(error),
+        None => outcome,
+    }
+}
+
+/// A stop, carrying what the guest printed before it: a cut script still
+/// shows the progress it reached.
+fn stopped(logs: &Arc<Mutex<String>>, status: &'static str, message: String) -> Error {
+    Error::SandboxStopped {
+        status,
+        message,
+        logs: logs
+            .lock()
+            .ok()
+            .map(|logs| logs.clone())
+            .filter(|logs| !logs.is_empty()),
+    }
+}
+
+/// The stop an interrupt flag names, if the guest was cut: the guard that set
+/// it threw into the guest, so the flag decides whether the call finished
+/// however the value the guest returned looks.
+fn interrupted(
+    reason: u8,
+    opts: &ExecOptions,
+    logs: &Arc<Mutex<String>>,
+    wall_ms: u64,
+) -> Option<Error> {
+    match reason {
+        INTR_TIMEOUT => Some(stopped(
+            logs,
+            "timed_out",
+            format!("guest CPU budget exceeded ({}ms)", opts.timeout.as_millis()),
+        )),
+        INTR_CANCELLED => Some(stopped(logs, "cancelled", "guest cancelled".to_string())),
+        INTR_WALL => Some(stopped(
+            logs,
+            "timed_out",
+            format!("guest wall-clock budget exceeded ({wall_ms}ms)"),
+        )),
+        _ => None,
     }
 }
 
@@ -273,10 +446,12 @@ fn convert_exec_result(
     let errors = errors_json.as_array().cloned().unwrap_or_default();
     let errors_bytes = serde_json::to_string(&errors).map_or(0, |json| json.len());
     let logs_budget = max_value_bytes.saturating_sub(errors_bytes);
+    // Cloned, not taken: a stop this conversion ends in carries the logs the
+    // guest printed before it.
     let mut logs = logs
         .lock()
         .ok()
-        .map(|mut logs| std::mem::take(&mut *logs))
+        .map(|logs| logs.clone())
         .unwrap_or_default();
     let logs_truncated = truncate_logs(&mut logs, logs_budget);
     let value_budget = max_value_bytes
@@ -335,14 +510,33 @@ fn install_globals<'js>(
     models: Option<ModelsFn>,
     logs: &Arc<Mutex<String>>,
     max_output_bytes: usize,
+    deadline: Option<Instant>,
+    intr: &Arc<AtomicU8>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> rquickjs::Result<Function<'js>> {
     let lofi = Object::new(ctx.clone())?;
     bind_tools(
         ctx, &lofi, tools, recall, result, skills_dir, subagent, models,
     )?;
     lofi.set("tmpDir", tools.tmp_dir().to_string_lossy().to_string())?;
+    // What the tracker refuses a call on: the guard, the caller's flag, or a
+    // wall that has passed say the guest is stopped, whether or not the
+    // interpreter has ticked since. The instant is part of the answer because
+    // a tool that ends on its own deadline can wake the guest before the host
+    // notices that same deadline.
+    let stopped = Function::new(ctx.clone(), {
+        let intr = intr.clone();
+        let cancel = cancel.cloned();
+        move || -> bool {
+            intr.load(Ordering::Relaxed) != INTR_RUNNING
+                || deadline.is_some_and(|end| Instant::now() >= end)
+                || cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        }
+    })?;
     let install_tracker: Function = ctx.eval(TRACK_FOREGROUND_TOOLS)?;
-    let drain_tools = install_tracker.call((lofi.clone(),))?;
+    let drain_tools = install_tracker.call((lofi.clone(), stopped))?;
     ctx.globals().set("lofi", lofi)?;
 
     let max_log_bytes = MAX_LOG_BYTES.min(max_output_bytes);

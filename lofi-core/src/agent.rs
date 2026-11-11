@@ -111,12 +111,11 @@ pub(crate) use auto_mode::collect_text;
 pub use event::AgentEvent;
 #[cfg(test)]
 pub(crate) use exec::extract_code_prefix;
-pub(crate) use exec::{cap_description, normalize_exec_input};
-pub(crate) use exec::{cap_exec_result, cap_tool_result, CodePrefixDecoder};
+pub(crate) use exec::{cap_description, exec_timeout_ms, normalize_exec_input};
+pub(crate) use exec::{cap_exec_envelope, cap_exec_result, cap_tool_result, CodePrefixDecoder};
 pub use exec::{
     exec_input_code_and_label, exec_label, exec_result_display, exec_tool_schema, parse_exec_input,
 };
-pub(crate) use model::assemble_system_prompt;
 pub(crate) use model::select_model_for_subagent;
 pub(crate) use model::{parse_model_query, NO_MODELS_HINT};
 pub use model::{rebuild_agent, select_model, select_model_with_level};

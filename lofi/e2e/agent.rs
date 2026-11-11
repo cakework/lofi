@@ -731,7 +731,9 @@ fn permission_deny_returns_an_error_without_running_the_command() {
     assert!(!fixture.workspace.join("denied.txt").exists());
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
-    assert!(requests[1].body.contains("denied"));
+    // The status word, not the denied.txt the command names: this must fail
+    // if the command ran.
+    assert!(requests[1].body.contains(r#"\"status\":\"blocked\""#));
 }
 
 #[test]

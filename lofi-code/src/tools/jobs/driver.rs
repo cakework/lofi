@@ -27,7 +27,7 @@ pub(super) async fn run_job(
     jobs: std::sync::Weak<Inner>,
     handle: Arc<JobHandle>,
     mut child: tokio::process::Child,
-    timeout_ms: Option<u64>,
+    deadline: Option<Instant>,
     generation: u64,
     master: Option<OwnedFd>,
     bash_env: crate::BashEnv,
@@ -54,7 +54,6 @@ pub(super) async fn run_job(
         None
     };
     let mut idle_tracker = IdleTracker::new();
-    let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
     let mut guard = PgrpKillGuard::new(child.id());
     // On any early return the guard SIGKILLs the process group; on a clean
     // reap it is disarmed.
@@ -342,5 +341,11 @@ fn format_notice(job: &Job) -> String {
         let _ = write!(s, " (signal {sig})");
     }
     let _ = write!(s, " — log: {}", job.log_path);
+    // A timed-out job is settled on the work it reached, not discarded: the
+    // group is killed, and what it printed before the deadline is in the log
+    // the parent was just given.
+    if job.state == State::TimedOut {
+        s.push_str("; killed at its deadline, and the log keeps what it reached");
+    }
     s
 }

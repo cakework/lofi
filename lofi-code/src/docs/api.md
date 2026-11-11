@@ -138,14 +138,23 @@ stderr are merged.
 
 **Parameters:**
 - `cmd` (string, required) — the shell command.
-- `timeoutMs` (number, optional) — timeout in milliseconds (default 120000).
+- `timeoutMs` (number, optional) — timeout in milliseconds (default 120000),
+  clamped to what the exec call has left: its own `timeoutMs` or the run's
+  remaining time, whichever is smaller. A command that would start with no
+  time left is reported as a timeout instead of running.
 - `steer` (boolean, optional) — set `false` to run the command without
   steering refusals (default `true`).
 
 **Returns:** `{ ok, output, code, command, directory, signal, duration_ms,
-status }`. `code` is the exit status (null on signal/timeout); `signal` is the
-Unix signal number (null unless killed by a signal); `duration_ms` is wall
-time; `status` is `"exited"`, `"signaled"`, or `"timeout"` after execution. A command blocked before execution returns `"denied"` or `"needs_confirmation"`, with `ok: false` and no exit code. Output is tail-truncated to the configured `[truncate] max_lines` and `max_bytes` values (defaults: 2000 lines and 50 KiB), keeping the end where errors land. When truncated, the full output is saved to a file under `lofi.tmpDir`; the notice names it so you can page through it with `lofi.read(path)`. The child env is
+status }`. `code` is the exit status (null when a signal, a deadline or a
+cancellation ended the command); `signal` is the Unix signal number (null
+unless killed by a signal); `duration_ms` is wall time. `status` follows
+the run's vocabulary: `"completed"`, `"failed"` (a signal death reports
+`failed`, with `signal` naming it), `"timed_out"` when the command's own
+bound or the run's remaining time ended it, or `"cancelled"` when the run
+was cancelled under it. A cut command keeps the output it reached, with
+`<timeout>` or `<cancelled>` marking where it was cut; a command that printed
+nothing reports the marker alone. A command held back before execution reports `"blocked"`, with `ok: false` and no exit code, and its output names the rule or the missing approval. Output is tail-truncated to the configured `[truncate] max_lines` and `max_bytes` values (defaults: 2000 lines and 50 KiB), keeping the end where errors land. When truncated, the full output is saved to a file under `lofi.tmpDir`; the notice names it so you can page through it with `lofi.read(path)`. The child env is
 stripped to a minimal baseline by default; env vars the user approved are
 present but their values are replaced with `[redacted]` in the output.
 
@@ -193,10 +202,12 @@ and `jobRead`.
   detection because silence is normal compute. When the output is unchanged
   for this long, the job becomes `idle` and queues one idle notice.
 - `timeoutMs` (number, optional) — kill deadline in milliseconds. There is
-  no default: background jobs are the long-running builds and test runs
-  that do not fit a synchronous tool call, so a job runs until it exits, is
-  killed, or the session ends. Pass `timeoutMs` to cap it; on timeout the
-  whole process group is killed and the job ends as `"timed_out"`.
+  no default of its own: background jobs are the long-running builds and test
+  runs that do not fit a synchronous tool call, so a job runs until it exits,
+  is killed, or the session ends. A job outlives the call that spawned it and
+  is bound by this timeout alone, so `exec({ timeoutMs: 30000 })` does not
+  kill a job it started. On timeout the whole process group is killed and the job
+  ends as `"timed_out"`.
 - `notify` (boolean, optional, default `true`) — master switch for the
   terminal, idle, and periodic notices. `false` silences the job entirely.
 - `notifyIntervalMs` (number, optional) — turn on periodic progress pings
@@ -205,6 +216,7 @@ and `jobRead`.
 
 **Returns:** `{ ok, id, state, command, directory, pid, timeoutMs,
 logPath, tty, cols, rows, idleMs }`. `state` starts as `"running"`.
+`timeoutMs` is the deadline the job runs under.
 `logPath` names the merged stdout/stderr log under `lofi.tmpDir`; it is a
 read root, so `lofi.read` on it also works. For a tty job the driver copies
 PTY output into this log. The log grows unbounded for the life of the job
@@ -216,9 +228,10 @@ reading it whole.
 Current state, timestamps, exit status, and limits for a job.
 
 **Returns:** `{ ok, id, state, command, directory, pid, exitCode, signal,
-durationMs, timeoutMs, logPath, notify, notifyIntervalMs, notifyChanged,
-tty, cols, rows, idle, idleMs, idleForMs }`. `state` is `"running"`,
-`"completed"`, `"failed"`, `"cancelled"`, or `"timed_out"`. `idle` is true
+durationMs, timeoutMs, logPath, notify, notifyIntervalMs,
+notifyChanged, tty, cols, rows, idle, idleMs, idleForMs }`. `state` is
+`"running"`, `"completed"`, `"failed"`, `"cancelled"`, or `"timed_out"`.
+`idle` is true
 once output has been unchanged for `idleMs`; `idleForMs` is how long it has
 been idle. Unknown ids return `{ ok: false, error }`.
 
@@ -312,7 +325,9 @@ Errors with `ok: false` when the key is unknown or the job is not a tty job.
 ## lofi.sleep(seconds)
 
 Wait inside the exec for `seconds` seconds (a number; fractions are fine). The
-wait observes run cancellation, so a cancelled turn leaves it at once. `seconds`
+wait observes run cancellation, so a cancelled turn leaves it at once, and it is
+bounded by the call's own clock: a sleep that would outlast the `exec` deadline
+throws when the budget runs out instead of holding the guest past it. `seconds`
 must be at most 86400 (one day): for a longer pause, schedule a wake-up with
 `notifyAt` and end the turn instead of holding the exec open. Do not sleep to
 wait for a background job: its completion notice arrives as a new user message
@@ -323,14 +338,17 @@ once the turn ends.
   at once.
 
 **Returns:** `{ ok }`. Throws when `seconds` is not a non-negative number
-within the cap, or when the run is cancelled mid-wait.
+within the cap, when the run is cancelled mid-wait, or when the call's time runs
+out first.
 
 ## lofi.notifyAt(at, message?)
 
 Queue a one-shot wake-up notice for the session. When `at` passes, the host
 delivers the notice as a notice prompt — the same path a finished background
 job's notice takes — so the agent wakes to it whether or not it is mid-turn.
-An `at` in the past fires on the next host poll.
+An `at` in the past fires on the next host poll. A wake-up is session-scoped,
+not call-scoped: it outlives the call that scheduled it, which has already
+returned `ok`.
 
 The session records its pending timers, so a resume after a restart re-arms
 them: one whose time passed while lofi was down fires once on the next poll.
@@ -353,7 +371,8 @@ within the limit.
 
 Like `notifyAt`, but re-armed: the first notice comes one `every` duration
 from now and each interval after it. A host that polls late gets one notice
-per elapsed window, never a burst of the missed ones.
+per elapsed window, never a burst of the missed ones. Each fire stands on its
+own, so the fires a session ends before are the ones dropped.
 
 **Parameters:**
 - `every` (string, required) — a duration like `5m`, `1h30m`, or `500ms`.
@@ -460,8 +479,16 @@ log reads, mechanical edits).
   history it reached, so `stopped` names the deadline that stopped it; a
   wrap-up that answers settles `completed`, and one that crosses the token
   budget settles `failed` with how to resume: by `id` when the run kept
-  work, or that a resume would start over. For work that may outlive one
-  call, start it with `lofi.subagentSpawn` and take the result with
+  work, or that a resume would start over. Commands and background jobs the
+  run starts are bounded by the timeout each call sets and by nothing else.
+  A foreground child cannot outlive the call that awaits it, so its own
+  `timeout_ms` is cut to what that call has left, and one that sets none takes
+  what is left; a child the call cut reports `requestedTimeoutMs` with the
+  value the caller set. A child cut by its caller's clock is cancelled where it
+  stands instead: that clock ends the call the child was awaited in, so
+  neither the wrap-up nor the child's spend reaches the caller, which reads
+  the spend with `lofi.subagentUsage`. For work that may outlive one call,
+  start it with `lofi.subagentSpawn` and take the result with
   `lofi.subagentWait`, whose wait timeout never cancels the run.
 - `idle_ms` (number, optional) — how long the run may go without an event
   before it is stopped, default 300_000; zero is rejected. Every text
@@ -479,8 +506,9 @@ log reads, mechanical edits).
   what it reached, and the run settles `completed` with that summary. It
   keeps `timed_out` only when that wrap-up fails, or `blocked` when a
   prompt was still open. Such a run reports `stopped: "idle" | "cap"`
-  (which deadline fired), and `rounds`, `elapsed_ms` and `last_tool`
-  describe the work before that wrap-up, not the summary turn.
+  (which deadline fired), and `rounds`, `elapsed_ms`, `cap_ms` when it had
+  a cap, and `last_tool` describe the work before that wrap-up, not the
+  summary turn.
 - `output_limit` (number, optional) — cap on the returned result bytes.
 - `token_budget` (number, optional) — total token budget, counting every
   token category the provider reports (input, output, cache). The run is
@@ -510,8 +538,10 @@ the provider reported them; `rounds` counts the model rounds the run
 finished, `elapsed_ms` its wall time, and `last_tool` the tool it called
 last, so a stopped run says where it stopped; `stopped` names the deadline
 (`idle` or `cap`) for a run a deadline stopped, including one that
-answered its wrap-up and settled `completed`. A stopped run keeps the
-history it reached,
+answered its wrap-up and settled `completed`. A run whose prompt is still
+open when the cap lands settles `blocked` with `stopped` saying `cap`: the
+answer was still owed, so the report names the command it waited on instead
+of summarizing work it never did. A stopped run keeps the history it reached,
 so a resume continues that work instead of rerunning it, and its `error`
 says so with the `id` to pass back; a run that kept nothing says that
 instead, so the hint never promises work that does not exist. A tool call
@@ -530,7 +560,9 @@ fails while 64 runs are still active.
 
 Start a background subagent and return immediately. The run survives the
 end of this exec; unlike `lofi.subagent`, cancelling the exec does not
-cancel the run. Take the result later with `lofi.subagentWait`.
+cancel the run, and neither does the calling call's own `timeoutMs`. Take
+the result later with `lofi.subagentWait`. Only `timeout_ms` and
+`idle_ms` bound it; pass neither and it runs until it settles.
 
 **Parameters:** same as `lofi.subagent`, except `output_limit`, which
 only a foreground call takes. `id` resumes that run in the background, so
@@ -551,13 +583,16 @@ Report one subagent run's state.
 **Parameters:**
 - `id` (string, required) — the run id from `subagentSpawn` or `subagent`.
 
-**Returns:** `{ ok, id, status, session_id?, usage?, error?, rounds?, elapsed_ms?, last_tool?, stopped? }`. `status` is
+**Returns:** `{ ok, id, status, session_id?, usage?, error?, rounds?, elapsed_ms?, last_tool?, stopped?, cap_ms?, requestedTimeoutMs? }`. `status` is
 `running`, `completed`, `failed`, `cancelled`, `timed_out`, or
 `blocked`; `error` is set for every status but `completed` and
 `running`, and a run that settled in this
 process carries `rounds`, `elapsed_ms` and `last_tool` (a rehydrated entry
 keeps only the settle marker). `stopped` names the deadline that stopped
-the run, and survives a restart. Unknown ids resolve with `ok: false`.
+the run (`idle` or `cap`), and survives a restart. `cap_ms` is the
+`timeout_ms` the run was given, and `requestedTimeoutMs` the value the caller
+set when the call that awaited it cut it shorter. Unknown ids resolve
+with `ok: false`.
 
 ## lofi.subagentList({ state?, limit?, cursor? })
 
@@ -612,11 +647,18 @@ never cancels the run: the run keeps going and can be awaited again.
 
 **Parameters:**
 - `id` (string, required) — the run id.
-- `timeout_ms` (number, optional) — wait limit, default 60_000. Keep it
-  below the exec's own timeout.
+- `timeout_ms` (number, optional) — wait limit. Without one the wait ends
+  when the run settles: at its idle deadline, at its cap, or when it is
+  killed. A wait that expired at a constant of its own would report a run
+  that is still working as if it had timed out. A run with no cap, inside a
+  call that reports nothing until it ends, has no deadline running, so such
+  a wait can last as long as that call: pass `timeout_ms` to poll instead
+  of blocking. A cap keeps counting through that call, so a capped run still
+  ends it.
 
-**Returns:** the same shape as `lofi.subagent` once the run is terminal;
-`{ ok, id, status: "running" }` when the wait timed out.
+**Returns:** the same shape as `lofi.subagent` once the run is terminal, and
+`{ ok, id, status: "running" }` when the wait hit the `timeout_ms` it was
+given; the run keeps going and can be awaited again.
 
 ## lofi.subagentRead({ id, cursor?, limit?, types? })
 
@@ -849,6 +891,14 @@ Await every foreground `lofi` call. The sandbox drains omitted promises
 before it exits and reports rejected calls or results with `ok: false` in the
 parent result's `errors` field. Such failures make the parent result fail.
 Use `jobSpawn` when work must continue in the background.
+
+The parent result names its outcome in `status`, using the vocabulary a run
+and a job already use: `"completed"`, `"failed"` (the guest threw or a
+call it left pending rejected), `"timed_out"` (its `timeoutMs`, its CPU
+allowance, or the run's remaining time ended it), or `"cancelled"` (the run
+was cancelled under it). A failing result keeps `errors` and the spend it
+reached; the logs it printed come back unless the guest threw, whose error
+carries the message and no log.
 
 ## Compacted sessions
 

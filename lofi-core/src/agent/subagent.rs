@@ -64,9 +64,6 @@ const EVENT_TEXT_CAP: usize = 8 * 1024;
 /// Cap on the outcome line quoted in a terminal notice: the notice becomes
 /// a parent prompt, so it stays short.
 const NOTICE_DETAIL_CAP: usize = 200;
-/// Default `subagentWait` limit: below the two-minute guest exec timeout so
-/// a default wait reports `running` instead of dying with the exec.
-const DEFAULT_WAIT_MS: u64 = 60_000;
 /// Grace period between a kill's cooperative cancel and the task abort
 /// backstop.
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -1412,6 +1409,8 @@ fn status_op(registry: &SubagentRegistry, args: &Value) -> Value {
             "elapsed_ms",
             "last_tool",
             "stopped",
+            "cap_ms",
+            "requestedTimeoutMs",
         ] {
             if let Some(value) = outcome.get(key) {
                 out[key] = value.clone();
@@ -1690,8 +1689,13 @@ async fn wait_op(registry: &SubagentRegistry, args: Value) -> Value {
         Ok(id) => id,
         Err(out) => return out,
     };
+    // Without `timeout_ms` there is no deadline of the wait's own: it ends
+    // when the run settles, because a wait that expired at a constant would
+    // report a run still working as if the wait had failed. A caller that
+    // runs the wait inside a capped run is clamped to what that run has left.
+    // Pass `timeout_ms` to poll instead.
     let timeout = match u64_arg(&args, "timeout_ms") {
-        Ok(ms) => Duration::from_millis(ms.unwrap_or(DEFAULT_WAIT_MS)),
+        Ok(ms) => ms.map(Duration::from_millis),
         Err(e) => return arg_error_json(&e),
     };
     let mut rx = {
@@ -1701,8 +1705,12 @@ async fn wait_op(registry: &SubagentRegistry, args: Value) -> Value {
             None => return unknown_id(&id),
         }
     };
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
+    let mut deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        match timeout {
+            Some(timeout) => Box::pin(tokio::time::sleep(timeout)),
+            // Never resolves: the loop below then ends only on the run.
+            None => Box::pin(std::future::pending()),
+        };
     loop {
         if rx.borrow().is_terminal() {
             return registry.outcome_of(&id).unwrap_or_else(|| unknown_id(&id));
@@ -1900,6 +1908,9 @@ async fn start(
     // stalled run long before the cap.
     let limits = Deadlines::from_args(args)?;
     let output_limit = u64_arg(args, "output_limit")?.map_or(DEFAULT_OUTPUT_LIMIT, |v| v as usize);
+    // The allowance the caller named before the parent's clock cut it, kept so
+    // the settled run can report both numbers.
+    let requested_ms = u64_arg(args, "requested_timeout_ms")?;
     let token_budget = u64_arg(args, "token_budget")?;
     if token_budget == Some(0) {
         return Err(Error::Tool("token_budget must be positive when set".into()).into());
@@ -1946,6 +1957,7 @@ async fn start(
                 prompt,
                 output_limit,
                 token_budget,
+                requested_ms,
                 generation,
                 task_session_id,
             )
@@ -1979,6 +1991,7 @@ async fn run_task(
     prompt: String,
     output_limit: usize,
     token_budget: Option<u64>,
+    requested_ms: Option<u64>,
     generation: u64,
     session_id: Option<String>,
 ) {
@@ -2022,6 +2035,13 @@ async fn run_task(
     // holds KBs regardless of the caller's output_limit. The full answer
     // stays in the transcript.
     let mut retained = outcome;
+    // A capped run reports what it asked for beside what it got, so a
+    // background run read back later still says the parent cut it short.
+    if let Some(asked) = requested_ms {
+        if let Some(progress) = retained.progress.as_mut() {
+            progress["requestedTimeoutMs"] = json!(asked);
+        }
+    }
     if let Some(result) = retained.result.as_mut() {
         if result.len() > DEFAULT_OUTPUT_LIMIT {
             retained.full_bytes = Some(retained.full_bytes.unwrap_or(result.len()));
@@ -2474,11 +2494,14 @@ fn settle_entry(
         // Restamp at settle: the stamp orders eviction, and a long run that
         // finishes last must not become the oldest victim.
         entry.used = registry.stamp();
+        // A settled run is no owner any more, whatever ended it: the
+        // reminders it armed would otherwise keep waking this session for a
+        // run that is not running, the harm a kill already prevents.
+        let tools = entry.backend.tool_executor();
+        let _ = tools.timers().cancel_owner(Some(id));
         // Idle entries must not hold a sandbox thread: it restarts lazily on
         // the first exec of the next resume.
-        entry.backend = entry
-            .backend
-            .with_tool_executor(entry.backend.tool_executor().reset_exec_worker());
+        entry.backend = entry.backend.with_tool_executor(tools.reset_exec_worker());
         true
     } else {
         false
@@ -2515,11 +2538,16 @@ async fn run_under_watchdog(
         cancel: stopping.clone(),
         armed: true,
     };
+    // The bounds are not announced as a notice: a notice is recorded as a turn
+    // prompt, so it would sit in the transcript and replay stale on a resume.
+    // The watchdog enforces them, and the settle report names the one that
+    // fired.
+    let request = TurnRequest::prompt(prompt, PromptKind::Task);
     let turn = backend.run_turn(
         messages,
         // The task is parent-written, so it must not read as user
         // authorization in the child's auto-mode context.
-        TurnRequest::prompt(prompt, PromptKind::Task),
+        request,
         tx,
         cursor,
         RunControls {
@@ -2546,6 +2574,14 @@ async fn run_under_watchdog(
                         .unwrap_or(Ok(TurnOutcome::Cancelled));
                 }
                 if let Some(reason) = progress.expired(limits) {
+                    // An open prompt settles as `blocked` only while it is
+                    // still pending when the settle reads it, so give the ask
+                    // a tick to be answered or to time out first: the same
+                    // stop then reads the same way whichever timer is polled
+                    // first.
+                    if matches!(reason, Expiry::Cap(_)) && progress.confirms.pending() > 0 {
+                        tokio::time::sleep(WATCHDOG_TICK).await;
+                    }
                     // Read the open prompt now: dropping the turn closes it,
                     // and a blocked settle names what it waited on.
                     let waiting = (progress.confirms.pending() > 0)
@@ -2596,6 +2632,7 @@ async fn run_turn_with_timeout(
     generation: u64,
 ) -> RunOutcome {
     let progress = Arc::new(RunProgress::new(
+        run_started(),
         backend.tool_executor().confirm_watch.clone(),
         backend.tool_executor().activity.clone(),
     ));
@@ -2629,7 +2666,6 @@ async fn run_turn_with_timeout(
     // stop the drain explicitly; it flushes the buffer before exiting.
     let _ = stop_tx.send(());
     let _ = drain.await;
-
     // A stopped run is wrapped up: one short turn asks what it reached, so
     // the parent reads a summary. A run stopped while the user owed it an
     // answer never reaches its model.
@@ -2637,8 +2673,13 @@ async fn run_turn_with_timeout(
         Some((Expiry::Cap(_), Some(command))) => Some(command.clone()),
         _ => None,
     };
-    // The progress report describes the run, not the summary that follows it.
-    let reported = progress.json();
+    // The progress report describes the run, not the summary that follows it,
+    // and states the budget it ran under: the elapsed time in it is what the
+    // cap was spent on.
+    let mut reported = progress.json();
+    if let Some(cap) = limits.cap {
+        reported["cap_ms"] = json!(u64::try_from(cap.as_millis()).unwrap_or(u64::MAX));
+    }
     // A turn dropped mid-call (a deadline, or a kill that outran its grace)
     // leaves a tool call no provider will accept, so the history is repaired
     // before it settles. A stopped run keeps what it reached either way, so a
@@ -2683,9 +2724,7 @@ async fn run_turn_with_timeout(
         (Some(_), Some((spent, budget))) => budget_failure(spent, budget, &id, kept),
         (Some(_), None) if stopped_by_caller => (Status::Cancelled, Some("cancelled".to_string())),
         (Some(_), None) if wrapped => (Status::Completed, None),
-        (Some((reason, _)), None) => {
-            deadline_status(*reason, blocked.as_deref(), &limits, &id, kept)
-        }
+        (Some((reason, _)), None) => deadline_status(*reason, blocked.as_deref(), &id, kept),
     };
     let (result, full_bytes) = if status == Status::Completed {
         last_text(&messages[base_len..], output_limit)
@@ -2700,7 +2739,7 @@ async fn run_turn_with_timeout(
     if status == Status::Completed && result.is_none() {
         match &expired {
             Some((reason, _)) => {
-                (status, error) = deadline_status(*reason, blocked.as_deref(), &limits, &id, kept);
+                (status, error) = deadline_status(*reason, blocked.as_deref(), &id, kept);
             }
             None => {
                 (status, error) = (
@@ -2790,6 +2829,9 @@ async fn wrap_up(
         },
     );
     tokio::pin!(turn);
+    // The summary is deliberately outside the run's own bound, so it runs
+    // under a budget of its own: a cap the caller set still bounds it, so a
+    // tight caller never waits much past the deadline it named.
     let budget = limits
         .cap
         .map_or(WRAP_UP_TIMEOUT, |cap| WRAP_UP_TIMEOUT.min(cap));
@@ -2918,7 +2960,6 @@ fn budget_failure(spent: u64, budget: u64, id: &str, kept: bool) -> (Status, Opt
 fn deadline_status(
     expiry: Expiry,
     blocked: Option<&str>,
-    limits: &Deadlines,
     id: &str,
     kept: bool,
 ) -> (Status, Option<String>) {
@@ -2931,10 +2972,10 @@ fn deadline_status(
                 kept,
             )),
         ),
-        (Expiry::Idle, None) => (
+        (Expiry::Idle(idle), None) => (
             Status::TimedOut,
             Some(resume_hint(
-                &format!("idle for {} ms", limits.idle.as_millis()),
+                &format!("idle for {} ms", idle.as_millis()),
                 id,
                 kept,
             )),
@@ -2988,23 +3029,30 @@ impl Deadlines {
     }
 }
 
-/// Which deadline stopped a run, carrying the cap that fired so the settle
-/// report names it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Which bound of a run passed, carrying the value that fired so a settle
+/// report can name it without reaching back into the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expiry {
-    Idle,
+    /// The cap.
     Cap(Duration),
+    /// The idle allowance.
+    Idle(Duration),
 }
 
 impl Expiry {
-    /// The deadline that fired, so a settled run says a deadline stopped it
-    /// even when it answered the summary request.
+    /// The word a settle report uses for it.
     fn as_str(self) -> &'static str {
         match self {
-            Expiry::Idle => "idle",
-            Expiry::Cap(_) => "cap",
+            Self::Cap(_) => "cap",
+            Self::Idle(_) => "idle",
         }
     }
+}
+
+/// The instant a run began, so the watchdog cannot grant a task that is
+/// scheduled late a fresh allowance.
+fn run_started() -> std::time::Instant {
+    std::time::Instant::now()
 }
 
 /// How long the watchdog sleeps between checks. Small enough that a short
@@ -3032,6 +3080,8 @@ struct RunProgress {
     /// Prompts this child is waiting on: the idle clock pauses while any is
     /// open, because the child cannot make progress until the user answers.
     confirms: Arc<super::tool_executor::ConfirmWatch>,
+    /// Whether the turn loop reported that the clock, not the model, ended a
+    /// turn: the one stop the child's own events can name.
     /// Calls this child is running: the idle clock pauses while any runs,
     /// because a call reports nothing until it ends.
     activity: Arc<super::tool_executor::ActivityWatch>,
@@ -3039,11 +3089,12 @@ struct RunProgress {
 
 impl RunProgress {
     fn new(
+        started: std::time::Instant,
         confirms: Arc<super::tool_executor::ConfirmWatch>,
         activity: Arc<super::tool_executor::ActivityWatch>,
     ) -> Self {
         Self {
-            started: std::time::Instant::now(),
+            started,
             last_event: AtomicU64::new(0),
             rounds: AtomicU64::new(0),
             waited_at_event: AtomicU64::new(confirms.waited().as_millis() as u64),
@@ -3073,16 +3124,21 @@ impl RunProgress {
         }
     }
 
+    /// The hard cap, once it has passed: the one deadline a run cannot work
+    /// through.
+    fn cap_expiry(&self, limits: &Deadlines) -> Option<Expiry> {
+        let cap = limits.cap?;
+        (self.started.elapsed() >= cap).then_some(Expiry::Cap(cap))
+    }
+
     /// The deadline that has passed, if any. A run waiting on the user, or
     /// busy inside a tool call that reports nothing until it ends, is
     /// working: only the hard cap stops it.
     fn expired(&self, limits: &Deadlines) -> Option<Expiry> {
-        let elapsed = self.started.elapsed();
-        if let Some(cap) = limits.cap {
-            if elapsed >= cap {
-                return Some(Expiry::Cap(cap));
-            }
+        if let Some(cap) = self.cap_expiry(limits) {
+            return Some(cap);
         }
+        let elapsed = self.started.elapsed();
         let (busy, free) = self.activity.idle_mark();
         if self.confirms.pending() > 0 || busy > 0 {
             return None;
@@ -3102,7 +3158,7 @@ impl RunProgress {
             Some(free) => idle.min(free),
             None => idle,
         };
-        idle.ge(&limits.idle).then_some(Expiry::Idle)
+        idle.ge(&limits.idle).then_some(Expiry::Idle(limits.idle))
     }
 
     /// Where the run got to, as the settle report and the notice name it.
@@ -4176,6 +4232,7 @@ mod deadlines {
 
     fn progress() -> RunProgress {
         RunProgress::new(
+            std::time::Instant::now(),
             Arc::new(super::super::tool_executor::ConfirmWatch::default()),
             Arc::new(super::super::tool_executor::ActivityWatch::default()),
         )
@@ -4224,6 +4281,30 @@ mod deadlines {
         assert_eq!(
             progress.expired(&capped),
             Some(Expiry::Cap(Duration::from_hours(2)))
+        );
+    }
+
+    #[test]
+    fn run_progress_counts_from_the_instant_it_is_given() {
+        let limits = Deadlines {
+            idle: Duration::from_hours(1),
+            cap: Some(Duration::from_secs(30)),
+        };
+        // Armed a minute ago, though this task only started now: the cap is
+        // spent, because the run began when its clock did.
+        let armed = std::time::Instant::now()
+            .checked_sub(Duration::from_mins(1))
+            .unwrap_or_else(std::time::Instant::now);
+
+        let progress = RunProgress::new(
+            armed,
+            Arc::new(super::super::tool_executor::ConfirmWatch::default()),
+            Arc::new(super::super::tool_executor::ActivityWatch::default()),
+        );
+
+        assert_eq!(
+            progress.expired(&limits),
+            Some(Expiry::Cap(Duration::from_secs(30)))
         );
     }
 

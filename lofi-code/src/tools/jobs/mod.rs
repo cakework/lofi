@@ -104,7 +104,8 @@ struct Job {
     signal: Option<i32>,
     log_path: String,
     /// Kill deadline; `None` means the job runs until it exits, is killed,
-    /// or the session ends.
+    /// or the session ends. A job outlives the call that spawned it, so this
+    /// is the caller's own timeout and nothing cuts it.
     timeout_ms: Option<u64>,
     notify: NotifyOpts,
     /// Whether the child runs on a pseudo-terminal.
@@ -156,7 +157,7 @@ impl Job {
             .unwrap_or_else(Instant::now)
             .duration_since(self.started)
             .as_millis() as u64;
-        json!({
+        let out = json!({
             "ok": true,
             "id": short_id(self.id),
             "state": self.state.as_str(),
@@ -180,7 +181,8 @@ impl Job {
                 self.last_output_at
                     .map_or(0, |t| t.elapsed().as_millis() as u64)
             }),
-        })
+        });
+        out
     }
 }
 

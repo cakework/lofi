@@ -315,6 +315,10 @@ pub(crate) struct App {
     /// `/paths` allowed-paths manager, reading and editing through the
     /// session's paths handle.
     paths_picker: Option<PathsPickerState>,
+    /// The session's tool executor, cloned from the agent at startup. `/new`
+    /// arms its budget again, so a new conversation is not stuck on a spent
+    /// one.
+    executor: Option<lofi_core::agent::ToolExecutor>,
     /// Allowed-paths view shared with the agent, wired when the session
     /// starts.
     paths: Option<lofi_core::paths::PathsHandle>,

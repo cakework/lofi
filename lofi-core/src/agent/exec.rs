@@ -26,6 +26,102 @@ pub(crate) fn cap_exec_result(content: &str) -> String {
     cap_tool_result_to(content, MAX_EXEC_RESULT_BYTES)
 }
 
+/// Serialize an exec envelope inside the exec limit by cutting its payload
+/// down. A raw cut at the limit severs the JSON and loses every key after the
+/// cut, `status` and `subagents` among them.
+///
+/// Every text field can outgrow the limit once escaped, the guest's own return
+/// value and its object keys included, so the longest strings in the payload
+/// are what get halved. `ok`, `status` and `subagents` say what happened and
+/// are never cut. The envelope says `truncated` when anything was.
+pub(crate) fn cap_exec_envelope(output: serde_json::Map<String, serde_json::Value>) -> String {
+    /// The fields a cut may take room from.
+    const PAYLOAD: [&str; 3] = ["logs", "errors", "value"];
+
+    /// Longest string anywhere under `value`, keys included.
+    fn longest(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::String(text) => text.len(),
+            serde_json::Value::Array(items) => items.iter().map(longest).max().unwrap_or(0),
+            serde_json::Value::Object(map) => map
+                .keys()
+                .map(String::len)
+                .chain(map.values().map(longest))
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// Halve every string of at least `band` bytes, keys included, and report
+    /// whether one was cut. Cutting the whole band is what keeps the trimming
+    /// linear-ish: thousands of equal escaped strings would otherwise give up
+    /// one half each, one full serialization per string.
+    fn halve_band(value: &mut serde_json::Value, band: usize) -> bool {
+        match value {
+            serde_json::Value::String(text) if text.len() >= band => {
+                text.truncate(text.floor_char_boundary(text.len() / 2));
+                true
+            }
+            serde_json::Value::Array(items) => {
+                let mut cut = false;
+                for item in items {
+                    cut |= halve_band(item, band);
+                }
+                cut
+            }
+            serde_json::Value::Object(map) => {
+                let long: Vec<String> = map
+                    .keys()
+                    .filter(|key| key.len() >= band)
+                    .cloned()
+                    .collect();
+                let mut cut = !long.is_empty();
+                for key in long {
+                    let mut shortened = key.clone();
+                    shortened.truncate(shortened.floor_char_boundary(key.len() / 2));
+                    let held = map.remove(&key).unwrap_or(serde_json::Value::Null);
+                    map.insert(shortened, held);
+                }
+                for item in map.values_mut() {
+                    cut |= halve_band(item, band);
+                }
+                cut
+            }
+            _ => false,
+        }
+    }
+
+    let mut body = serde_json::Value::Object(output);
+    loop {
+        let text = serde_json::to_string(&body).unwrap_or_else(|_| "{\"ok\":true}".to_string());
+        if text.len() <= MAX_EXEC_RESULT_BYTES {
+            return text;
+        }
+        let serde_json::Value::Object(map) = &mut body else {
+            return text;
+        };
+        map.insert("truncated".into(), serde_json::Value::Bool(true));
+        let mut cut = false;
+        for field in PAYLOAD {
+            if let Some(payload) = map.get_mut(field) {
+                let target = longest(payload);
+                if target > 0 {
+                    cut |= halve_band(payload, (target / 2).max(1));
+                }
+            }
+        }
+        if !cut {
+            // Nothing string-shaped is left to trim: the payload goes whole
+            // rather than the status giving up its room for it.
+            let dropped = PAYLOAD.iter().filter(|field| map.remove(**field).is_some());
+            if dropped.count() == 0 {
+                return text;
+            }
+        }
+    }
+}
+
 #[must_use]
 pub fn exec_tool_schema() -> ToolSchema {
     ToolSchema {
@@ -248,6 +344,11 @@ pub fn parse_exec_input(input: &serde_json::Value) -> (String, HashMap<String, S
 }
 
 use lofi_code::{DESCRIPTION_CUT_MARKER, MAX_DESCRIPTION_CHARS};
+
+/// The wall-clock budget an exec call asked for, if it named one.
+pub(crate) fn exec_timeout_ms(input: &serde_json::Value) -> Option<u64> {
+    input.get("timeoutMs").and_then(serde_json::Value::as_u64)
+}
 
 /// Trim, then keep the head with a cut marker: a description states its
 /// purpose up front.
