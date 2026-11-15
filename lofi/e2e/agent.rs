@@ -3,7 +3,8 @@ use crate::support::{
     eof_cut_responses_response, event_types, google_text_response, google_thinking_usage_response,
     google_tool_response, lost_tool_response, responses_response, responses_tool_response,
     text_response, text_response_with_usage, thinking_response, tool_response, transcript_text,
-    wait_for_process_exit, Fixture, MockResponse, MockServer, ProcessGuard, WAIT,
+    wait_for_pid_file, wait_for_process_exit, Fixture, MockResponse, MockServer, ProcessGuard,
+    WAIT,
 };
 
 #[test]
@@ -748,21 +749,7 @@ fn cancelling_a_running_tool_kills_its_process_and_records_cancellation() {
     tui.submit("cancel tool prompt marker");
     tui.wait_for("Permission Required", WAIT);
     tui.send(b"a");
-    let pid_path = fixture.workspace.join("foreground.pid");
-    let start = std::time::Instant::now();
-    while !pid_path.exists() && start.elapsed() < WAIT {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        pid_path.exists(),
-        "foreground command did not start; terminal output: {}",
-        tui.output()
-    );
-    let pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
+    let pid = wait_for_pid_file(&fixture.workspace.join("foreground.pid"));
     let mut process = ProcessGuard::new(pid);
     tui.send(b"\x03");
     tui.wait_for("Cancelled", WAIT);

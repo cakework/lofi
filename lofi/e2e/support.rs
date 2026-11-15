@@ -2498,6 +2498,26 @@ impl Drop for ProcessGuard {
     }
 }
 
+/// Read the pid a shell redirect wrote. The redirect creates the file before
+/// the command writes into it, so waiting for existence alone can read an empty
+/// file under load.
+pub fn wait_for_pid_file(path: &Path) -> i32 {
+    let start = Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                return pid;
+            }
+        }
+        assert!(
+            start.elapsed() < WAIT,
+            "pid file {} never held a pid",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub fn wait_for_process_exit(pid: i32) {
     let start = Instant::now();
     while start.elapsed() < WAIT {

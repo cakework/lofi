@@ -1,6 +1,6 @@
 use crate::support::{
     process_is_alive, text_response, text_response_with_usage, tool_response, transcript_text,
-    wait_for_process_exit, Fixture, MockServer, ProcessGuard, WAIT,
+    wait_for_pid_file, wait_for_process_exit, Fixture, MockServer, ProcessGuard, WAIT,
 };
 
 #[test]
@@ -602,11 +602,7 @@ fn tui_shutdown_kills_a_live_background_job_process_group() {
     tui.wait_for_scrollback("Permission Required", WAIT);
     tui.send(b"a");
     tui.wait_for_scrollback("shutdown job answer", WAIT);
-    let pid: i32 = std::fs::read_to_string(fixture.workspace.join("shutdown-job.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = wait_for_pid_file(&fixture.workspace.join("shutdown-job.pid"));
     let mut job = ProcessGuard::new(pid);
     assert!(process_is_alive(pid));
 

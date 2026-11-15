@@ -11,8 +11,8 @@ use crate::support::{
     parallel_responses_tool_response, parallel_tool_response, process_is_alive, responses_response,
     spawned_pid, stop_text_response, text_response, text_response_with_usage, thinking_response,
     tool_response, tool_response_with_usage, transcript_text, truncated_responses_response,
-    truncated_text_response, truncated_tool_response, wait_for_process_exit, Fixture, MockResponse,
-    MockServer, ProcessGuard, WAIT,
+    truncated_text_response, truncated_tool_response, wait_for_pid_file, wait_for_process_exit,
+    Fixture, MockResponse, MockServer, ProcessGuard, WAIT,
 };
 
 /// RSS settles slower than screen state: under a fully parallel test run
@@ -1058,16 +1058,7 @@ fn cancelled_tool_turn_replays_as_a_closed_cycle_after_restart() {
     first.submit("cancelled lifecycle prompt");
     first.wait_for("Permission Required", WAIT);
     first.send(b"a");
-    let pid_path = fixture.workspace.join("cancelled-lifecycle.pid");
-    let started = std::time::Instant::now();
-    while !pid_path.exists() && started.elapsed() < WAIT {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
+    let pid = wait_for_pid_file(&fixture.workspace.join("cancelled-lifecycle.pid"));
     let mut process = ProcessGuard::new(pid);
     first.send(b"\x03");
     first.wait_for("Cancelled", WAIT);
@@ -1124,26 +1115,9 @@ fn cancelled_parallel_tool_calls_replay_as_closed_cycles_after_restart() {
     first.submit("cancelled parallel prompt");
     first.wait_for("Permission Required", WAIT);
     first.send(b"a");
-    let mut guards = Vec::new();
-    for name in ["cancelled-parallel-b.pid"] {
-        let path = fixture.workspace.join(name);
-        let started = std::time::Instant::now();
-        while !path.exists() && started.elapsed() < WAIT {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            path.exists(),
-            "tool process did not create {name}; terminal output:
-{}",
-            first.output()
-        );
-        let pid = std::fs::read_to_string(&path)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
-        guards.push(ProcessGuard::new(pid));
-    }
+    let mut guards = vec![ProcessGuard::new(wait_for_pid_file(
+        &fixture.workspace.join("cancelled-parallel-b.pid"),
+    ))];
     first.send(b"\x03");
     first.wait_for("Cancelled", WAIT);
     for guard in &mut guards {
@@ -1212,20 +1186,9 @@ fn cancelled_parallel_responses_calls_replay_as_closed_cycles_after_restart() {
     first.submit("cancelled responses prompt");
     first.wait_for("Permission Required", WAIT);
     first.send(b"a");
-    let mut guards = Vec::new();
-    for name in ["cancelled-responses-b.pid"] {
-        let path = fixture.workspace.join(name);
-        let started = std::time::Instant::now();
-        while !path.exists() && started.elapsed() < WAIT {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let pid = std::fs::read_to_string(&path)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
-        guards.push(ProcessGuard::new(pid));
-    }
+    let mut guards = vec![ProcessGuard::new(wait_for_pid_file(
+        &fixture.workspace.join("cancelled-responses-b.pid"),
+    ))];
     first.send(b"\x03");
     first.wait_for("Cancelled", WAIT);
     for guard in &mut guards {
@@ -1829,11 +1792,7 @@ fn resume_picker_kills_current_session_jobs_and_drops_their_notices() {
     tui.send(b"a");
     tui.wait_for("resume current job started", WAIT);
     fixture.wait_for_event_count("turn_end", 2);
-    let pid: i32 = std::fs::read_to_string(fixture.workspace.join("resume-job.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = wait_for_pid_file(&fixture.workspace.join("resume-job.pid"));
     let mut job = ProcessGuard::new(pid);
     assert!(process_is_alive(pid));
 
@@ -2048,22 +2007,7 @@ mode = "prefix"
     tui.submit("start a background job and then run a long foreground command");
     tui.wait_for("Permission Required", WAIT);
     tui.send(b"a");
-    let pid_path = fixture.workspace.join("foreground-tool.pid");
-    let started = std::time::Instant::now();
-    while !pid_path.exists() && started.elapsed() < WAIT {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        pid_path.exists(),
-        "foreground tool did not start; requests: {}; output: {:?}",
-        server.request_count(),
-        tui.output()
-    );
-    let pid: i32 = std::fs::read_to_string(pid_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = wait_for_pid_file(&fixture.workspace.join("foreground-tool.pid"));
     let mut foreground = ProcessGuard::new(pid);
     assert!(process_is_alive(pid));
 

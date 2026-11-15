@@ -3,8 +3,8 @@ use serde_json::Value;
 
 use crate::support::{
     delayed_text_response, delayed_tool_response, process_is_alive, spawned_pid, text_response,
-    thinking_tool_response, tool_response, transcript_text, wait_for_process_exit, Fixture,
-    MockServer, ProcessGuard, Tui, WAIT,
+    thinking_tool_response, tool_response, transcript_text, wait_for_pid_file,
+    wait_for_process_exit, Fixture, MockServer, ProcessGuard, Tui, WAIT,
 };
 
 fn enter_navigation(tui: &mut Tui) {
@@ -1429,16 +1429,7 @@ fn ctrl_c_cancels_user_shell_and_kills_its_process_group() {
     let mut tui = fixture.spawn(&[]);
 
     tui.submit("!echo $$ > user-shell.pid; exec sleep 60");
-    let pid_path = fixture.workspace.join("user-shell.pid");
-    let started = std::time::Instant::now();
-    while !pid_path.exists() && started.elapsed() < WAIT {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let pid: i32 = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = wait_for_pid_file(&fixture.workspace.join("user-shell.pid"));
     let mut guard = ProcessGuard::new(pid);
     assert!(process_is_alive(pid));
 
@@ -1480,16 +1471,7 @@ fn user_shell_records_exit_signal_and_large_output_without_blocking_shutdown() {
     assert!(!requests[0].body.contains("large-shell-0000"));
 
     tui.submit("!echo $$ > shutdown-shell.pid; printf shutdown-stream-start; sleep 60");
-    let pid_path = fixture.workspace.join("shutdown-shell.pid");
-    let started = std::time::Instant::now();
-    while !pid_path.exists() && started.elapsed() < WAIT {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let pid: i32 = std::fs::read_to_string(pid_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = wait_for_pid_file(&fixture.workspace.join("shutdown-shell.pid"));
     let mut guard = ProcessGuard::new(pid);
     tui.send(b"\x04");
     tui.wait_exit();
