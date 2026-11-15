@@ -707,7 +707,10 @@ pub fn compaction_status_from_index(
 }
 
 /// Job ids with a `JobStarted` marker but no matching `JobFinished` marker
-/// on the visible lineage.
+/// on the visible lineage. Test-only: it is the lineage-only answer the
+/// finished-anywhere scan exists to replace, so handing it to a caller would
+/// bring back the stale job it drops.
+#[cfg(test)]
 #[must_use]
 pub fn outstanding_job_ids(events: &[SessionEvent]) -> Vec<u64> {
     let mut lifecycle = Lifecycle::default();
@@ -727,16 +730,18 @@ pub struct OutstandingJob {
     pub cmd: Option<String>,
 }
 
-/// Like [`outstanding_job_ids`] but reads lifecycle markers directly from a
-/// cursor over an indexed lineage; `index` must be lineage-scoped (see
-/// `SessionCursor::snapshot`). Only `IndexKind::JobLifecycle` entries are
-/// touched.
+/// The jobs a resumed transcript opened and never closed on the selected
+/// lineage. An id whose `JobFinished` sits on any branch is dropped too.
+/// Reads lifecycle markers directly from a cursor over an indexed lineage;
+/// `index` must be lineage-scoped (see `SessionCursor::snapshot`). Only
+/// `IndexKind::JobLifecycle` entries are touched.
 ///
-/// A job that released after a lineage switch keeps its `JobStarted` on the
-/// selected lineage and its `JobFinished` on the abandoned one, so marker
-/// absence alone would report a process that is long gone as stale. The
-/// finished-anywhere scan costs one more pass over the lifecycle entries and
-/// only runs when the lineage names a start with no release.
+/// A job that released before a rollback to a point between its start and its
+/// release keeps `JobStarted` on the selected lineage while `JobFinished`
+/// sits on the pruned branch, so marker absence alone would report a process
+/// that is long gone as stale. The finished-anywhere scan re-indexes the whole
+/// transcript and parses each lifecycle event, so it only runs when the lineage
+/// names a start with no release.
 /// # Errors
 /// Propagates cursor I/O failures.
 pub fn outstanding_jobs_at(
@@ -756,7 +761,9 @@ pub fn outstanding_jobs_at(
 }
 
 /// The pending wake-up set a resume must re-arm: the last `TimerState` on
-/// the visible lineage, or empty when the session recorded none.
+/// the visible lineage, or empty when the session recorded none. Test-only;
+/// `timer_records_at` is the path a resume takes.
+#[cfg(test)]
 #[must_use]
 pub fn timer_records(events: &[SessionEvent]) -> Vec<lofi_types::TimerRecord> {
     let mut latest: Vec<lofi_types::TimerRecord> = Vec::new();
@@ -768,9 +775,10 @@ pub fn timer_records(events: &[SessionEvent]) -> Vec<lofi_types::TimerRecord> {
     latest
 }
 
-/// Like [`timer_records`] but reads only the `TimerState` entries of an
-/// indexed lineage; `index` must be lineage-scoped (see
-/// `SessionCursor::snapshot`).
+/// The pending wake-up set a resume must re-arm: the last `TimerState`
+/// on the selected lineage, or empty when the session recorded none. Reads
+/// only the `TimerState` entries of an indexed lineage; `index` must be
+/// lineage-scoped (see `SessionCursor::snapshot`).
 /// # Errors
 /// Propagates cursor I/O failures.
 pub fn timer_records_at(
@@ -1563,12 +1571,15 @@ mod tests {
         // Roll back to the JobStarted event so the JobFinished marker lands on
         // the pruned branch while JobStarted stays on the selected lineage.
         cursor.restore_branch(started_id).unwrap();
+        let _live = cursor.record_job_started(43, "sleep 60").unwrap();
 
         let snapshot = cursor.snapshot().unwrap();
         let outstanding = outstanding_jobs_at(&cursor, &snapshot.index).unwrap();
-        assert!(
-            outstanding.is_empty(),
-            "a job that finished on another branch must not be stale: {outstanding:?}"
+        let ids = outstanding.iter().map(|job| job.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![43],
+            "only the job released on another branch is dropped: {outstanding:?}"
         );
     }
 

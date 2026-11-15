@@ -124,6 +124,11 @@ struct Job {
     /// Owning subagent run id; `None` for jobs spawned by the session's own
     /// execs. Lets a subagent cancellation kill exactly its process tree.
     owner: Option<String>,
+    /// The driver published the end state and queued the completion notice
+    /// it owes. A state that reads terminal is not enough to evict on:
+    /// `jobKill` marks a job cancelled before its driver reaps the process,
+    /// and the notice that driver still owes names this row and its log.
+    settled: bool,
 }
 
 /// Progress-notification settings for a job.
@@ -487,13 +492,15 @@ impl JobRegistry {
     /// Kills and unregisters every job whose id is not in `keep`. Returns
     /// the ids that were killed. The kill is silent: notifications are
     /// disabled before termination so the job driver does not push a
-    /// "cancelled" notice. Used by `/tree` rollback reconcile, where the
-    /// user has explicitly asked to drop the lineage that owned the job —
-    /// neither the agent nor the user needs to be told the subsidiary
-    /// process went away; the separate UI toast covers the user side.
+    /// "cancelled" notice, and notices already queued for the dropped jobs
+    /// are discarded. Used by `/tree` rollback reconcile, where the user has
+    /// explicitly asked to drop the lineage that owned the job — neither the
+    /// agent nor the user needs to be told the subsidiary process went away;
+    /// the separate UI toast covers the user side.
     pub fn kill_not_in(&self, keep: &[u64]) -> Vec<u64> {
         let keep: std::collections::HashSet<u64> = keep.iter().copied().collect();
         let mut killed = Vec::new();
+        let mut dropped = Vec::new();
         for id in self.live_ids() {
             if keep.contains(&id) {
                 continue;
@@ -539,6 +546,18 @@ impl JobRegistry {
                     .clone();
                 let _ = std::fs::remove_file(log_path);
             }
+            dropped.push(id);
+        }
+        if !dropped.is_empty() {
+            // A notice queued just before the rollback names a job and a log
+            // that are gone; the next prompt would carry it into the branch
+            // that replaced the one it describes.
+            self.inner
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .queue
+                .retain(|notice| !dropped.contains(&notice.id));
         }
         killed.sort_unstable();
         killed

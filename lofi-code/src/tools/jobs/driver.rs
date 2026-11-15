@@ -188,6 +188,9 @@ pub(super) async fn run_job(
                 });
             }
         }
+        // The row and its log are now safe to evict on: the notice that
+        // could still name them is in the queue, under this lock.
+        job.settled = true;
     }
     // Release the queue before the release hook: a hook may spawn or kill
     // jobs, and those paths take the same locks.
@@ -211,21 +214,44 @@ pub(super) async fn run_job(
 }
 
 /// Keep at most [`MAX_TERMINAL_JOBS`] terminal records, evicting the oldest
-/// first. Running jobs are never evicted. An evicted record's log file is
-/// removed: the record no longer exists, so nothing can page the log.
+/// first. Running jobs are never evicted, and neither is a job whose driver
+/// has not published its end state yet (see `Job::settled`). An evicted
+/// record's log file is removed: the record no longer exists, so nothing can
+/// page the log.
+///
+/// A job whose terminal notice still waits in the queue is kept: that notice
+/// promises the host a row and a log path, and the queue can hold more
+/// completions than the record cap allows.
 pub(super) fn evict_terminal_excess(inner: &Inner) {
+    // Lock order stays pending, then jobs, then job data. The queue guard is
+    // held across the whole pass: released, a driver could settle between the
+    // snapshot and the scan, and the pass would evict a job whose completion
+    // it never saw queued.
+    let pending = inner
+        .pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let promised: std::collections::HashSet<u64> = pending
+        .queue
+        .iter()
+        .filter(|notice| notice.terminal)
+        .map(|notice| notice.id)
+        .collect();
     let mut jobs = inner
         .jobs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut terminal: Vec<u64> = jobs
         .iter()
-        .filter(|(_, h)| {
-            h.data
+        .filter(|(id, h)| {
+            if promised.contains(id) {
+                return false;
+            }
+            let job = h
+                .data
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .state
-                .is_terminal()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            job.settled && job.state.is_terminal()
         })
         .map(|(id, _)| *id)
         .collect();
@@ -265,6 +291,18 @@ pub(super) fn push_notice(registry: &std::sync::Weak<Inner>, generation: u64, no
     // under the queue lock so a publisher that paused after its first check
     // cannot enqueue an old-session notice after the clear.
     if inner.generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    // A branch switch unregisters the jobs of the lineage it drops while
+    // their drivers still watch the processes they killed. The notice
+    // belongs to the branch that is gone, so it is dropped here instead of
+    // reaching the next prompt.
+    let registered = inner
+        .jobs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&notice.id);
+    if !registered {
         return;
     }
     pending.push(notice);

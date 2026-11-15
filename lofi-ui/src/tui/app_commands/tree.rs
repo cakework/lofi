@@ -223,15 +223,60 @@ impl App {
         }));
     }
 
-    fn present_lineage_job_reconciliation(
+    /// Jobs and wake-ups both belong to the lineage that was showing, so a
+    /// successful rollback replaces them with the selected one's.
+    pub(in crate::tui) fn adopt_selected_lineage_work(
+        &mut self,
+        cursor: &store::SessionCursor,
+        index: &[store::SessionIndexEntry],
+    ) {
+        if let Some(jobs) = self.jobs.clone() {
+            match self
+                .lifecycle
+                .reconcile_jobs_after_lineage_switch(cursor, index, &jobs)
+            {
+                Ok(reconciliation) => self.present_lineage_job_reconciliation(&reconciliation),
+                Err(error) => {
+                    // The rollback already happened, so the rows and the
+                    // notice left here describe a lineage the app is no
+                    // longer on. Fail closed: showing none is true, showing
+                    // the abandoned branch's is not.
+                    self.stale_jobs.clear();
+                    self.startup_notices.clear();
+                    self.notify(NotifyKind::Error, format!("reconcile branch jobs: {error}"));
+                }
+            }
+        }
+        match lofi_core::session::replay::timer_records_at(cursor, index) {
+            Ok(timers) => {
+                // Restored as recorded, the same way a resume restores them:
+                // a wake-up is owed whether or not its moment passed while
+                // another branch was showing, and a timer dropped here would
+                // be one the selected transcript still lists.
+                if let Some(registry) = &self.timers {
+                    registry.restore(&timers);
+                }
+                self.timers_recorded.clone_from(&timers);
+            }
+            Err(error) => self.notify(NotifyKind::Error, format!("restore branch timers: {error}")),
+        }
+    }
+
+    pub(in crate::tui) fn present_lineage_job_reconciliation(
         &mut self,
         reconciliation: &lofi_core::LineageJobReconciliation,
     ) {
+        // The rows and the pending handover notice describe the lineage that
+        // was showing until now, so both are replaced by this one. The notice
+        // rides the next prompt instead of starting a run of its own: the
+        // user is still editing the restored prompt here.
+        self.stale_jobs.clone_from(&reconciliation.stale);
+        self.startup_notices.clear();
         if !reconciliation.killed.is_empty() {
             let ids = reconciliation
                 .killed
                 .iter()
-                .map(u64::to_string)
+                .map(|id| lofi_types::short_id(*id))
                 .collect::<Vec<_>>()
                 .join(", ");
             self.notify(
@@ -246,15 +291,12 @@ impl App {
             let ids = reconciliation
                 .stale
                 .iter()
-                .map(u64::to_string)
+                .map(|job| lofi_types::short_id(job.id))
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.prompt_queue.push(super::QueuedPrompt {
-                text: format!(
-                    "branch switch: jobs [{ids}] from the prior lineage are no longer running; their ids are stale. Use jobSpawn for new background work."
-                ),
-                kind: lofi_types::PromptKind::Notice,
-            });
+            self.startup_notices.push(format!(
+                "branch switch: jobs [{ids}] on this branch are no longer running; their ids are stale. Use jobSpawn for new background work."
+            ));
         }
     }
 
@@ -336,17 +378,7 @@ impl App {
             );
             return;
         }
-        if let Some(jobs) = self.jobs.as_ref() {
-            match self
-                .lifecycle
-                .reconcile_jobs_after_lineage_switch(&cursor, &snapshot.index, jobs)
-            {
-                Ok(reconciliation) => self.present_lineage_job_reconciliation(&reconciliation),
-                Err(error) => {
-                    self.notify(NotifyKind::Error, format!("reconcile branch jobs: {error}"));
-                }
-            }
-        }
+        self.adopt_selected_lineage_work(&cursor, &snapshot.index);
         let prefill = if !entry.prefill.is_empty() {
             entry.prefill.to_string()
         } else if entry.source_kind == store::IndexKind::UserPrompt {

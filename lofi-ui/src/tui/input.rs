@@ -378,14 +378,16 @@ fn spawn_agent_run(
     let preempt_clone = preempt.clone();
     let continuation = prompt.is_none();
     let prompt = prompt.unwrap_or_default();
-    // Notices computed at session startup (e.g. stale job ids) ride the
-    // first agent run so the model sees them inline before the user's text.
-    // Continuations skip them: mid-run context is already shaped.
+    // Handover notices (e.g. stale job ids) ride the next agent run so the
+    // model sees them inline before the user's text. Continuations skip them:
+    // mid-run context is already shaped. The app keeps its copy until this
+    // run publishes that notice, which proves it is recorded.
     let startup_notices = if continuation {
         Vec::new()
     } else {
-        std::mem::take(&mut app.startup_notices)
+        app.startup_notices.clone()
     };
+    app.notices_in_flight = !startup_notices.is_empty();
     // Pre-render only when the submitted prompt is the first durable row.
     // Otherwise the core event stream must establish notice-before-user
     // ordering without deduplicating the wrong last row.

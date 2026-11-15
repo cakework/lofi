@@ -234,9 +234,13 @@ pub(crate) struct App {
     /// Text of a mailbox wake whose turn did not start yet. A wake must not
     /// cut a running turn, so it waits for the app to reach rest.
     mailbox_wake: Option<String>,
-    /// Stale-job notices computed at session startup, folded into the
-    /// history of the first agent run after resume. Consumed on first use.
+    /// What a session handover (startup, `/resume`, `/tree`) owes the model:
+    /// the stale job ids, folded into history ahead of the next prompt.
     startup_notices: Vec<String>,
+    /// A run was handed `startup_notices` and has not recorded all of them.
+    /// Each notice leaves `App` when the run publishes that notice, so a run
+    /// that fails before recording one leaves it for the next.
+    notices_in_flight: bool,
     cost: f64,
     turn_cost: f64,
     turn_has_round_usage: bool,
@@ -482,5 +486,26 @@ impl App {
         self.startup_notices.push(format!(
             "session resumed: jobs [{ids}] from the previous run are no longer running; their ids are stale. Use jobSpawn for new background work."
         ));
+    }
+
+    /// Forget a handover notice once the run recorded it. The notice prompt
+    /// carrying its text is the proof: a turn records a notice before it
+    /// publishes it, and every earlier event — the model report, an open or
+    /// session failure — arrives before anything is durable.
+    fn acknowledge_handover_notice(&mut self, event: &AgentEvent) {
+        if !self.notices_in_flight {
+            return;
+        }
+        let AgentEvent::Prompt {
+            prompt,
+            kind: PromptKind::Notice,
+        } = event
+        else {
+            return;
+        };
+        if self.startup_notices.first() == Some(prompt) {
+            self.startup_notices.remove(0);
+            self.notices_in_flight = !self.startup_notices.is_empty();
+        }
     }
 }

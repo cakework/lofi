@@ -244,6 +244,7 @@ impl BuiltinTools {
                 idle_ms,
                 idle: false,
                 last_output_at: Some(started),
+                settled: false,
             }),
             cancel: std::sync::atomic::AtomicBool::new(false),
             on_release: Mutex::new(None),

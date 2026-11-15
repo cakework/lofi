@@ -68,6 +68,7 @@ fn rollback_away_then_back_does_not_report_completed_job_as_stale() {
         ),
         text_response("first answer settled"),
         text_response("second answer after job"),
+        text_response("answer after both rollbacks"),
     ]);
     let fixture = Fixture::new(&server);
     let mut tui = fixture.spawn(&[]);
@@ -110,22 +111,28 @@ fn rollback_away_then_back_does_not_report_completed_job_as_stale() {
     tui.send(b"\r");
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // A queued stale notice is drained by the next input event while at rest.
-    // Send a neutral keystroke and give any injected notice time to become an
-    // agent request before asserting the request log stayed at three turns.
-    tui.send(b" ");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline && server.request_count() < 4 {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    let requests = server.requests();
+    // A stale notice would ride the next prompt rather than start a run here.
+    // Selecting a branch starts nothing: the request log stays at three turns.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     assert_eq!(
-        requests.len(),
+        server.request_count(),
         3,
-        "completed job must not queue a stale notice; requests: {:?}",
-        requests.iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        "selecting a branch must not start a run: {:?}",
+        server
+            .requests()
+            .iter()
+            .map(|r| r.body.clone())
+            .collect::<Vec<_>>()
     );
+
+    // Now submit for real: the fourth request is the only place a notice
+    // queued by either rollback would surface. The picker restored its own
+    // text into the editor, so clear it first.
+    tui.send(b"\x15");
+    tui.submit("after both rollbacks");
+    tui.wait_for("answer after both rollbacks", WAIT);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
     assert!(
         !requests
             .iter()
@@ -257,6 +264,22 @@ fn resume_reports_job_from_interrupted_process_as_stale() {
             < transcript.find("check resumed session").unwrap(),
         "the startup notice must precede the typed prompt in the transcript"
     );
+
+    // The next prompt carries no handover: the notice was recorded, and the
+    // app drops its copy on the prompt event that proves it, wherever that
+    // event falls in a drained batch.
+    server.push(text_response("second resume scenario settled"));
+    resumed.submit("second resumed prompt");
+    resumed.wait_for("second resume scenario settled", WAIT);
+    let requests = server.requests();
+    assert_eq!(server.request_count(), 4);
+    assert_eq!(
+        requests[3].body.matches("session resumed: jobs [").count(),
+        1,
+        "the recorded notice rides the history once, not a second time"
+    );
+    let transcript = transcript_text(&fixture.events());
+    assert_eq!(transcript.matches("session resumed: jobs [").count(), 1);
 
     let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
     wait_for_process_exit(pid);
@@ -2063,6 +2086,17 @@ fn background_job_completion_is_injected_as_a_notice_prompt() {
     let events = fixture.events();
     assert_eq!(job_events(&events, "job_started").len(), 1);
     assert_eq!(job_events(&events, "job_finished").len(), 1);
+    // A user role on the wire is not enough: the completion must be recorded
+    // as a notice, or its styling and its cancellation handling differ.
+    let completed_notices = events
+        .iter()
+        .filter(|event| event.get("kind").and_then(|k| k.as_str()) == Some("notice"))
+        .filter(|event| event.to_string().contains("completed: sleep 0.3"))
+        .count();
+    assert_eq!(
+        completed_notices, 1,
+        "the completion is recorded as a notice: {events:?}"
+    );
 }
 
 #[test]

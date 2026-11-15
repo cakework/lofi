@@ -358,5 +358,6 @@ impl App {
         self.prompt_queue
             .retain(|queued| queued.kind == lofi_types::PromptKind::User);
         self.startup_notices.clear();
+        self.notices_in_flight = false;
     }
 }

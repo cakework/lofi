@@ -58,6 +58,7 @@ impl App {
             prompt_queue: Vec::new(),
             mailbox_wake: None,
             startup_notices: Vec::new(),
+            notices_in_flight: false,
             run: None,
             run_start: None,
             run_model_label: None,

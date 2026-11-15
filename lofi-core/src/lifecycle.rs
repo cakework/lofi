@@ -11,6 +11,7 @@ use crate::recall::{
     recall, recall_cursor, CompactionTarget, RecallOutcome, RecallRequest, RecallScope,
 };
 use crate::session::recorder::SessionRecord;
+use crate::session::replay::OutstandingJob;
 use crate::session::store::{CompactionCounts, SessionCursor, SessionIndexEntry};
 use crate::session::view::SessionView;
 use crate::{CodeCompactionHook, Error, Result};
@@ -47,7 +48,7 @@ pub struct HistoryStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineageJobReconciliation {
     pub killed: Vec<u64>,
-    pub stale: Vec<u64>,
+    pub stale: Vec<OutstandingJob>,
 }
 
 impl AgentLifecycle {
@@ -133,12 +134,16 @@ impl AgentLifecycle {
 
     /// Reconcile session-owned jobs after a branch switch has been loaded.
     /// Jobs acquired on another lineage are cancelled and removed. Started
-    /// jobs that belong to this lineage but no longer have a live process are
-    /// reported as stale for the frontend to present.
+    /// jobs that belong to this lineage, no longer have a live process, and
+    /// did not release on any branch are reported as stale for the frontend
+    /// to present.
     ///
     /// # Errors
-    /// Propagates lifecycle-marker reads. No jobs are changed if those reads
-    /// fail.
+    /// Propagates the lineage-marker read, which happens before a job is
+    /// cancelled or removed, so its failure leaves the registry untouched.
+    /// The finished-anywhere scan only narrows the stale rows: when it fails,
+    /// the rows it would have cleared are reported, because an extra stale
+    /// row costs less than a job left running on the branch that replaced it.
     pub fn reconcile_jobs_after_lineage_switch(
         &self,
         cursor: &SessionCursor,
@@ -156,23 +161,39 @@ impl AgentLifecycle {
         // marker behind.  Rollback to a point between start and finish
         // cuts the marker off the lineage, but the process already
         // exited — reporting it as stale is a false positive.
-        let killed = jobs.kill_not_in(&lineage.started);
+        //
+        // Only a job the registry does not count as live can be stale, so the
+        // scan reads for those alone. The snapshot is safe because the sweep
+        // below only unregisters jobs outside this lineage: it cannot turn a
+        // live job into a stale row, and one that exits after the snapshot
+        // records its own finish.
         let live = jobs.live_ids();
-        let stale: Vec<u64> = lineage
+        let candidates: Vec<u64> = lineage
             .outstanding
-            .into_iter()
+            .iter()
             .map(|job| job.id)
             .filter(|id| !live.contains(id))
             .collect();
-        let stale = if stale.is_empty() {
-            stale
+        let finished_elsewhere = if candidates.is_empty() {
+            std::collections::HashSet::new()
         } else {
-            let finished_elsewhere = cursor.finished_job_ids_anywhere(&stale)?;
-            stale
-                .into_iter()
-                .filter(|id| !finished_elsewhere.contains(id))
-                .collect()
+            cursor
+                .finished_job_ids_anywhere(&candidates)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        target: "lofi::reconcile",
+                        %error,
+                        "finished scan failed; stale rows not narrowed"
+                    );
+                    std::collections::HashSet::new()
+                })
         };
+        let killed = jobs.kill_not_in(&lineage.started);
+        let stale: Vec<OutstandingJob> = lineage
+            .outstanding
+            .into_iter()
+            .filter(|job| !live.contains(&job.id) && !finished_elsewhere.contains(&job.id))
+            .collect();
         Ok(LineageJobReconciliation { killed, stale })
     }
 
@@ -992,7 +1013,13 @@ mod tests {
             .reconcile_jobs_after_lineage_switch(&cursor, &snapshot.index, &jobs)
             .unwrap();
         assert!(reconciliation.killed.is_empty());
-        assert_eq!(reconciliation.stale, vec![42]);
+        assert_eq!(
+            reconciliation.stale,
+            vec![OutstandingJob {
+                id: 42,
+                cmd: Some("cargo test".into())
+            }]
+        );
 
         cursor
             .record_job_finished(&owner, 42, lofi_code::JobRelease::Exited)

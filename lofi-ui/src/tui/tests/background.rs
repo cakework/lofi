@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui::run::{drain_run_batch, RUN_BATCH};
 
 fn stale_job(id: u64, cmd: Option<&str>) -> lofi_core::session::replay::OutstandingJob {
     lofi_core::session::replay::OutstandingJob {
@@ -375,8 +376,14 @@ fn a_stale_row_without_a_recorded_command_says_so() {
 fn a_new_session_drops_the_stale_jobs() {
     let mut a = app_with_timers();
     a.stale_jobs = vec![stale_job(7, None)];
+    a.announce_stale_jobs(&[stale_job(7, None)]);
     a.reset_session_jobs();
     assert!(a.jobs_rows().is_empty());
+    assert!(
+        a.startup_notices.is_empty(),
+        "the new session owes the model nothing from the old one"
+    );
+    assert!(!a.notices_in_flight);
 }
 
 #[test]
@@ -478,6 +485,50 @@ fn a_switch_adopts_the_recorded_work() {
 }
 
 #[test]
+fn a_branch_switch_restores_an_overdue_timer_as_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_file(&dir);
+    let cursor = store::SessionCursor::open(path).unwrap();
+    let recorded = lofi_types::TimerRecord {
+        id: 4,
+        due_ms: 1,
+        every_ms: None,
+        message: Some("wake".into()),
+        owner: None,
+    };
+    let mut events = [SessionEvent {
+        id: String::new(),
+        parent_id: None,
+        kind: SessionEventKind::TimerState {
+            timers: vec![recorded.clone()],
+        },
+    }];
+    cursor.append_events(&mut events).unwrap();
+    let snapshot = cursor.snapshot().unwrap();
+
+    let mut a = app_with_timers();
+    a.adopt_selected_lineage_work(&cursor, &snapshot.index);
+
+    // A wake-up that came due while the other branch was showing was never
+    // delivered, so selecting this branch owes it and restores it whole.
+    let timers = a.timers.as_ref().unwrap();
+    assert_eq!(timers.records(), vec![recorded.clone()], "restored as is");
+    assert_eq!(
+        a.timers_recorded,
+        vec![recorded],
+        "the snapshot is what the branch holds"
+    );
+    let notices = timers.take_notices();
+    assert_eq!(notices.len(), 1, "it fires once, not never: {notices:?}");
+    assert!(
+        notices[0].contains("wake"),
+        "the message travels with it: {notices:?}"
+    );
+    assert!(timers.records().is_empty(), "a one-shot retires");
+    assert!(timers.take_notices().is_empty(), "and never fires again");
+}
+
+#[test]
 fn a_handover_warns_the_model_about_stale_job_ids() {
     let mut a = app();
     a.announce_stale_jobs(&[]);
@@ -489,6 +540,177 @@ fn a_handover_warns_the_model_about_stale_job_ids() {
         "{:?}",
         a.startup_notices
     );
+}
+
+#[test]
+fn a_handover_notice_stays_until_the_run_records_it() {
+    let mut a = app();
+    a.announce_stale_jobs(&[stale_job(7, None)]);
+    let notice = a.startup_notices[0].clone();
+    a.notices_in_flight = true;
+
+    // Every run reports its model before it opens the turn, and every failure
+    // publishes an error, so neither proves the notice is durable.
+    a.acknowledge_handover_notice(&AgentEvent::ModelReported {
+        id: "p/m".into(),
+        display: "m".into(),
+    });
+    a.acknowledge_handover_notice(&AgentEvent::Error("open turn: broken".into()));
+    assert_eq!(
+        a.startup_notices,
+        vec![notice.clone()],
+        "a run that failed before recording keeps the notice for the next"
+    );
+    assert!(a.notices_in_flight);
+
+    // Another notice in the same turn is not the one this copy stands for.
+    a.acknowledge_handover_notice(&AgentEvent::Prompt {
+        prompt: "budget is nearly spent".into(),
+        kind: PromptKind::Notice,
+    });
+    assert_eq!(a.startup_notices, vec![notice.clone()]);
+
+    a.acknowledge_handover_notice(&AgentEvent::Prompt {
+        prompt: notice,
+        kind: PromptKind::Notice,
+    });
+    assert!(a.startup_notices.is_empty());
+    assert!(!a.notices_in_flight);
+}
+
+#[test]
+fn a_notice_proves_itself_from_any_event_of_the_batch() {
+    let mut a = app();
+    a.announce_stale_jobs(&[stale_job(7, None)]);
+    let notice = a.startup_notices[0].clone();
+    a.notices_in_flight = true;
+    // A turn announces itself and publishes its notice back to back, so the
+    // waking event is usually the announcement, not the proof.
+    let batch = vec![AgentEvent::Prompt {
+        prompt: notice.clone(),
+        kind: PromptKind::Notice,
+    }];
+    let mut queued = batch.into_iter();
+    drain_run_batch(&mut a, AgentEvent::RunStart, || queued.next());
+    assert!(
+        a.startup_notices.is_empty(),
+        "the drain acknowledges every event, not just the first: {:?}",
+        a.startup_notices
+    );
+    assert!(!a.notices_in_flight);
+}
+
+/// Queue a handover notice behind `fillers` fillers and drain one batch woken
+/// by a second copy of that notice. Two copies are queued because each one a
+/// dispatched event acknowledges is removed, which makes the waking event as
+/// visible as the last queued one. Returns how many events were fetched and
+/// what is still queued.
+fn drain_behind(app: &mut App, fillers: usize) -> (usize, Vec<AgentEvent>) {
+    app.announce_stale_jobs(&[stale_job(7, None)]);
+    app.announce_stale_jobs(&[stale_job(7, None)]);
+    app.notices_in_flight = true;
+    assert_eq!(app.startup_notices.len(), 2, "two copies to acknowledge");
+    let notice = AgentEvent::Prompt {
+        prompt: app.startup_notices[1].clone(),
+        kind: PromptKind::Notice,
+    };
+    let mut queued = (0..fillers)
+        .map(|_| AgentEvent::Text("filler".into()))
+        .chain([notice.clone()]);
+    let mut fetched = 0;
+    drain_run_batch(app, notice, || {
+        let event = queued.next();
+        fetched += usize::from(event.is_some());
+        event
+    });
+    (fetched, queued.collect())
+}
+
+#[test]
+fn the_batch_cap_bounds_the_events_it_dispatches() {
+    let mut a = app();
+    // A full batch dispatches its first and its last event: both copies of the
+    // notice are acknowledged, and nothing is fetched past the last one.
+    let (fetched, rest) = drain_behind(&mut a, RUN_BATCH - 2);
+    assert_eq!(fetched, RUN_BATCH - 1, "one full batch is fetched");
+    assert!(
+        a.startup_notices.is_empty(),
+        "both ends of the batch ran: {:?}",
+        a.startup_notices
+    );
+    assert!(!a.notices_in_flight);
+    assert!(rest.is_empty());
+
+    // One event past the cap stays in the channel untouched.
+    let (fetched, rest) = drain_behind(&mut a, RUN_BATCH - 1);
+    assert_eq!(
+        fetched,
+        RUN_BATCH - 1,
+        "the wake plus the queue below the cap is one full batch"
+    );
+    assert_eq!(
+        a.startup_notices.len(),
+        1,
+        "the swept batch acknowledges the wake only: {:?}",
+        a.startup_notices
+    );
+    assert!(a.notices_in_flight);
+    assert_eq!(rest.len(), 1, "the drain stopped at the cap");
+    assert!(
+        matches!(
+            rest.first(),
+            Some(AgentEvent::Prompt {
+                kind: PromptKind::Notice,
+                ..
+            })
+        ),
+        "the queue still holds the notice: {rest:?}"
+    );
+}
+
+#[test]
+fn a_branch_switch_replaces_the_rows_and_the_pending_handover_notice() {
+    let mut a = app();
+    a.announce_stale_jobs(&[stale_job(7, None)]);
+    a.stale_jobs = vec![stale_job(7, None)];
+    a.present_lineage_job_reconciliation(&lofi_core::LineageJobReconciliation {
+        killed: vec![12],
+        stale: vec![stale_job(13, Some("cargo watch"))],
+    });
+    assert_eq!(
+        a.stale_jobs,
+        vec![stale_job(13, Some("cargo watch"))],
+        "the rows describe the selected lineage, not the abandoned one"
+    );
+    assert_eq!(a.startup_notices.len(), 1, "{:?}", a.startup_notices);
+    assert!(
+        a.startup_notices[0].contains("jobs [d]"),
+        "handles, not decimal ids: {:?}",
+        a.startup_notices
+    );
+    assert!(
+        !a.startup_notices[0].contains("session resumed"),
+        "the resume notice named a job this lineage may never have started: {:?}",
+        a.startup_notices
+    );
+    assert!(
+        a.prompt_queue.is_empty(),
+        "the notice rides the next prompt instead of starting a run"
+    );
+    assert!(
+        a.notify
+            .as_ref()
+            .is_some_and(|n| n.msg.contains("killed 1") && n.msg.contains(": c")),
+        "the toast names handles, not decimal ids: {:?}",
+        a.notify
+    );
+
+    a.present_lineage_job_reconciliation(&lofi_core::LineageJobReconciliation::default());
+    assert!(
+        a.stale_jobs.is_empty(),
+        "a lineage with nothing stale has no rows"
+    );
+    assert!(a.startup_notices.is_empty());
 }
 
 #[test]

@@ -13,6 +13,62 @@ fn split_thinking_suffix(query: &str) -> (&str, Option<ThinkingLevel>) {
     }
 }
 
+/// How many events one wake drains before it yields to the select loop.
+pub(super) const RUN_BATCH: usize = 64;
+
+/// Dispatch at most `RUN_BATCH` events, the one that woke the loop included.
+/// Returns the last outcome the batch ended a run with, or `None` when none
+/// did.
+///
+/// Every event of the batch counts, not only the first: a turn announces
+/// itself and publishes its notice prompts back to back, so the proof that a
+/// handover notice is recorded usually rides the batch that announced the
+/// run. A batch cut short leaves the rest in the channel; the next wake
+/// drains them the same way.
+pub(super) fn drain_run_batch(
+    app: &mut App,
+    first: AgentEvent,
+    mut next: impl FnMut() -> Option<AgentEvent>,
+) -> Option<program_status::Settled> {
+    let mut settled = None;
+    let mut event = Some(first);
+    for index in 0..RUN_BATCH {
+        let Some(e) = event.take() else { break };
+        app.acknowledge_handover_notice(&e);
+        if let Some(s) = program_status::settled(&e) {
+            settled = Some(s);
+        }
+        if let AgentEvent::UserShell {
+            command,
+            output,
+            exit_code,
+            signal,
+            duration_ms,
+            truncated,
+            cancelled,
+            exclude_from_context,
+        } = e
+        {
+            let result = lofi_core::UserShellResult::from_session(
+                command,
+                output,
+                exit_code,
+                signal,
+                duration_ms,
+                truncated,
+                cancelled,
+            );
+            finish_user_shell(app, result, exclude_from_context);
+        } else {
+            app.apply_event(e);
+        }
+        if index + 1 < RUN_BATCH {
+            event = next();
+        }
+    }
+    settled
+}
+
 /// Cancel an in-flight run and wait for its recorder to flush. Aborting the
 /// task skips that flush, so the deadline sits far beyond any healthy
 /// round; the engine's cancel flag and idle timeout bound the wait on
@@ -318,8 +374,9 @@ pub(crate) async fn run_loop(
         // elsewhere). Their ids are stale; surface that on the first agent
         // turn after resume so the model does not try to poll them. Also
         // takes the recorded timer set; re-armed below, once the agent hands
-        // the registry over. Reuses the already-built lineage index — no
-        // second file scan.
+        // the registry over. Reuses the already-built lineage index; only a
+        // started job with no release on this lineage costs a second index
+        // read.
         let stale = app.adopt_recorded_work(&cursor, &index)?;
         app.announce_stale_jobs(&stale);
     }
@@ -452,30 +509,12 @@ pub(crate) async fn run_loop(
                         if let Some(run) = current_run.as_ref() {
                             attach_run_cursor(&mut app, run);
                         }
-                        let mut event = Some(e);
-                        for index in 0..64 {
-                            let Some(e) = event.take() else { break };
-                            if let Some(s) = program_status::settled(&e) {
-                                settled = s;
-                            }
-                            if let AgentEvent::UserShell {
-                                command, output, exit_code, signal, duration_ms,
-                                truncated, cancelled, exclude_from_context,
-                            } = e
-                            {
-                                let result = lofi_core::UserShellResult::from_session(
-                                    command, output, exit_code, signal, duration_ms,
-                                    truncated, cancelled,
-                                );
-                                finish_user_shell(&mut app, result, exclude_from_context);
-                            } else {
-                                app.apply_event(e);
-                            }
-                            if index < 63 {
-                                event = current_run
-                                    .as_mut()
-                                    .and_then(|run| run.rx.try_recv().ok());
-                            }
+                        if let Some(s) = drain_run_batch(&mut app, e, || {
+                            current_run
+                                .as_mut()
+                                .and_then(|run| run.rx.try_recv().ok())
+                        }) {
+                            settled = s;
                         }
                         // If there's a queued prompt, signal the agent to
                         // exit its round loop after the current round so the
@@ -674,12 +713,13 @@ pub(crate) async fn run_loop(
                             app.notify(NotifyKind::Error, "switch model: no model registry");
                         }
                     }
-                    // Slash commands (notably /tree reconcile) can push
-                    // notices into prompt_queue while at rest. The queue's
-                    // usual consumer is the agent-finished branch of the
-                    // current_run select arm; without a live run, that arm
-                    // never fires and the notice would sit forever. Drain
-                    // at rest here, matching the mpsc notice path.
+                    // A prompt queued while a run was live outlives that run,
+                    // and Enter during lifecycle work queues one with no run
+                    // at all. The queue's usual consumer is the
+                    // agent-finished branch of the current_run select arm;
+                    // without a live run, that arm never fires and the entry
+                    // would sit forever. Drain at rest here, matching the
+                    // mpsc notice path.
                     if !app.should_quit
                         && !app.busy()
                         && !app.prompt_queue.is_empty()

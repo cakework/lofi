@@ -26,6 +26,7 @@ fn handle_with(notify: NotifyOpts, log_path: String) -> Arc<JobHandle> {
             idle_ms: None,
             idle: false,
             last_output_at: None,
+            settled: false,
         }),
         cancel: AtomicBool::new(false),
         on_release: Mutex::new(None),
@@ -314,6 +315,11 @@ fn reset_ends_the_old_scope_and_rejects_its_late_notices() {
     push_notice(&weak, old_generation, stale);
     assert!(registry.take_notices().is_empty());
     let current_generation = registry.inner.generation.load(Ordering::SeqCst);
+    // The new generation holds its own job under that id; a notice is only
+    // kept for a job the registry still lists.
+    let fresh = handle_with(NotifyOpts::terminal_only(), "fresh".into());
+    fresh.data.lock().unwrap().id = id;
+    registry.inner.jobs.lock().unwrap().insert(id, fresh);
     let current = JobNotice {
         id,
         terminal: true,
@@ -341,6 +347,7 @@ fn terminal_records_are_evicted_beyond_the_cap_and_logs_removed() {
                 let mut job = handle.data.lock().unwrap();
                 job.id = i;
                 job.state = State::Completed;
+                job.settled = true;
             }
             jobs.insert(i, handle);
         }
@@ -374,6 +381,115 @@ fn terminal_records_are_evicted_beyond_the_cap_and_logs_removed() {
     }
     assert!(jobs.contains_key(&total));
     assert!(std::path::Path::new(&log_paths[(total - 1) as usize]).exists());
+}
+
+#[test]
+fn a_terminal_record_with_a_pending_notice_survives_eviction() {
+    let registry = JobRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    // More terminal records than the cap, so eviction must pick survivors.
+    let total = MAX_TERMINAL_JOBS as u64 + 6;
+    {
+        let mut jobs = registry.inner.jobs.lock().unwrap();
+        for id in 1..=total {
+            let log = dir.path().join(format!("job-{id}.log"));
+            std::fs::write(&log, b"x").unwrap();
+            let handle = handle_with(
+                NotifyOpts::terminal_only(),
+                log.to_string_lossy().into_owned(),
+            );
+            {
+                let mut job = handle.data.lock().unwrap();
+                job.id = id;
+                job.state = State::Completed;
+                job.settled = true;
+            }
+            jobs.insert(id, handle);
+        }
+    }
+    {
+        // The oldest three still have a completion notice waiting for the
+        // host, which promises a row and a readable log.
+        let mut pending = registry.inner.pending.lock().unwrap();
+        for id in 1..=3_u64 {
+            pending.push(JobNotice {
+                id,
+                terminal: true,
+                text: format!("completed: {id}"),
+            });
+        }
+    }
+
+    evict_terminal_excess(&registry.inner);
+
+    let jobs = registry.inner.jobs.lock().unwrap();
+    for id in 1..=3_u64 {
+        assert!(jobs.contains_key(&id), "job {id} still owes its notice");
+        assert!(dir.path().join(format!("job-{id}.log")).exists());
+    }
+    assert_eq!(
+        jobs.len(),
+        MAX_TERMINAL_JOBS + 3,
+        "the promised records are kept on top of the cap"
+    );
+}
+
+#[test]
+fn a_killed_job_survives_eviction_until_its_driver_settles() {
+    let registry = JobRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    // The oldest record was killed and its driver has not reaped the process
+    // or queued the completion it owes. Its state already reads terminal.
+    let killed_log = dir.path().join("job-1.log");
+    std::fs::write(&killed_log, b"x").unwrap();
+    let killed = handle_with(
+        NotifyOpts::terminal_only(),
+        killed_log.to_string_lossy().into_owned(),
+    );
+    {
+        let mut job = killed.data.lock().unwrap();
+        job.id = 1;
+        job.state = State::Cancelled;
+        job.ended = Some(Instant::now());
+    }
+    registry
+        .inner
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(1, killed.clone());
+    {
+        let mut jobs = registry.inner.jobs.lock().unwrap();
+        for id in 2..=MAX_TERMINAL_JOBS as u64 + 6 {
+            let log = dir.path().join(format!("job-{id}.log"));
+            std::fs::write(&log, b"x").unwrap();
+            let handle = handle_with(
+                NotifyOpts::terminal_only(),
+                log.to_string_lossy().into_owned(),
+            );
+            {
+                let mut job = handle.data.lock().unwrap();
+                job.id = id;
+                job.state = State::Completed;
+                job.settled = true;
+            }
+            jobs.insert(id, handle);
+        }
+    }
+
+    evict_terminal_excess(&registry.inner);
+    assert!(
+        registry.inner.jobs.lock().unwrap().contains_key(&1),
+        "a job whose driver still owes a completion is not evictable"
+    );
+    assert!(killed_log.exists());
+
+    // Settled with no queued notice: nothing names the row any more, so the
+    // cap applies to it again.
+    killed.data.lock().unwrap().settled = true;
+    evict_terminal_excess(&registry.inner);
+    assert!(!registry.inner.jobs.lock().unwrap().contains_key(&1));
+    assert!(!killed_log.exists());
 }
 
 #[test]
@@ -453,6 +569,70 @@ fn kill_not_in_disables_notify_before_killing() {
     let job = handle.data.lock().unwrap();
     assert!(job.state.is_terminal());
     assert!(!job.notify.enabled);
+}
+
+#[test]
+fn kill_not_in_drops_notices_queued_for_the_dropped_jobs() {
+    let registry = JobRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut ids = Vec::new();
+    for id in 1..=2_u64 {
+        let log = dir.path().join(format!("job-{id}.log"));
+        std::fs::write(&log, b"x").unwrap();
+        let handle = handle_with(
+            NotifyOpts::terminal_only(),
+            log.to_string_lossy().into_owned(),
+        );
+        {
+            let mut job = handle.data.lock().unwrap();
+            job.id = id;
+            job.state = State::Completed;
+        }
+        registry.inner.jobs.lock().unwrap().insert(id, handle);
+        ids.push(id);
+    }
+    {
+        let mut pending = registry.inner.pending.lock().unwrap();
+        for id in &ids {
+            pending.push(JobNotice {
+                id: *id,
+                terminal: true,
+                text: format!("completed: {id}"),
+            });
+        }
+    }
+
+    registry.kill_not_in(&[ids[1]]);
+
+    let notices = registry.take_notices();
+    assert_eq!(
+        notices.len(),
+        1,
+        "the dropped job's notice names a log that is gone: {notices:?}"
+    );
+    assert_eq!(notices[0].id, ids[1]);
+}
+
+#[test]
+fn a_notice_for_an_unregistered_job_is_dropped() {
+    let registry = JobRegistry::new();
+    let weak = Arc::downgrade(&registry.inner);
+    let generation = registry.inner.generation.load(Ordering::SeqCst);
+
+    push_notice(
+        &weak,
+        generation,
+        JobNotice {
+            id: 7,
+            terminal: true,
+            text: "completed: 7".into(),
+        },
+    );
+
+    assert!(
+        registry.take_notices().is_empty(),
+        "no record means nothing to report"
+    );
 }
 
 #[tokio::test]

@@ -486,8 +486,8 @@ impl SessionCursor {
 
     /// Collect which of the given job ids have a `JobFinished` marker
     /// anywhere in the transcript tree (not just the selected lineage).
-    /// Used by branch-switch reconciliation to avoid reporting a job as
-    /// stale when it already completed on a pruned branch.
+    /// Used by branch-switch reconciliation and by resume to avoid reporting a
+    /// job as stale when it already completed on a pruned branch.
     /// # Errors
     /// Propagates indexing and event parsing failures.
     pub fn finished_job_ids_anywhere(
