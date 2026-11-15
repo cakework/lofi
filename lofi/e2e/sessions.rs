@@ -214,7 +214,11 @@ fn branch_switch_retains_then_releases_owned_job() {
     let events = fixture.events();
     assert_eq!(server.request_count(), 3);
     assert_eq!(job_events(&events, "job_started").len(), 1);
-    assert!(job_events(&events, "job_finished").is_empty());
+    assert_eq!(
+        job_events(&events, "job_finished").len(),
+        1,
+        "the rollback kill records the release on the branch it abandoned"
+    );
 }
 
 #[test]

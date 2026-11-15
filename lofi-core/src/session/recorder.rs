@@ -149,16 +149,27 @@ impl store::SessionCursor {
         Ok(self.job_owner(events[0].id.clone()))
     }
 
-    /// Record a job release only if its acquisition is still on the selected
-    /// lineage. A job that finishes after a branch switch cannot attach its
-    /// release marker to the replacement branch.
-    pub(crate) fn record_job_finished(&self, owner: &JobOwner, job_id: u64) -> Result<()> {
+    /// Record a job release. A start still on the selected lineage takes the
+    /// marker there; a start that a branch switch abandoned takes it on a side
+    /// branch of its own, so returning to that branch does not read the job as
+    /// one that outlived the run.
+    pub(crate) fn record_job_finished(
+        &self,
+        owner: &JobOwner,
+        job_id: u64,
+        release: lofi_code::JobRelease,
+    ) -> Result<()> {
         let mut events = [SessionEvent {
             id: String::new(),
             parent_id: None,
             kind: SessionEventKind::JobFinished { job_id },
         }];
-        self.append_events_if_ancestor(owner, &mut events)?;
+        match release {
+            lofi_code::JobRelease::Exited => self.record_job_release(owner, &mut events)?,
+            lofi_code::JobRelease::Abandoned => {
+                self.record_abandoned_job_release(owner, &mut events)?;
+            }
+        }
         Ok(())
     }
 
@@ -1223,7 +1234,9 @@ mod tests {
             })
             .unwrap();
         let owner = cursor.record_job_started(7, "cargo test").unwrap();
-        cursor.record_job_finished(&owner, 7).unwrap();
+        cursor
+            .record_job_finished(&owner, 7, lofi_code::JobRelease::Exited)
+            .unwrap();
         cursor
             .record(SessionRecord::Compaction {
                 kept_messages: &[user_msg("kept")],

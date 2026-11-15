@@ -498,11 +498,14 @@ impl JobRegistry {
             if keep.contains(&id) {
                 continue;
             }
-            if let Some(handle) = self.get(id) {
-                // This resource no longer belongs to the selected lineage.
-                // Do not let its asynchronous driver append a release marker
-                // to the branch that replaced it.
-                handle
+            let release = self.get(id).and_then(|handle| {
+                // This resource no longer belongs to the selected lineage, so
+                // its driver would append the release to the branch that
+                // replaced it. Take the hook out of the driver's hands and run
+                // it here instead: a dropped hook would leave the start open,
+                // and a later return to its branch would report a job that is
+                // already dead as one that outlived the run.
+                let release = handle
                     .on_release
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -513,9 +516,13 @@ impl JobRegistry {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .notify
                     .enabled = false;
-            }
+                release
+            });
             if self.kill(id) {
                 killed.push(id);
+            }
+            if let Some(release) = release {
+                release(id, crate::JobRelease::Abandoned);
             }
             if let Some(handle) = self
                 .inner

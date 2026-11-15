@@ -731,13 +731,28 @@ pub struct OutstandingJob {
 /// cursor over an indexed lineage; `index` must be lineage-scoped (see
 /// `SessionCursor::snapshot`). Only `IndexKind::JobLifecycle` entries are
 /// touched.
+///
+/// A job that released after a lineage switch keeps its `JobStarted` on the
+/// selected lineage and its `JobFinished` on the abandoned one, so marker
+/// absence alone would report a process that is long gone as stale. The
+/// finished-anywhere scan costs one more pass over the lifecycle entries and
+/// only runs when the lineage names a start with no release.
 /// # Errors
 /// Propagates cursor I/O failures.
 pub fn outstanding_jobs_at(
     cursor: &SessionCursor,
     index: &[SessionIndexEntry],
 ) -> lofi_error::Result<Vec<OutstandingJob>> {
-    Ok(job_lifecycle_ids_at(cursor, index)?.outstanding)
+    let outstanding = job_lifecycle_ids_at(cursor, index)?.outstanding;
+    if outstanding.is_empty() {
+        return Ok(outstanding);
+    }
+    let ids = outstanding.iter().map(|job| job.id).collect::<Vec<_>>();
+    let finished = cursor.finished_job_ids_anywhere(&ids)?;
+    Ok(outstanding
+        .into_iter()
+        .filter(|job| !finished.contains(&job.id))
+        .collect())
 }
 
 /// The pending wake-up set a resume must re-arm: the last `TimerState` on
@@ -1533,6 +1548,28 @@ mod tests {
         let mut events = vec![job_started(3), job_finished(3), user_msg("done")];
         chain(&mut events);
         assert!(outstanding_job_ids(&events).is_empty());
+    }
+
+    #[test]
+    fn outstanding_jobs_at_ignores_a_job_finished_on_a_pruned_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::session::store::SessionStore::new(dir.path().join("sessions"));
+        let cursor = store.create_cursor(dir.path(), &"p/m".into()).unwrap();
+        let owner = cursor.record_job_started(42, "cargo test").unwrap();
+        let started_id = cursor.leaf_id();
+        cursor
+            .record_job_finished(&owner, 42, lofi_code::JobRelease::Exited)
+            .unwrap();
+        // Roll back to the JobStarted event so the JobFinished marker lands on
+        // the pruned branch while JobStarted stays on the selected lineage.
+        cursor.restore_branch(started_id).unwrap();
+
+        let snapshot = cursor.snapshot().unwrap();
+        let outstanding = outstanding_jobs_at(&cursor, &snapshot.index).unwrap();
+        assert!(
+            outstanding.is_empty(),
+            "a job that finished on another branch must not be stale: {outstanding:?}"
+        );
     }
 
     #[test]

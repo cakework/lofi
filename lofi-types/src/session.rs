@@ -136,8 +136,9 @@ pub enum SessionEventKind {
         cmd: Option<String>,
     },
     /// Paired with [`Self::JobStarted`] by id; a start with no matching
-    /// finish on the visible lineage was still running when the session
-    /// last ended.
+    /// finish anywhere in the transcript was still running when the session
+    /// last ended. A finish on a branch the session abandoned still counts,
+    /// so a job a rollback killed does not read as one that outlived the run.
     JobFinished {
         job_id: u64,
     },

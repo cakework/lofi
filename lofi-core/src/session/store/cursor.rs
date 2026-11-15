@@ -7,7 +7,7 @@ use lofi_types::{Message, PromptKind, SessionEvent, SessionEventKind};
 use serde::Deserialize;
 
 use super::append::{
-    append_compaction_from, append_prepared_events, AppendParent, CompactionCounts,
+    append_compaction_from, append_prepared_events, append_records, AppendParent, CompactionCounts,
 };
 use super::index::{
     compaction_index_suffix, load_compaction_path, load_display_event_range,
@@ -584,28 +584,63 @@ impl SessionCursor {
         Ok((start, end))
     }
 
-    /// Append events only while `owner` remains on the selected lineage. The
-    /// lineage check and append share the cursor-head lock, so a branch switch
-    /// cannot land between them.
+    /// Record a job release where the job's start lives. The lineage check and
+    /// the write share the cursor-head lock, so a branch switch cannot land
+    /// between them.
     ///
     /// The owner carries the branch generation it was minted on. An unchanged
-    /// generation proves the marker is still an ancestor, because appends only
+    /// generation proves the start is still an ancestor, because appends only
     /// extend the head. A moved head may have switched branches, so the scan
-    /// runs.
-    pub(crate) fn append_events_if_ancestor(
+    /// runs: a start that is still selected takes the marker on the selected
+    /// lineage, and one that is not takes it on a side branch off its own
+    /// start. Dropping a release that arrived after the switch would leave the
+    /// start open, which every later resume reads as a job that outlived the
+    /// run.
+    pub(crate) fn record_job_release(
         &self,
         owner: &JobOwner,
         events: &mut [SessionEvent],
-    ) -> Result<Option<(u64, u64)>> {
+    ) -> Result<()> {
         let mut leaf = self.lock_leaf();
         if owner.branch != self.branch.load(Ordering::SeqCst) {
             let (_meta, index, _file_size) = load_index(&self.path)?;
+            // A job swept from another session's start has nothing here to
+            // attach to, and a dangling parent would corrupt the tree.
+            let started_here = index
+                .iter()
+                .any(|entry| entry.kind != IndexKind::Cursor && entry.id.matches(&owner.id));
             let selected = indexed_lineage(index, leaf.as_deref())?;
             if !selected.iter().any(|entry| entry.id.matches(&owner.id)) {
-                return Ok(None);
+                if started_here {
+                    append_side_branch(&self.path, &owner.id, events, leaf.as_deref())?;
+                }
+                return Ok(());
             }
         }
-        self.append_events_at_leaf(events, &mut leaf).map(Some)
+        self.append_events_at_leaf(events, &mut leaf)?;
+        Ok(())
+    }
+
+    /// Record a release for a job that a branch switch killed. The caller has
+    /// already established that the start is not on the selected lineage, so
+    /// this skips the ancestry scan: on a large transcript that scan re-reads
+    /// the whole file, and a single rollback runs it once per killed job.
+    ///
+    /// # Errors
+    /// Propagates transcript serialization and I/O failures.
+    pub(crate) fn record_abandoned_job_release(
+        &self,
+        owner: &JobOwner,
+        events: &mut [SessionEvent],
+    ) -> Result<()> {
+        let mut leaf = self.lock_leaf();
+        if owner.branch == self.branch.load(Ordering::SeqCst) {
+            // The head never moved in this transcript, so the release belongs
+            // on it even though another session dropped the job.
+            self.append_events_at_leaf(events, &mut leaf)?;
+            return Ok(());
+        }
+        append_side_branch(&self.path, &owner.id, events, leaf.as_deref())
     }
 
     /// Append the governing system prompt as a `Message(System)` event off the
@@ -836,4 +871,41 @@ fn append_cursor_events(
     }
     let (byte_start, end) = append_prepared_events(path, events)?;
     Ok((byte_start, end, next))
+}
+
+/// Append `events` as a side branch of `parent`, leaving the selected head
+/// where it is. The trailing cursor record restores that head in the same
+/// batch: indexing keeps only the latest cursor record, so a side append on its
+/// own would make a reopen fall back to physical EOF and select against the
+/// branch this one was meant to stay off.
+fn append_side_branch(
+    path: &Path,
+    parent: &str,
+    events: &mut [SessionEvent],
+    leaf: Option<&str>,
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    lock.lock()?;
+    let mut next = Some(parent.to_owned());
+    for event in events.iter_mut() {
+        event.id = short_id();
+        event.parent_id.clone_from(&next);
+        next = Some(event.id.clone());
+    }
+    let cursor = cursor_event(leaf);
+    append_records(path, |writer| {
+        for event in events.iter() {
+            writer.record(event)?;
+        }
+        writer.record(&cursor)
+    })?;
+    Ok(())
 }

@@ -899,7 +899,9 @@ mod tests {
         cursor
             .record(SessionRecord::System { prompt: "sys" })
             .unwrap();
-        cursor.record_job_finished(&owner, 42).unwrap();
+        cursor
+            .record_job_finished(&owner, 42, lofi_code::JobRelease::Exited)
+            .unwrap();
 
         let snapshot = cursor.snapshot().unwrap();
         let lineage =
@@ -909,21 +911,71 @@ mod tests {
     }
 
     #[test]
-    fn job_release_does_not_attach_after_owner_branch_is_abandoned() {
+    fn job_release_attaches_to_an_abandoned_start_without_moving_the_head() {
+        // Both paths must land the marker: a killed job reports Abandoned,
+        // trusting the caller that its start left the lineage, while a natural
+        // exit that raced the switch reports Exited and finds it by scanning.
+        for release in [
+            lofi_code::JobRelease::Abandoned,
+            lofi_code::JobRelease::Exited,
+        ] {
+            assert_abandoned_release_attaches(release);
+        }
+    }
+
+    fn assert_abandoned_release_attaches(release: lofi_code::JobRelease) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::session::store::SessionStore::new(dir.path().join("sessions"));
         let cursor = store.create_cursor(dir.path(), &"p/m".into()).unwrap();
         let root = cursor.leaf_id();
         let owner = cursor.record_job_started(42, "cargo test").unwrap();
+        let started = cursor.leaf_id();
 
-        cursor.restore_branch(root).unwrap();
-        cursor.record_job_finished(&owner, 42).unwrap();
+        // A rollback drops the start from the selected lineage and the job dies
+        // there. Dropping its release would leave the start open, so a later
+        // return to that branch reads a job that is already dead as one that
+        // outlived the run.
+        cursor.restore_branch(root.clone()).unwrap();
+        cursor.record_job_finished(&owner, 42, release).unwrap();
 
         let snapshot = cursor.snapshot().unwrap();
         let lineage =
             crate::session::replay::job_lifecycle_ids_at(&cursor, &snapshot.index).unwrap();
-        assert!(lineage.started.is_empty());
+        assert!(
+            lineage.started.is_empty(),
+            "the marker stays off the selected lineage"
+        );
         assert!(lineage.outstanding.is_empty());
+        assert_eq!(cursor.leaf_id(), root, "the release does not move the head");
+        assert_eq!(
+            cursor.finished_job_ids_anywhere(&[42]).unwrap(),
+            std::collections::HashSet::from([42])
+        );
+
+        // A reopen takes its head from the trailing cursor record, not from the
+        // side event's place in the file.
+        let reopened =
+            crate::session::store::SessionCursor::open(cursor.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.leaf_id(), root);
+        assert_eq!(
+            reopened.finished_job_ids_anywhere(&[42]).unwrap(),
+            std::collections::HashSet::from([42])
+        );
+
+        // Back on the branch that holds the start, the job reads as released.
+        reopened.restore_branch(started).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        let lineage =
+            crate::session::replay::job_lifecycle_ids_at(&reopened, &snapshot.index).unwrap();
+        assert_eq!(lineage.started, vec![42]);
+        // The lineage-only view still names the job: its release sits on a side
+        // branch. The finished-anywhere filter is what answers the caller.
+        assert_eq!(lineage.outstanding.len(), 1);
+        assert!(
+            crate::session::replay::outstanding_jobs_at(&reopened, &snapshot.index)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -942,7 +994,9 @@ mod tests {
         assert!(reconciliation.killed.is_empty());
         assert_eq!(reconciliation.stale, vec![42]);
 
-        cursor.record_job_finished(&owner, 42).unwrap();
+        cursor
+            .record_job_finished(&owner, 42, lofi_code::JobRelease::Exited)
+            .unwrap();
         let snapshot = cursor.snapshot().unwrap();
         let reconciliation = lifecycle
             .reconcile_jobs_after_lineage_switch(&cursor, &snapshot.index, &jobs)
@@ -958,7 +1012,9 @@ mod tests {
         let cursor = store.create_cursor(dir.path(), &"p/m".into()).unwrap();
         let owner = cursor.record_job_started(42, "cargo test").unwrap();
         let started_id = cursor.leaf_id();
-        cursor.record_job_finished(&owner, 42).unwrap();
+        cursor
+            .record_job_finished(&owner, 42, lofi_code::JobRelease::Exited)
+            .unwrap();
         // Roll back to the JobStarted event so the JobFinished marker lands on
         // the pruned branch while JobStarted stays on the selected lineage.
         cursor.restore_branch(started_id).unwrap();

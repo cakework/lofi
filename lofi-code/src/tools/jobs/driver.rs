@@ -203,7 +203,7 @@ pub(super) async fn run_job(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .id;
-        hook(id);
+        hook(id, crate::JobRelease::Exited);
     }
     if let Some(inner) = inner {
         evict_terminal_excess(&inner);

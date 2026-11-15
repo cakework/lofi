@@ -895,7 +895,7 @@ async fn job_completion_keeps_its_spawn_owner() {
         let finished = first_finished.clone();
         std::sync::Arc::new(move |_, _cmd| {
             let finished = finished.clone();
-            Some(std::sync::Arc::new(move |id| {
+            Some(std::sync::Arc::new(move |id, _| {
                 finished.lock().unwrap().push(id);
             }) as lofi_code::JobReleaseFn)
         })
@@ -915,7 +915,7 @@ async fn job_completion_keeps_its_spawn_owner() {
         let finished = second_finished.clone();
         std::sync::Arc::new(move |_, _cmd| {
             let finished = finished.clone();
-            Some(std::sync::Arc::new(move |id| {
+            Some(std::sync::Arc::new(move |id, _| {
                 finished.lock().unwrap().push(id);
             }) as lofi_code::JobReleaseFn)
         })

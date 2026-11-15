@@ -72,8 +72,19 @@ pub type SubagentFn = Arc<
 /// subagent sandboxes, tests).
 pub type ModelsFn = Arc<dyn Fn() -> Json + Send + Sync>;
 
+/// Why a job's release hook is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobRelease {
+    /// The process ended on its own.
+    Exited,
+    /// A branch switch killed a job whose start is not on the selected
+    /// lineage. The caller already knows the start was abandoned, so the
+    /// release must not pay for an ancestry scan of the whole transcript.
+    Abandoned,
+}
+
 // Must not block: called synchronously from the sandbox / job driver.
-pub type JobReleaseFn = Arc<dyn Fn(u64) + Send + Sync>;
+pub type JobReleaseFn = Arc<dyn Fn(u64, JobRelease) + Send + Sync>;
 /// Acquire lifecycle ownership for a spawned job. The returned release hook
 /// is retained by that job and called once when it reaches a terminal state.
 pub type JobAcquireFn = Arc<dyn Fn(u64, &str) -> Option<JobReleaseFn> + Send + Sync>;

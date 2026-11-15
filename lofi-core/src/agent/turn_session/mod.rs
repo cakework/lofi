@@ -710,8 +710,8 @@ fn tool_context(
             move |id: u64, cmd: &str| -> Option<lofi_code::JobReleaseFn> {
                 let owner = cursor.record_job_started(id, cmd).ok()?;
                 let cursor = cursor.clone();
-                Some(Arc::new(move |id| {
-                    let _ = cursor.record_job_finished(&owner, id);
+                Some(Arc::new(move |id, release| {
+                    let _ = cursor.record_job_finished(&owner, id, release);
                 }) as lofi_code::JobReleaseFn)
             },
         ) as lofi_code::JobAcquireFn
