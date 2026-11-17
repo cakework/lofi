@@ -62,12 +62,11 @@ pulldown-cmark = { version = "0.13", default-features = false }
 
 # TypeScript sandbox: swc strip + QuickJS.
 rquickjs = { version = "0.9", features = ["full", "futures"] }
-swc_common = "5"
-swc_ecma_ast = "5"
-swc_ecma_parser = "6"
-swc_ecma_visit = "5"
-swc_ecma_transforms_typescript = "7"
-swc_ecma_codegen = "5"
+swc_common = "27"
+swc_ecma_ast = "30"
+swc_ecma_parser = "47"
+swc_ecma_transforms_typescript = "57"
+swc_ecma_codegen = "33"
 
 # Test-only HTTP mocking.
 mockito = "1"

@@ -1,10 +1,9 @@
 use swc_common::sync::Lrc;
-use swc_common::{FileName, FilePathMapping, Globals, SourceMap, Span, Spanned, GLOBALS};
-use swc_ecma_ast::Module;
+use swc_common::{FileName, FilePathMapping, Globals, Mark, SourceMap, Span, Spanned, GLOBALS};
+use swc_ecma_ast::{Module, Pass, Program};
 use swc_ecma_codegen::to_code_default;
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax};
-use swc_ecma_transforms_typescript::strip_type;
-use swc_ecma_visit::VisitMutWith;
+use swc_ecma_transforms_typescript::strip;
 
 use lofi_error::{Error, Result};
 
@@ -33,7 +32,7 @@ pub fn compile_ts(src: &str) -> Result<String> {
             StringInput::from(&*fm),
             None,
         );
-        let mut module: Module = parser.parse_module().map_err(|e| {
+        let module: Module = parser.parse_module().map_err(|e| {
             Error::Sandbox(format!(
                 "parse error: {} at {}",
                 e.kind().msg(),
@@ -47,8 +46,9 @@ pub fn compile_ts(src: &str) -> Result<String> {
                 span_loc(&cm, e.span())
             )));
         }
-        module.visit_mut_with(&mut strip_type());
-        let js = to_code_default(cm, None, &module);
+        let mut program = Program::Module(module);
+        strip(Mark::new(), Mark::new()).process(&mut program);
+        let js = to_code_default(cm, None, &program);
         Ok(js)
     })?;
 
