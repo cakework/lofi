@@ -2,6 +2,7 @@
 //! and a `serde_json::Value`; conversion caps depth, nodes, and copied bytes
 //! so a self-referential or pathologically large value cannot exhaust memory.
 
+use rquickjs::function::This;
 use rquickjs::{Array, Ctx, Function, IntoJs, Object, Value};
 use serde_json::{json, Value as Json};
 
@@ -315,6 +316,9 @@ fn object_to_json<'js>(
     }
 
     if map.is_empty() && !conversion.truncated {
+        if let Some(at) = date_to_rfc3339(object) {
+            return Json::String(at);
+        }
         let prototype_name = object.get_prototype().and_then(|prototype| {
             prototype
                 .get::<_, Function>("constructor")
@@ -331,6 +335,25 @@ fn object_to_json<'js>(
         }
     }
     Json::Object(map)
+}
+
+/// A guest `Date` as an RFC 3339 timestamp, so a returned instant reads as a
+/// time rather than an opaque sentinel. A `Date` has no own enumerable
+/// property, so it reaches the sentinel branch as an empty object.
+fn date_to_rfc3339<'js>(object: &Object<'js>) -> Option<String> {
+    let ctor: Object<'js> = object.ctx().globals().get("Date").ok()?;
+    if !object.is_instance_of(&ctor) {
+        return None;
+    }
+    let get_time: Function<'js> = object.get("getTime").ok()?;
+    let millis: f64 = get_time.call((This(object.clone()),)).ok()?;
+    // An invalid `Date` reports NaN, which must not land on the epoch.
+    if !millis.is_finite() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let at = jiff::Timestamp::from_millisecond(millis as i64).ok()?;
+    Some(at.to_string())
 }
 
 fn sentinel_for(kind: &str, name: Option<&str>, is_constructor: bool) -> Json {

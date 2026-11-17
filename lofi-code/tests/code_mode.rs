@@ -155,6 +155,29 @@ async fn exec_returning_constructor_yields_opaque_sentinel_with_flag() {
 }
 
 #[tokio::test]
+async fn exec_returning_a_date_yields_an_rfc3339_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "return { at: new Date(1767225600000) };";
+    let res = exec(src, &ctx(dir.path()), &ExecOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(res.value, json!({ "at": "2026-01-01T00:00:00Z" }));
+}
+
+#[tokio::test]
+async fn exec_returning_an_invalid_date_yields_opaque_sentinel() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "return new Date('nope');";
+    let res = exec(src, &ctx(dir.path()), &ExecOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        res.value,
+        json!({ "__lofi_opaque_kind__": "object", "__lofi_opaque_name__": "Date" })
+    );
+}
+
+#[tokio::test]
 async fn exec_returning_non_enumerable_property_is_visible() {
     let dir = tempfile::tempdir().unwrap();
     let src =
