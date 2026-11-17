@@ -90,7 +90,7 @@ enum SessionCommand {
             default_value = "7d",
             value_parser = parse_age
         )]
-        delete_older_than: chrono::Duration,
+        delete_older_than: jiff::SignedDuration,
         /// Report what would be deleted without deleting it
         #[arg(long)]
         dry_run: bool,
@@ -397,7 +397,7 @@ fn list_sessions(root: &std::path::Path, all: bool) -> anyhow::Result<()> {
 
 /// Parse an age with a unit: `30m`, `12h`, `7d`, or `2w`. A bare number is
 /// rejected, because the unit decides whether the user meant hours or days.
-fn parse_age(text: &str) -> Result<chrono::Duration, String> {
+fn parse_age(text: &str) -> Result<jiff::SignedDuration, String> {
     let (count, unit) = match text.find(|c: char| c.is_ascii_alphabetic()) {
         Some(at) => text.split_at(at),
         None => return Err(format!("missing a unit in {text}: use s, m, h, d, or w")),
@@ -408,26 +408,29 @@ fn parse_age(text: &str) -> Result<chrono::Duration, String> {
     if count < 0 {
         return Err(format!("negative count in {text}"));
     }
-    let age = match unit {
-        "s" => chrono::Duration::try_seconds(count),
-        "m" => chrono::Duration::try_minutes(count),
-        "h" => chrono::Duration::try_hours(count),
-        "d" => chrono::Duration::try_days(count),
-        "w" => chrono::Duration::try_weeks(count),
+    let seconds_per_unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
         _ => {
             return Err(format!(
                 "unknown unit {unit} in {text}: use s, m, h, d, or w"
             ))
         }
     };
-    age.ok_or_else(|| format!("age is too large in {text}"))
+    count
+        .checked_mul(seconds_per_unit)
+        .map(jiff::SignedDuration::from_secs)
+        .ok_or_else(|| format!("age is too large in {text}"))
 }
 
 /// The age as the user would write it back: the largest unit that divides
 /// it exactly, so `7d` prints as `7d` and not `168h`. Weeks stay out, so
 /// the default never comes back as `1w`.
-fn age_label(age: chrono::Duration) -> String {
-    let seconds = age.num_seconds().unsigned_abs();
+fn age_label(age: jiff::SignedDuration) -> String {
+    let seconds = age.as_secs().unsigned_abs();
     for (unit, size) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
         if seconds >= size && seconds.is_multiple_of(size) {
             return format!("{}{unit}", seconds / size);
@@ -438,7 +441,7 @@ fn age_label(age: chrono::Duration) -> String {
 
 fn prune_sessions(
     root: &std::path::Path,
-    older_than: chrono::Duration,
+    older_than: jiff::SignedDuration,
     dry_run: bool,
     all: bool,
 ) -> anyhow::Result<()> {
@@ -448,10 +451,10 @@ fn prune_sessions(
     } else {
         store.list_files_for_cwd(root).context("list sessions")?
     };
-    let cutoff = chrono::Utc::now() - older_than;
+    let cutoff = jiff::Timestamp::now() - older_than;
     let stale: Vec<_> = files
         .into_iter()
-        .filter(|file| chrono::DateTime::<chrono::Utc>::from(file.last_active()) < cutoff)
+        .filter(|file| jiff::Timestamp::try_from(file.last_active()).is_ok_and(|at| at < cutoff))
         .collect();
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
@@ -530,8 +533,8 @@ fn print_docs_search(query: &str) -> anyhow::Result<()> {
 fn format_ts(ms: u64) -> String {
     i64::try_from(ms)
         .ok()
-        .and_then(chrono::DateTime::from_timestamp_millis)
-        .map(|at| at.format("%Y-%m-%d %H:%M").to_string())
+        .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+        .map(|at| at.strftime("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
 }
 

@@ -216,8 +216,8 @@ fn parse_message(tool: &str, message: Option<Value>) -> Result<Option<String>> {
 /// colon (`+0000` and `+00:00` are both accepted).
 fn parse_timestamp(at: &str) -> Option<SystemTime> {
     let normalized = normalize_offset(at);
-    let dt = chrono::DateTime::parse_from_rfc3339(&normalized).ok()?;
-    Some(SystemTime::from(dt.with_timezone(&chrono::Utc)))
+    let at: jiff::Timestamp = normalized.parse().ok()?;
+    SystemTime::try_from(at).ok()
 }
 
 fn normalize_offset(at: &str) -> String {

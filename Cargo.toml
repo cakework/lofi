@@ -46,7 +46,7 @@ regex = "1"
 globset = "0.4"
 ignore = "0.4"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+jiff = "1.0"
 indexmap = { version = "2.5.0", features = ["serde"] }
 
 ratatui = "0.30"
@@ -61,7 +61,17 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 pulldown-cmark = { version = "0.13", default-features = false }
 
 # TypeScript sandbox: swc strip + QuickJS.
-rquickjs = { version = "0.9", features = ["full", "futures"] }
+# "full" minus "chrono": we never convert JS dates to chrono types, and the
+# feature is the only thing keeping chrono in the tree.
+rquickjs = { version = "0.9", features = [
+    "loader",
+    "dyn-load",
+    "either",
+    "indexmap",
+    "macro",
+    "phf",
+    "futures",
+] }
 swc_common = "27"
 swc_ecma_ast = "30"
 swc_ecma_parser = "47"

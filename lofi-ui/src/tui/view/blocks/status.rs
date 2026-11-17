@@ -179,8 +179,13 @@ fn timer_label(timer: &lofi_core::TimerInfo) -> String {
             prim::fmt_duration_short(every)
         );
     }
-    let due = chrono::DateTime::<chrono::Local>::from(timer.due);
-    format!("timer {id}: notify at {}", due.format("%Y-%m-%d %H:%M"))
+    let due = jiff::Timestamp::try_from(timer.due)
+        .map(|at| at.to_zoned_datetime(jiff::tz::TimeZone::system()))
+        .map_or_else(
+            |_| "an unknown time".to_string(),
+            |at| at.strftime("%Y-%m-%d %H:%M").to_string(),
+        );
+    format!("timer {id}: notify at {due}")
 }
 
 /// How long until a timer fires, or `due` once the poll is late.
