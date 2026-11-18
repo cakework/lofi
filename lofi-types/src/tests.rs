@@ -149,7 +149,7 @@ fn content_block_round_trips() {
         content: "img".to_string(),
         is_error: false,
         images: vec![ToolResultImage {
-            bytes: vec![0x89, 0x50],
+            bytes: vec![0x89, 0x50].into(),
             media_type: "image/png".to_string(),
         }],
     });
@@ -164,7 +164,7 @@ fn content_block_round_trips() {
         redacted: false,
     });
     round_trip(&ContentBlock::Image {
-        bytes: vec![0xFF, 0xD8, 0xFF, 0xD9],
+        bytes: vec![0xFF, 0xD8, 0xFF, 0xD9].into(),
         media_type: "image/jpeg".to_string(),
     });
 }
@@ -172,7 +172,7 @@ fn content_block_round_trips() {
 #[test]
 fn image_block_serializes_bytes_as_base64() {
     let json = serde_json::to_value(&ContentBlock::Image {
-        bytes: vec![1, 2, 3],
+        bytes: vec![1, 2, 3].into(),
         media_type: "image/jpeg".to_string(),
     })
     .unwrap();
@@ -183,7 +183,7 @@ fn image_block_serializes_bytes_as_base64() {
     assert_eq!(
         back,
         ContentBlock::Image {
-            bytes: vec![1, 2, 3],
+            bytes: vec![1, 2, 3].into(),
             media_type: "image/jpeg".to_string(),
         }
     );

@@ -569,7 +569,7 @@ fn request_converts_foreign_reasoning_without_replaying_encrypted_content() {
         kind: PromptKind::default(),
     }];
 
-    let request = OpenAiResponsesIr::build_request(&target, &messages, &[]);
+    let request = OpenAiResponsesIr::build_request_with_prefix(&target, &[], &messages, &[]);
     let input = request["input"].as_array().unwrap();
 
     assert_eq!(input.len(), 2);
@@ -686,7 +686,7 @@ fn tool_result_with_images_serializes_output_as_items() {
             content: "read image.png".to_string(),
             is_error: false,
             images: vec![lofi_types::ToolResultImage {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 media_type: "image/png".to_string(),
             }],
         }],
@@ -738,7 +738,7 @@ fn user_image_block_serializes_as_input_image() {
                 text: "describe".to_string(),
             },
             ContentBlock::Image {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 media_type: "image/jpeg".to_string(),
             },
         ],

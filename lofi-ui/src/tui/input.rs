@@ -369,7 +369,7 @@ fn spawn_agent_run(
     // log, so seed_system is a no-op there.
     let _ = app.lifecycle.seed_system(&app.system_prompt);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let history = app.lifecycle.shared_history();
+    let lifecycle = app.lifecycle.clone();
     let agent = agent.clone();
     let err_tx = tx.clone();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -413,7 +413,7 @@ fn spawn_agent_run(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor.clone());
                 }
-                let mut messages = history.lock().map(|m| m.clone()).unwrap_or_default();
+                let mut messages = lifecycle.lease_history();
                 let result = std::panic::AssertUnwindSafe(agent.run_turn(
                     &mut messages,
                     lofi_core::TurnRequest {
@@ -437,9 +437,7 @@ fn spawn_agent_run(
                 ))
                 .catch_unwind()
                 .await;
-                if let Ok(mut stored) = history.lock() {
-                    *stored = messages;
-                }
+                drop(messages);
                 match result {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(error)) => Err(error.to_string()),

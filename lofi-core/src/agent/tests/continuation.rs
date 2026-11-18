@@ -1042,7 +1042,7 @@ fn oversized_image_messages() -> Vec<Message> {
                 text: "look".to_string(),
             },
             ContentBlock::Image {
-                bytes: vec![0u8; 7 * 1024 * 1024],
+                bytes: vec![0u8; 7 * 1024 * 1024].into(),
                 media_type: "image/jpeg".to_string(),
             },
         ],

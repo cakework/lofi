@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lofi_types::{
@@ -22,9 +23,54 @@ use crate::{CodeCompactionHook, Error, Result};
 #[derive(Clone)]
 pub struct AgentLifecycle {
     history: Arc<Mutex<Vec<Message>>>,
+    leased_stats: Arc<Mutex<Option<HistoryStats>>>,
+    generation: Arc<AtomicU64>,
     compaction: CompactionConfig,
     context_window: u64,
     workspace_root: Option<PathBuf>,
+}
+
+/// Exclusive checkout of the live conversation history for one active turn.
+///
+/// Moves `Vec<Message>` out of [`AgentLifecycle`] instead of deep-cloning it
+/// and restores it on drop unless a newer session/branch replaced history
+/// while an unacknowledged turn was winding down.
+pub struct HistoryLease {
+    history: Arc<Mutex<Vec<Message>>>,
+    leased_stats: Arc<Mutex<Option<HistoryStats>>>,
+    generation: Arc<AtomicU64>,
+    leased_generation: u64,
+    messages: Vec<Message>,
+}
+
+impl std::ops::Deref for HistoryLease {
+    type Target = Vec<Message>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.messages
+    }
+}
+
+impl std::ops::DerefMut for HistoryLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.messages
+    }
+}
+
+impl Drop for HistoryLease {
+    fn drop(&mut self) {
+        if let Ok(mut stats) = self.leased_stats.lock() {
+            *stats = None;
+        }
+        if self.generation.load(Ordering::Acquire) != self.leased_generation {
+            return;
+        }
+        if let Ok(mut stored) = self.history.lock() {
+            if self.generation.load(Ordering::Acquire) == self.leased_generation {
+                *stored = std::mem::take(&mut self.messages);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,9 +102,33 @@ impl AgentLifecycle {
     pub fn new(compaction: CompactionConfig, context_window: u64) -> Self {
         Self {
             history: Arc::new(Mutex::new(Vec::new())),
+            leased_stats: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
             compaction,
             context_window,
             workspace_root: None,
+        }
+    }
+
+    #[must_use]
+    pub fn lease_history(&self) -> HistoryLease {
+        let mut stored = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let leased_generation = self.generation.load(Ordering::Acquire);
+        let stats = compute_history_stats(&stored);
+        let messages = std::mem::take(&mut *stored);
+        drop(stored);
+        if let Ok(mut cached) = self.leased_stats.lock() {
+            *cached = Some(stats);
+        }
+        HistoryLease {
+            history: Arc::clone(&self.history),
+            leased_stats: Arc::clone(&self.leased_stats),
+            generation: Arc::clone(&self.generation),
+            leased_generation,
+            messages,
         }
     }
 
@@ -109,6 +179,10 @@ impl AgentLifecycle {
             .history
             .lock()
             .map_err(|_| Error::State("agent history lock poisoned".to_string()))?;
+        self.generation.fetch_add(1, Ordering::Release);
+        if let Ok(mut cached) = self.leased_stats.lock() {
+            *cached = None;
+        }
         if history.capacity() >= messages.len() {
             history.clear();
             history.extend(messages);
@@ -210,23 +284,31 @@ impl AgentLifecycle {
     /// # Errors
     /// Returns a state error when the shared history lock is poisoned.
     pub fn clear_history(&mut self) -> Result<()> {
-        self.history
+        let mut history = self
+            .history
             .lock()
-            .map_err(|_| Error::State("agent history lock poisoned".to_string()))?
-            .clear();
+            .map_err(|_| Error::State("agent history lock poisoned".to_string()))?;
+        self.generation.fetch_add(1, Ordering::Release);
+        if let Ok(mut cached) = self.leased_stats.lock() {
+            *cached = None;
+        }
+        history.clear();
         Ok(())
     }
 
     #[must_use]
     pub fn history_stats(&self) -> HistoryStats {
-        self.history.lock().map_or_else(
-            |_| HistoryStats::default(),
-            |messages| HistoryStats {
-                messages: messages.len(),
-                estimated_retained_bytes: messages.capacity() * std::mem::size_of::<Message>()
-                    + messages.iter().map(message_heap_bytes).sum::<usize>(),
-            },
-        )
+        let Ok(messages) = self.history.lock() else {
+            return HistoryStats::default();
+        };
+        if messages.is_empty() {
+            if let Ok(cached) = self.leased_stats.lock() {
+                if let Some(stats) = *cached {
+                    return stats;
+                }
+            }
+        }
+        compute_history_stats(&messages)
     }
 
     pub fn set_context_window(&mut self, context_window: u64) {
@@ -304,10 +386,14 @@ impl AgentLifecycle {
                 system_prompt,
             })?;
         }
+        self.generation.fetch_add(1, Ordering::Release);
+        if let Ok(mut cached) = self.leased_stats.lock() {
+            *cached = None;
+        }
         *history = new_history;
         drop(history);
         // /compact can finish with no following agent run.
-        lofi_code::memory::release_freed_memory();
+        crate::release_freed_memory();
         Ok(Some(compaction))
     }
 
@@ -348,7 +434,10 @@ impl AgentLifecycle {
         cursor: Option<&SessionCursor>,
         system_prompt: &str,
     ) -> Result<HardCompactOutcome> {
-        if self.messages_since_last_compact(cursor)?
+        let Some(events) = self.compaction_events(cursor)? else {
+            return Ok(HardCompactOutcome::NotEnoughHistory);
+        };
+        if assistant_messages_since_last_compact(&events)
             < self.compaction.min_messages_between_hard_compacts
         {
             return Ok(HardCompactOutcome::Cooldown);
@@ -376,27 +465,6 @@ impl AgentLifecycle {
             return Ok(None);
         };
         Ok(Some(recall(&events, &request)))
-    }
-
-    fn messages_since_last_compact(&self, cursor: Option<&SessionCursor>) -> Result<usize> {
-        let Some(events) = self.compaction_events(cursor)? else {
-            return Ok(usize::MAX);
-        };
-        let Some(last_compaction) = events
-            .iter()
-            .rposition(|event| matches!(event.kind, SessionEventKind::Compaction { .. }))
-        else {
-            return Ok(usize::MAX);
-        };
-        Ok(events[last_compaction + 1..]
-            .iter()
-            .filter(|event| {
-                matches!(
-                    &event.kind,
-                    SessionEventKind::Message(message) if message.role == Role::Assistant
-                )
-            })
-            .count())
     }
 
     /// Materialize the session lineage for compact/recall/context policy.
@@ -430,6 +498,33 @@ pub(crate) fn history_from_cursor(
     Ok(projection.finish())
 }
 
+fn assistant_messages_since_last_compact(events: &[SessionEvent]) -> usize {
+    let Some(last_compaction) = events
+        .iter()
+        .rposition(|event| matches!(event.kind, SessionEventKind::Compaction { .. }))
+    else {
+        return usize::MAX;
+    };
+    events[last_compaction + 1..]
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::Message(message) if message.role == Role::Assistant
+            )
+        })
+        .count()
+}
+
+#[allow(clippy::ptr_arg)]
+fn compute_history_stats(messages: &Vec<Message>) -> HistoryStats {
+    HistoryStats {
+        messages: messages.len(),
+        estimated_retained_bytes: messages.capacity() * std::mem::size_of::<Message>()
+            + messages.iter().map(message_heap_bytes).sum::<usize>(),
+    }
+}
+
 fn message_heap_bytes(message: &Message) -> usize {
     message.blocks.capacity() * std::mem::size_of::<ContentBlock>()
         + message.blocks.iter().map(content_heap_bytes).sum::<usize>()
@@ -450,8 +545,16 @@ fn content_heap_bytes(block: &ContentBlock) -> usize {
         ContentBlock::ToolResult {
             tool_use_id,
             content,
+            images,
             ..
-        } => tool_use_id.capacity() + content.capacity(),
+        } => {
+            tool_use_id.capacity()
+                + content.capacity()
+                + images
+                    .iter()
+                    .map(|img| img.bytes.len() + img.media_type.capacity())
+                    .sum::<usize>()
+        }
         ContentBlock::PartSignature {
             provider,
             model,
@@ -469,7 +572,7 @@ fn content_heap_bytes(block: &ContentBlock) -> usize {
                 }
                 + signature.capacity()
         }
-        ContentBlock::Image { bytes, media_type } => bytes.capacity() + media_type.capacity(),
+        ContentBlock::Image { bytes, media_type } => bytes.len() + media_type.capacity(),
     }
 }
 
@@ -813,7 +916,7 @@ mod tests {
                         text: "inspect this image".into(),
                     },
                     ContentBlock::Image {
-                        bytes: vec![1; 128 * 1024],
+                        bytes: vec![1; 128 * 1024].into(),
                         media_type: "image/png".into(),
                     },
                 ],
@@ -837,7 +940,7 @@ mod tests {
                     content: "screenshot".into(),
                     is_error: false,
                     images: vec![lofi_types::ToolResultImage {
-                        bytes: vec![2; 128 * 1024],
+                        bytes: vec![2; 128 * 1024].into(),
                         media_type: "image/png".into(),
                     }],
                 }],

@@ -122,13 +122,28 @@ pub(crate) fn cap_exec_envelope(output: serde_json::Map<String, serde_json::Valu
     }
 }
 
+static EXEC_TOOL_SCHEMA: std::sync::LazyLock<(ToolSchema, usize)> =
+    std::sync::LazyLock::new(|| {
+        let schema = ToolSchema {
+            name: lofi_code::EXEC_TOOL_NAME.to_string(),
+            description: lofi_code::EXEC_TOOL_DESCRIPTION.to_string(),
+            input_schema: lofi_code::exec_tool_input_schema(),
+        };
+        let bytes = serde_json::to_string(&schema).map_or(0, |text| text.len());
+        (schema, bytes)
+    });
+
 #[must_use]
 pub fn exec_tool_schema() -> ToolSchema {
-    ToolSchema {
-        name: lofi_code::EXEC_TOOL_NAME.to_string(),
-        description: lofi_code::EXEC_TOOL_DESCRIPTION.to_string(),
-        input_schema: lofi_code::exec_tool_input_schema(),
-    }
+    EXEC_TOOL_SCHEMA.0.clone()
+}
+
+pub(crate) fn exec_tool_schema_ref() -> &'static ToolSchema {
+    &EXEC_TOOL_SCHEMA.0
+}
+
+pub(crate) fn exec_tool_schema_bytes() -> usize {
+    EXEC_TOOL_SCHEMA.1
 }
 
 pub(crate) fn decode_json_string(s: &str) -> String {

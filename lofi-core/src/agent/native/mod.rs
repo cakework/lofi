@@ -199,25 +199,22 @@ impl Agent {
         } else {
             0
         };
-        let schema = serde_json::to_string(&super::exec_tool_schema()).map_or(0, |text| text.len());
+        let schema = super::exec_tool_schema_bytes();
         ((prompt + schema) / 4) as u64
     }
 
-    fn request_messages(&self, messages: &[Message]) -> Option<Vec<Message>> {
+    fn injected_system_message(&self, messages: &[Message]) -> Option<Message> {
         if !self.injects_system_prompt(messages) {
             return None;
         }
-        let mut request = Vec::with_capacity(messages.len() + 1);
-        request.push(Message {
+        Some(Message {
             origin: None,
             role: lofi_types::Role::System,
             blocks: vec![ContentBlock::Text {
                 text: self.system_prompt.clone(),
             }],
             kind: lofi_types::PromptKind::default(),
-        });
-        request.extend_from_slice(messages);
-        Some(request)
+        })
     }
 
     /// One provider round: send the history, stream the answer, run the tools
@@ -231,7 +228,6 @@ impl Agent {
     ) -> std::result::Result<Exchange, ExchangeFailure> {
         let sink = io.events();
         let cancel = io.cancel();
-        let schema = super::exec_tool_schema();
         let mut model = self.model.clone();
         // Clip the output cap against remaining context so strict providers
         // (max_tokens < context_window - input_tokens) never reject the
@@ -266,13 +262,13 @@ impl Agent {
             }
         };
         let visible_messages = stripped.as_deref().unwrap_or(messages);
-        let with_system = self.request_messages(visible_messages);
-        let send_messages = with_system.as_deref().unwrap_or(visible_messages);
+        let injected_system = self.injected_system_message(visible_messages);
+        let system_prefix = injected_system.as_slice();
         // Send-time byte guard: the provider caps the request body, not just
         // the token count, so an image-heavy history can be rejected (HTTP 413)
         // while the token-threshold compaction never trips. Stop before the
         // doomed request; the turn maps this to ContextPressure.
-        let image_bytes = image_payload_bytes(send_messages);
+        let image_bytes = image_payload_bytes(visible_messages);
         if image_bytes > MAX_REQUEST_IMAGE_BYTES {
             sink.notice(format!(
                 "attached images total {} MiB; compacting to fit the request size limit",
@@ -283,8 +279,12 @@ impl Agent {
                 "request images total {image_bytes} bytes"
             ))));
         }
-        let schemas = [schema];
-        let requested = async { self.provider.stream(&model, send_messages, &schemas).await };
+        let schemas = std::slice::from_ref(super::exec_tool_schema_ref());
+        let requested = async {
+            self.provider
+                .stream_with_prefix(&model, system_prefix, visible_messages, schemas)
+                .await
+        };
         let stream = if cancel.flag().is_some() {
             tokio::select! {
                 biased;

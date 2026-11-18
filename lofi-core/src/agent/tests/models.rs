@@ -783,7 +783,7 @@ async fn non_vision_model_warns_once_per_turn_with_image_in_history() {
                 text: "look".to_string(),
             },
             ContentBlock::Image {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 media_type: "image/jpeg".to_string(),
             },
         ],

@@ -578,6 +578,13 @@ impl TurnIo {
     /// the caller and writes nothing: the recorder keeps its counts, so the next
     /// checkpoint retries the same suffix.
     pub fn record(&self, history: &[Message]) -> Result<Option<(u64, u64)>> {
+        let suffix = history.get(self.frontier().upto..).unwrap_or_default();
+        self.record_turn_suffix(suffix)
+    }
+
+    /// Write an already-sliced turn suffix (messages since `frontier().upto`)
+    /// to the transcript without requiring a full-session history slice.
+    pub(crate) fn record_turn_suffix(&self, suffix: &[Message]) -> Result<Option<(u64, u64)>> {
         // The turn is gone: a detached transport still holds this capability
         // but may not extend a transcript no turn will settle.
         if !self.alive() {
@@ -589,7 +596,6 @@ impl TurnIo {
             let Some(recorder) = guard.as_mut() else {
                 return Ok(None);
             };
-            let suffix = history.get(self.frontier().upto..).unwrap_or_default();
             recorder.checkpoint(suffix, &summary)?
         };
         self.unpublish(range);

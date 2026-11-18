@@ -46,6 +46,22 @@ pub trait Provider: Send + Sync {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<BoxStream<'static, Result<StreamingEvent>>>;
+
+    async fn stream_with_prefix(
+        &self,
+        model: &Model,
+        prefix: &[Message],
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<BoxStream<'static, Result<StreamingEvent>>> {
+        if prefix.is_empty() {
+            return self.stream(model, messages, tools).await;
+        }
+        let mut combined = Vec::with_capacity(prefix.len() + messages.len());
+        combined.extend_from_slice(prefix);
+        combined.extend_from_slice(messages);
+        self.stream(model, &combined, tools).await
+    }
 }
 
 /// `config_loader` resolves `api_key` and `header` values in place, so the

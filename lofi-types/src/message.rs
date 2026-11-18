@@ -92,7 +92,7 @@ pub enum ContentBlock {
     /// of a duplicated 33%-larger base64 copy.
     Image {
         #[serde(with = "base64_bytes")]
-        bytes: Vec<u8>,
+        bytes: std::sync::Arc<[u8]>,
         media_type: String,
     },
 }
@@ -102,7 +102,7 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResultImage {
     #[serde(with = "base64_bytes")]
-    pub bytes: Vec<u8>,
+    pub bytes: std::sync::Arc<[u8]>,
     pub media_type: String,
 }
 
@@ -110,6 +110,8 @@ pub struct ToolResultImage {
 /// [`ContentBlock::Image`] round-trips through the tagged-union transcript
 /// format alongside the text variants.
 mod base64_bytes {
+    use std::sync::Arc;
+
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -118,9 +120,12 @@ mod base64_bytes {
         s.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<[u8]>, D::Error> {
         let s = String::deserialize(d)?;
-        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+        STANDARD
+            .decode(&s)
+            .map(Arc::from)
+            .map_err(serde::de::Error::custom)
     }
 }
 

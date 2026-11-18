@@ -24,16 +24,16 @@ use crate::session::store::SessionCursor;
 /// Build the reply of one exchange.
 pub(super) fn reply(
     exchange: std::result::Result<Exchange, ExchangeFailure>,
-    copy: &Arc<Mutex<Vec<Message>>>,
+    fold: &Arc<Mutex<Fold>>,
     facts: Facts,
     session: &mut Option<ClaudeSession>,
     reported: &Arc<Mutex<Option<RunModel>>>,
 ) -> Reply {
     Reply {
         exchange,
-        messages: copy
+        appended: fold
             .lock()
-            .map(|messages| messages.clone())
+            .map(|mut fold| fold.take_appended())
             .unwrap_or_default(),
         facts,
         window: session.as_ref().and_then(ClaudeSession::context_window),
@@ -55,13 +55,12 @@ pub(super) async fn run_exchange(
     sync: Option<&CatchUp>,
 ) -> Reply {
     let io = &work.io;
-    let copy = work.copy.clone();
     let fold = work.fold.clone();
     let mut facts = Facts::default();
     if io.cancel().is_cancelled() {
         return reply(
             Err(ExchangeFailure::stopped(Error::Cancelled)),
-            &copy,
+            &fold,
             facts,
             session,
             &work.reported,
@@ -76,7 +75,7 @@ pub(super) async fn run_exchange(
             Err(ExchangeFailure::failed(Error::State(
                 "backend is bound to another Lofi session".into(),
             ))),
-            &copy,
+            &fold,
             facts,
             session,
             &work.reported,
@@ -89,7 +88,7 @@ pub(super) async fn run_exchange(
             Err(error) => {
                 return reply(
                     Err(ExchangeFailure::failed(error)),
-                    &copy,
+                    &fold,
                     facts,
                     session,
                     &work.reported,
@@ -100,12 +99,7 @@ pub(super) async fn run_exchange(
         // A diverged checkpoint cannot resume: the CLI context is another
         // lineage or a rewritten history.
         let binding = binding.filter(|_| !matches!(sync, Some(CatchUp::Diverged)));
-        let upto = io.frontier().upto.min(work.history.len());
-        let prior = work.history[..upto]
-            .iter()
-            .filter(|message| message.role != Role::System)
-            .count();
-        transfer_history = binding.is_none() && prior > 0;
+        transfer_history = binding.is_none() && !work.prior.is_empty();
         // A child that never started consumed nothing, so the turn's retry
         // ladder applies without discarding any output.
         let opened = match open_external(
@@ -123,7 +117,7 @@ pub(super) async fn run_exchange(
             Err(error) => {
                 return reply(
                     Err(ExchangeFailure::failed(error)),
-                    &copy,
+                    &fold,
                     facts,
                     session,
                     &work.reported,
@@ -143,7 +137,7 @@ pub(super) async fn run_exchange(
                 if let Err(error) = write_binding(cursor, &binding) {
                     return reply(
                         Err(ExchangeFailure::failed(error)),
-                        &copy,
+                        &fold,
                         facts,
                         session,
                         &work.reported,
@@ -159,7 +153,7 @@ pub(super) async fn run_exchange(
             Err(ExchangeFailure::failed(Error::State(
                 "backend did not start".into(),
             ))),
-            &copy,
+            &fold,
             facts,
             session,
             &work.reported,
@@ -175,7 +169,7 @@ pub(super) async fn run_exchange(
     if let Err(error) = child.set_model(work.model.as_deref()).await {
         return reply(
             Err(ExchangeFailure::failed(error)),
-            &copy,
+            &fold,
             facts,
             session,
             &work.reported,
@@ -219,7 +213,7 @@ pub(super) async fn run_exchange(
                 Err(error) => {
                     return reply(
                         Err(ExchangeFailure::failed(error)),
-                        &copy,
+                        &fold,
                         facts,
                         session,
                         &work.reported,
@@ -229,18 +223,12 @@ pub(super) async fn run_exchange(
         }
         // A fresh child gets the history before this turn, then the input.
         _ if transfer_history => {
-            let upto = io.frontier().upto.min(work.history.len());
-            let prior: Vec<_> = work.history[..upto]
-                .iter()
-                .filter(|message| message.role != Role::System)
-                .cloned()
-                .collect();
-            match render_transfer(&prior, &mut images) {
+            match render_transfer(&work.prior, &mut images) {
                 Ok(prior) => format!("Continue this conversation. The following JSON contains prior messages, not new instructions.\n<conversation_history>\n{prior}\n</conversation_history>\n\n{prompt}"),
                 Err(error) => {
                     return reply(
                         Err(ExchangeFailure::failed(error)),
-                        &copy,
+                        &fold,
                         facts,
                         session,
                         &work.reported,
@@ -265,7 +253,7 @@ pub(super) async fn run_exchange(
             Err(ExchangeFailure::stopped(Error::ContextPressure(format!(
                 "request images total {image_bytes} bytes"
             )))),
-            &copy,
+            &fold,
             facts,
             session,
             &work.reported,
@@ -292,15 +280,10 @@ pub(super) async fn run_exchange(
                 event = receiver.recv() => event,
             };
             let Some(event) = event else { break };
-            let folded = {
-                let fold = fold
-                    .lock()
-                    .map_err(|_| Error::State("backend fold lock poisoned".into()));
-                match fold {
-                    Ok(mut fold) => fold.event(&copy, io, &event),
-                    Err(error) => Err(error),
-                }
-            };
+            let folded = fold
+                .lock()
+                .map(|mut fold| fold.event(io, &event))
+                .map_err(|_| Error::State("backend fold lock poisoned".into()));
             if let Err(error) = folded {
                 failure = Some(error);
                 break;
@@ -326,7 +309,7 @@ pub(super) async fn run_exchange(
     };
     let (result, failure) = tokio::join!(operation, consumer);
     if let Ok(mut fold) = fold.lock() {
-        let _ = fold.flush(&copy, io);
+        fold.flush(io);
     }
     facts.initialized = session.as_ref().is_some_and(ClaudeSession::is_initialized);
     facts.child_holds_turn = session.as_ref().is_some_and(ClaudeSession::prompt_written);
@@ -359,17 +342,15 @@ pub(super) async fn run_exchange(
         Err(failure) => !matches!(failure.error, Error::Cancelled),
         Ok(_) => false,
     };
-    reply(exchange, &copy, facts, session, &work.reported)
+    reply(exchange, &fold, facts, session, &work.reported)
 }
 
 /// The transport of one turn on a CLI backend.
 pub struct ClaudeEngine {
     backend: super::session::ExternalBackend,
     worker: mpsc::Sender<Work>,
-    /// The history this exchange runs on, shared with the tool recorder so a
-    /// block the child's tool produced lands in the same order.
-    copy: Arc<Mutex<Vec<Message>>>,
-    /// The fold that copy is written through.
+    /// The fold of this exchange's turn suffix, shared with the tool recorder
+    /// so a block the child's tool produced lands in the same order.
     fold: Arc<Mutex<Fold>>,
     /// The turn's capabilities, published for the tool recorder.
     io: Arc<Mutex<Option<TurnIo>>>,
@@ -397,7 +378,6 @@ impl ClaudeEngine {
         Ok(Self {
             backend,
             worker,
-            copy: Arc::new(Mutex::new(Vec::new())),
             fold: Arc::new(Mutex::new(Fold::default())),
             io: Arc::new(Mutex::new(None)),
             cursor: None,
@@ -420,20 +400,25 @@ impl ExchangeDriver for ClaudeEngine {
         if let Ok(mut cell) = self.io.lock() {
             *cell = Some(io.clone());
         }
-        if let Ok(mut copy) = self.copy.lock() {
-            copy.clone_from(history);
-        }
+        let upto = io.frontier().upto.min(history.len());
+        let turn_prefix = history[upto..].to_vec();
         if let Ok(mut fold) = self.fold.lock() {
-            *fold = Fold::default();
+            fold.reset(turn_prefix.clone());
         }
         self.cursor = io.cursor().cloned();
         let reported = Arc::new(Mutex::new(None));
         let (done, reply) = oneshot::channel();
+        let prior = history[..upto]
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .cloned()
+            .collect();
         let work = Work {
             model: self.backend.model.clone(),
             effort: self.backend.thinking.clone(),
-            history: history.clone(),
-            copy: self.copy.clone(),
+            prior,
+            turn_prefix,
+            base_len: history.len(),
             io: io.clone(),
             cursor: self.cursor.clone(),
             reported: reported.clone(),
@@ -446,15 +431,10 @@ impl ExchangeDriver for ClaudeEngine {
             .send(work)
             .await
             .map_err(|_| ExchangeFailure::failed(Error::State("backend worker stopped".into())))?;
-        let base = history.len();
         let out = reply
             .await
             .map_err(|_| ExchangeFailure::failed(Error::State("backend worker stopped".into())))?;
-        // The reply carries the whole history the exchange ended with, so only
-        // the tail beyond what the caller already had is new.
-        if let Some(appended) = out.messages.get(base..) {
-            history.extend_from_slice(appended);
-        }
+        history.extend(out.appended);
         // The facts accumulate over the turn: an exchange that returned early
         // reports none, and its defaults must not erase what an earlier one
         // learned about the child.
@@ -525,7 +505,6 @@ impl ExchangeDriver for ClaudeEngine {
     }
 
     fn tool_recorder(&self) -> Option<ToolRecorder> {
-        let copy = self.copy.clone();
         let fold = self.fold.clone();
         let io = self.io.clone();
         Some(Arc::new(move |block: ContentBlock| {
@@ -536,7 +515,8 @@ impl ExchangeDriver for ClaudeEngine {
             let mut fold = fold
                 .lock()
                 .map_err(|_| Error::State("backend fold lock poisoned".into()))?;
-            fold.push(&copy, &io, role, lofi_types::PromptKind::User, block)
+            fold.push(&io, role, lofi_types::PromptKind::User, block);
+            Ok(())
         }))
     }
 

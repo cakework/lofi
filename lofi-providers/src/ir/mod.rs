@@ -28,12 +28,19 @@ pub(crate) fn b64(bytes: &[u8]) -> String {
 pub(crate) trait ProtocolIr: Send + 'static {
     type State: Default + Send + 'static;
 
-    fn build_request(model: &Model, messages: &[Message], tools: &[ToolSchema]) -> Value {
+    fn build_request_with_prefix(
+        model: &Model,
+        prefix: &[Message],
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Value {
         match messages_for_model(model, messages) {
-            Some(messages) => {
-                Self::build_request_inner(model, messages.iter().map(Cow::as_ref), tools)
-            }
-            None => Self::build_request_inner(model, messages.iter(), tools),
+            Some(sanitized) => Self::build_request_inner(
+                model,
+                prefix.iter().chain(sanitized.iter().map(Cow::as_ref)),
+                tools,
+            ),
+            None => Self::build_request_inner(model, prefix.iter().chain(messages.iter()), tools),
         }
     }
 
@@ -307,7 +314,7 @@ mod tests {
                 origin: None,
                 role: Role::User,
                 blocks: vec![ContentBlock::Image {
-                    bytes: vec![0; 1024],
+                    bytes: vec![0; 1024].into(),
                     media_type: "image/png".to_string(),
                 }],
                 kind: PromptKind::User,

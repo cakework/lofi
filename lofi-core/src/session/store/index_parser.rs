@@ -888,7 +888,7 @@ mod tests {
                 origin: None,
                 role: lofi_types::Role::User,
                 blocks: vec![lofi_types::ContentBlock::Image {
-                    bytes: vec![1; 1024 * 1024],
+                    bytes: vec![1; 1024 * 1024].into(),
                     media_type: "image/png".into(),
                 }],
                 kind: lofi_types::PromptKind::default(),

@@ -640,7 +640,7 @@ mod tests {
                 content: "read image.png".to_string(),
                 is_error: false,
                 images: vec![lofi_types::ToolResultImage {
-                    bytes: vec![1, 2, 3],
+                    bytes: vec![1, 2, 3].into(),
                     media_type: "image/png".to_string(),
                 }],
             }],
@@ -1029,7 +1029,7 @@ mod tests {
                     text: "what is this?".to_string(),
                 },
                 lofi_types::ContentBlock::Image {
-                    bytes: vec![1, 2, 3],
+                    bytes: vec![1, 2, 3].into(),
                     media_type: "image/jpeg".to_string(),
                 },
             ],

@@ -462,7 +462,7 @@ mod tests {
                     text: "look at this".into(),
                 },
                 ContentBlock::Image {
-                    bytes: vec![0u8; 16],
+                    bytes: vec![0u8; 16].into(),
                     media_type: "image/jpeg".into(),
                 },
             ],

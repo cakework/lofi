@@ -73,7 +73,7 @@ fn content_value_stays_a_string_without_images() {
 #[test]
 fn content_value_sends_images_as_base64_blocks() {
     let block = lofi_types::ContentBlock::Image {
-        bytes: vec![1, 2, 3],
+        bytes: vec![1, 2, 3].into(),
         media_type: "image/png".into(),
     };
     let value = content_value("look", &[block]);

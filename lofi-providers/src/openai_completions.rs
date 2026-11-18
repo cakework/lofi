@@ -26,7 +26,17 @@ impl super::Provider for OpenAiCompletionsProvider {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<BoxStream<'static, Result<StreamingEvent>>> {
-        let body = OpenAiCompletionsIr::build_request(model, messages, tools);
+        self.stream_with_prefix(model, &[], messages, tools).await
+    }
+
+    async fn stream_with_prefix(
+        &self,
+        model: &Model,
+        prefix: &[Message],
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<BoxStream<'static, Result<StreamingEvent>>> {
+        let body = OpenAiCompletionsIr::build_request_with_prefix(model, prefix, messages, tools);
         let req = apply_headers(
             with_bearer(
                 self.client

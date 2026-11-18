@@ -1139,7 +1139,10 @@ pub(super) fn upgrade_exec_image(
         obj.insert("bytes".to_string(), serde_json::json!(bytes.len()));
         obj.insert("media_type".to_string(), serde_json::json!(&media_type));
     }
-    Ok(Some(lofi_types::ToolResultImage { bytes, media_type }))
+    Ok(Some(lofi_types::ToolResultImage {
+        bytes: bytes.into(),
+        media_type,
+    }))
 }
 
 /// Clears a directory prompt's `active` flag when the ask ends. The UI drops

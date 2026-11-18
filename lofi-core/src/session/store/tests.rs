@@ -515,7 +515,7 @@ fn compaction_preserves_images_without_restoring_oversized_result_text() {
         .create_cursor(Path::new("/tmp/compaction-image"), &"p/m".into())
         .unwrap();
     let image = lofi_types::ToolResultImage {
-        bytes: vec![1; 512 * 1024],
+        bytes: vec![1; 512 * 1024].into(),
         media_type: "image/png".into(),
     };
     let mut events = [ev(Message {
@@ -551,7 +551,7 @@ fn compaction_preserves_images_without_restoring_oversized_result_text() {
     assert_result(
         &displayed,
         &lofi_types::ToolResultImage {
-            bytes: Vec::new(),
+            bytes: Vec::new().into(),
             media_type: image.media_type.clone(),
         },
     );
@@ -564,7 +564,7 @@ fn compaction_preserves_images_after_text_budget_is_exhausted() {
         .create_cursor(Path::new("/tmp/compaction-image-budget"), &"p/m".into())
         .unwrap();
     let image = lofi_types::ToolResultImage {
-        bytes: vec![2; 512 * 1024],
+        bytes: vec![2; 512 * 1024].into(),
         media_type: "image/jpeg".into(),
     };
     let blocks = vec![
@@ -572,7 +572,7 @@ fn compaction_preserves_images_after_text_budget_is_exhausted() {
             text: "inspect image".into(),
         },
         ContentBlock::Image {
-            bytes: vec![1; 512 * 1024],
+            bytes: vec![1; 512 * 1024].into(),
             media_type: "image/png".into(),
         },
         ContentBlock::ToolResult {

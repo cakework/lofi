@@ -472,11 +472,11 @@ fn strip_image_blocks_replaces_images_with_text_markers() {
                 text: "look".to_string(),
             },
             ContentBlock::Image {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 media_type: "image/jpeg".to_string(),
             },
             ContentBlock::Image {
-                bytes: vec![4, 5],
+                bytes: vec![4, 5].into(),
                 media_type: "image/png".to_string(),
             },
         ],
@@ -513,7 +513,7 @@ fn strip_image_blocks_downgrades_tool_result_images() {
             content: "read image.png".to_string(),
             is_error: false,
             images: vec![lofi_types::ToolResultImage {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 media_type: "image/png".to_string(),
             }],
         }],
@@ -556,7 +556,7 @@ fn strip_image_blocks_is_a_noop_without_images() {
 #[test]
 fn image_payload_bytes_counts_base64_length() {
     let image = |n: usize| ContentBlock::Image {
-        bytes: vec![0u8; n],
+        bytes: vec![0u8; n].into(),
         media_type: "image/jpeg".to_string(),
     };
     let messages = vec![Message {
@@ -580,7 +580,7 @@ fn image_payload_bytes_counts_base64_length() {
 #[test]
 fn image_payload_budget_distinguishes_over_and_under() {
     let image = |n: usize| ContentBlock::Image {
-        bytes: vec![0u8; n],
+        bytes: vec![0u8; n].into(),
         media_type: "image/jpeg".to_string(),
     };
     // 7 MiB raw -> ~9.3 MiB base64, over the 8 MiB budget.

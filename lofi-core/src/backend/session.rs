@@ -293,7 +293,7 @@ impl ExternalBackend {
                             Err(error) => {
                                 let _ = work.done.send(reply(
                                     Err(ExchangeFailure::failed(error)),
-                                    &work.copy,
+                                    &work.fold,
                                     Facts::default(),
                                     &mut session,
                                     &work.reported,
@@ -325,8 +325,8 @@ impl ExternalBackend {
                             owner = None;
                         }
                         effort = work.effort.clone();
-                        if let Ok(mut copy) = work.copy.lock() {
-                            copy.clone_from(&work.history);
+                        if let Ok(mut fold) = work.fold.lock() {
+                            fold.reset(work.turn_prefix.clone());
                         }
                         let out = run_exchange(
                             &name,
@@ -347,7 +347,7 @@ impl ExternalBackend {
                         if work.abandoned.load(Ordering::Acquire) {
                             abandon_exchange(&work, &mut session, &mut owner).await;
                         }
-                        history_len = out.messages.len();
+                        history_len = work.base_len + out.appended.len();
                         let _ = work.done.send(out);
                     }
                     if let Some(mut session) = session {
@@ -442,7 +442,7 @@ fn child_is_fresh(
         Some(CatchUp::Diverged) => false,
         Some(_) => path == owner,
         // No cursor: the history length is the only signal.
-        None => work.history.len() == history_len,
+        None => work.base_len == history_len,
     }
 }
 
@@ -450,11 +450,13 @@ fn child_is_fresh(
 pub(super) struct Work {
     pub(super) model: Option<String>,
     pub(super) effort: lofi_types::ThinkingLevel,
-    /// The caller's history at the start of this exchange.
-    pub(super) history: Vec<Message>,
-    /// The copy the worker appends to, shared with the tool recorder so a
-    /// block the child's tool produced lands in the same order.
-    pub(super) copy: Arc<Mutex<Vec<Message>>>,
+    /// Non-system messages before this turn's admission frontier, used when a
+    /// fresh child must receive prior conversation history.
+    pub(super) prior: Vec<Message>,
+    /// Messages already recorded in this turn before this exchange began.
+    pub(super) turn_prefix: Vec<Message>,
+    /// Total length of the caller's history at the start of this exchange.
+    pub(super) base_len: usize,
     pub(super) io: TurnIo,
     pub(super) cursor: Option<SessionCursor>,
     /// The identity the child reported for itself, so the terminal marker and
@@ -474,9 +476,8 @@ pub(super) struct Work {
 /// What one exchange produced.
 pub(super) struct Reply {
     pub(super) exchange: std::result::Result<Exchange, ExchangeFailure>,
-    /// The history the exchange ended with: the caller's history followed by
-    /// what this exchange appended, in order.
-    pub(super) messages: Vec<Message>,
+    /// Messages this exchange appended, in order.
+    pub(super) appended: Vec<Message>,
     pub(super) facts: Facts,
     pub(super) window: Option<u64>,
     pub(super) reported: Option<RunModel>,
@@ -859,16 +860,28 @@ pub(super) fn block_role(block: &ContentBlock) -> Role {
 #[derive(Default)]
 pub(super) struct Fold {
     pending: Vec<ContentBlock>,
+    turn_messages: Vec<Message>,
+    appended_from: usize,
 }
 
 impl Fold {
-    pub(super) fn flush(&mut self, copy: &Arc<Mutex<Vec<Message>>>, io: &TurnIo) -> Result<()> {
+    pub(super) fn reset(&mut self, turn_prefix: Vec<Message>) {
+        self.pending.clear();
+        self.appended_from = turn_prefix.len();
+        self.turn_messages = turn_prefix;
+    }
+
+    pub(super) fn take_appended(&mut self) -> Vec<Message> {
+        let start = self.appended_from.min(self.turn_messages.len());
+        self.turn_messages.drain(start..).collect()
+    }
+
+    pub(super) fn flush(&mut self, io: &TurnIo) {
         if self.pending.is_empty() {
-            return Ok(());
+            return;
         }
         let blocks = std::mem::take(&mut self.pending);
-        Self::append(
-            copy,
+        self.append(
             io,
             Message {
                 role: Role::Assistant,
@@ -876,37 +889,28 @@ impl Fold {
                 origin: None,
                 blocks,
             },
-        )
+        );
     }
 
-    fn append(copy: &Arc<Mutex<Vec<Message>>>, io: &TurnIo, message: Message) -> Result<()> {
-        let history = {
-            let mut history = copy
-                .lock()
-                .map_err(|_| Error::State("backend history lock poisoned".into()))?;
-            history.push(message);
-            history.clone()
-        };
+    fn append(&mut self, io: &TurnIo, message: Message) {
+        self.turn_messages.push(message);
         // Best effort: the recorder keeps its counts, so the next commit
         // retries the same suffix. A byte this one wrote stays pending in the
         // turn and travels with that commit's range.
-        if let Err(error) = io.record(&history) {
+        if let Err(error) = io.record_turn_suffix(&self.turn_messages) {
             tracing::warn!(error = %error, "backend checkpoint write failed");
         }
-        Ok(())
     }
 
     pub(super) fn push(
         &mut self,
-        copy: &Arc<Mutex<Vec<Message>>>,
         io: &TurnIo,
         role: Role,
         kind: lofi_types::PromptKind,
         block: ContentBlock,
-    ) -> Result<()> {
-        self.flush(copy, io)?;
-        Self::append(
-            copy,
+    ) {
+        self.flush(io);
+        self.append(
             io,
             Message {
                 role,
@@ -914,30 +918,24 @@ impl Fold {
                 origin: None,
                 blocks: vec![block],
             },
-        )
+        );
     }
 
-    pub(super) fn event(
-        &mut self,
-        copy: &Arc<Mutex<Vec<Message>>>,
-        io: &TurnIo,
-        event: &crate::agent::AgentEvent,
-    ) -> Result<()> {
+    pub(super) fn event(&mut self, io: &TurnIo, event: &crate::agent::AgentEvent) {
         match event {
             crate::agent::AgentEvent::Text(text) => {
                 if text.is_empty() {
-                    return Ok(());
+                    return;
                 }
                 if let Some(ContentBlock::Text { text: last }) = self.pending.last_mut() {
                     last.push_str(text);
                 } else {
                     self.pending.push(ContentBlock::Text { text: text.clone() });
                 }
-                Ok(())
             }
             crate::agent::AgentEvent::Thinking(text) => {
                 if text.is_empty() {
-                    return Ok(());
+                    return;
                 }
                 if let Some(ContentBlock::Thinking { text: last, .. }) = self.pending.last_mut() {
                     last.push_str(text);
@@ -948,13 +946,12 @@ impl Fold {
                         redacted: false,
                     });
                 }
-                Ok(())
             }
             // A usage or context report closes the open block first, so the
             // assistant message it describes is already in the transcript.
             crate::agent::AgentEvent::ContextReported { .. }
-            | crate::agent::AgentEvent::RoundUsage { .. } => self.flush(copy, io),
-            _ => Ok(()),
+            | crate::agent::AgentEvent::RoundUsage { .. } => self.flush(io),
+            _ => {}
         }
     }
 }

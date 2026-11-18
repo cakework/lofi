@@ -28,7 +28,17 @@ impl super::Provider for GoogleGenerativeAiProvider {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<BoxStream<'static, Result<StreamingEvent>>> {
-        let body = GoogleGenerativeAiIr::build_request(model, messages, tools);
+        self.stream_with_prefix(model, &[], messages, tools).await
+    }
+
+    async fn stream_with_prefix(
+        &self,
+        model: &Model,
+        prefix: &[Message],
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<BoxStream<'static, Result<StreamingEvent>>> {
+        let body = GoogleGenerativeAiIr::build_request_with_prefix(model, prefix, messages, tools);
         let base = model.base_url.as_deref().unwrap_or(&self.base_url);
         let url = stream_url(base, &model.id);
         let request = apply_headers(

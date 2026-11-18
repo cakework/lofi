@@ -352,14 +352,14 @@ mod tests {
     #[test]
     fn an_image_in_a_tool_result_bills_the_same_as_a_standalone_one() {
         let image = || lofi_types::ToolResultImage {
-            bytes: vec![0u8; 8],
+            bytes: vec![0u8; 8].into(),
             media_type: "image/png".to_string(),
         };
         let standalone = Message {
             origin: None,
             role: Role::User,
             blocks: vec![ContentBlock::Image {
-                bytes: vec![0u8; 8],
+                bytes: vec![0u8; 8].into(),
                 media_type: "image/png".to_string(),
             }],
             kind: lofi_types::PromptKind::User,

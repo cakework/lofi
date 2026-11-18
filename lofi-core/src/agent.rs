@@ -111,7 +111,10 @@ pub(crate) use auto_mode::collect_text;
 pub use event::AgentEvent;
 #[cfg(test)]
 pub(crate) use exec::extract_code_prefix;
-pub(crate) use exec::{cap_description, exec_timeout_ms, normalize_exec_input};
+pub(crate) use exec::{
+    cap_description, exec_timeout_ms, exec_tool_schema_bytes, exec_tool_schema_ref,
+    normalize_exec_input,
+};
 pub(crate) use exec::{cap_exec_envelope, cap_exec_result, cap_tool_result, CodePrefixDecoder};
 pub use exec::{
     exec_input_code_and_label, exec_label, exec_result_display, exec_tool_schema, parse_exec_input,
