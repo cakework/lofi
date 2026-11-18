@@ -339,6 +339,15 @@ impl AgentLifecycle {
         let Some(events) = self.compaction_events(cursor)? else {
             return Ok(None);
         };
+        self.compact_loaded_events(&events, cursor, system_prompt)
+    }
+
+    fn compact_loaded_events(
+        &mut self,
+        events: &[SessionEvent],
+        cursor: Option<&SessionCursor>,
+        system_prompt: &str,
+    ) -> Result<Option<Compaction>> {
         let options = CompactOptions {
             max_kept_tokens: self.compact_budget(),
             edit: self.compaction.edit.clone(),
@@ -350,7 +359,7 @@ impl AgentLifecycle {
                     .unwrap_or_default(),
             ))],
         };
-        let Some(compaction) = compact(&events, &options) else {
+        let Some(compaction) = compact(events, &options) else {
             return Ok(None);
         };
         let mut new_history = compacted_history(&compaction);
@@ -434,7 +443,18 @@ impl AgentLifecycle {
         cursor: Option<&SessionCursor>,
         system_prompt: &str,
     ) -> Result<HardCompactOutcome> {
-        let Some(events) = self.compaction_events(cursor)? else {
+        if let Some(cursor) = cursor {
+            if cursor.assistant_messages_since_last_compact()?
+                < self.compaction.min_messages_between_hard_compacts
+            {
+                return Ok(HardCompactOutcome::Cooldown);
+            }
+            return Ok(match self.compact(Some(cursor), system_prompt)? {
+                Some(compaction) => HardCompactOutcome::Compacted(compaction),
+                None => HardCompactOutcome::NotEnoughHistory,
+            });
+        }
+        let Some(events) = self.compaction_events(None)? else {
             return Ok(HardCompactOutcome::NotEnoughHistory);
         };
         if assistant_messages_since_last_compact(&events)
@@ -442,10 +462,12 @@ impl AgentLifecycle {
         {
             return Ok(HardCompactOutcome::Cooldown);
         }
-        Ok(match self.compact(cursor, system_prompt)? {
-            Some(compaction) => HardCompactOutcome::Compacted(compaction),
-            None => HardCompactOutcome::NotEnoughHistory,
-        })
+        Ok(
+            match self.compact_loaded_events(&events, None, system_prompt)? {
+                Some(compaction) => HardCompactOutcome::Compacted(compaction),
+                None => HardCompactOutcome::NotEnoughHistory,
+            },
+        )
     }
 
     /// Execute recall against the durable session when present, otherwise the

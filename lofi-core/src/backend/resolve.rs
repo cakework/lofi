@@ -64,14 +64,26 @@ impl BackendFactory {
             }
         }
         let registry = ModelRegistry::load_with_cache(&choices_config)?;
-        Ok(Self {
+        Ok(Self::from_resolved(config, registry, root, env))
+    }
+
+    /// Construct a factory from a config and an already-loaded model catalog,
+    /// avoiding a redundant `discovery.json` read and static catalog build.
+    #[must_use]
+    pub fn from_resolved(
+        config: Config,
+        registry: ModelRegistry,
+        root: &Path,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
             config: Arc::new(config),
             registry,
             root: root.to_path_buf(),
             env: Arc::new(env),
             skills_dir: None,
             persist_sessions: true,
-        })
+        }
     }
 
     #[must_use]
@@ -167,8 +179,7 @@ impl BackendFactory {
             Ok(registry) => registry,
             Err(_) => ModelRegistry::load(&config)?,
         };
-        BackendFactory::new(config, &self.root, self.env.to_vec())?
-            .with_resolved_registry(registry)
+        BackendFactory::from_resolved(config, registry, &self.root, self.env.to_vec())
             .with_skills_dir(self.skills_dir.clone())
             .with_subagent_persistence(self.persist_sessions)
             .open_resolved(Some(&query), executor)

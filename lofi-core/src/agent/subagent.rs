@@ -951,13 +951,16 @@ impl SubagentSupport {
     ///
     /// The factory carries this catalog, so an override can name a model the
     /// provider discovered at startup.
+    #[allow(clippy::unnecessary_wraps)]
     pub(super) fn factory(&self) -> Result<BackendFactory> {
-        Ok(
-            BackendFactory::new(self.config.clone(), &self.cwd, self.env.clone())?
-                .with_resolved_registry(self.registry.clone())
-                .with_skills_dir(self.skills_dir.clone())
-                .with_subagent_persistence(self.persist_sessions),
+        Ok(BackendFactory::from_resolved(
+            self.config.clone(),
+            self.registry.clone(),
+            &self.cwd,
+            self.env.clone(),
         )
+        .with_skills_dir(self.skills_dir.clone())
+        .with_subagent_persistence(self.persist_sessions))
     }
 
     /// Build the `lofi.models` hook: the registry's available choices as JSON.

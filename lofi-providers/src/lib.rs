@@ -194,12 +194,17 @@ fn transport_error_detail(error: reqwest::Error) -> String {
 }
 
 fn http_client() -> Result<reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
     let builder = reqwest::Client::builder();
     // Reqwest's 30-second TCP deadline can close a long provider stream
     // independently of Lofi's response-start timeout.
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     let builder = builder.tcp_user_timeout(None);
-    builder.build().map_err(|e| Error::Http(e.to_string()))
+    let client = builder.build().map_err(|e| Error::Http(e.to_string()))?;
+    Ok(CLIENT.get_or_init(|| client).clone())
 }
 
 pub(crate) async fn send_stream_request(
@@ -381,10 +386,7 @@ pub async fn fetch_models(
     headers: &HashMap<String, String>,
     auth: bool,
 ) -> Result<Value> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))?;
+    let client = http_client()?;
     let req = if auth {
         authed_get(&client, api, api_key, url)
     } else {
@@ -394,7 +396,8 @@ pub async fn fetch_models(
         apply_headers(req, headers)
     } else {
         req
-    };
+    }
+    .timeout(std::time::Duration::from_secs(30));
     let resp = req.send().await.map_err(|error| {
         provider_transport_error(error, lofi_error::ProviderPhase::ResponseStart)
     })?;

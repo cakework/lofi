@@ -156,11 +156,13 @@ pub(super) fn replay_indexed_session(
         Ok(())
     })?;
     let applied_offsets = accounting_offsets(index, &visible, &notices, &records);
-    let mut outcomes: Vec<SessionEvent> = Vec::with_capacity(applied_offsets.len());
-    cursor.visit_events(&applied_offsets, |ev| {
-        outcomes.push(ev);
-        Ok(())
-    })?;
+    let applied_set: HashSet<u64> = applied_offsets.iter().copied().collect();
+    let mut outcomes: Vec<(u64, SessionEvent)> = candidates
+        .into_iter()
+        .zip(records)
+        .filter(|(offset, _)| applied_set.contains(offset))
+        .collect();
+    outcomes.sort_by_key(|(offset, _)| *offset);
     let mut next_outcome = 0usize;
     for (turn, &start_pos) in starts.iter().enumerate() {
         let end_pos = starts.get(turn + 1).copied().unwrap_or(visible.len());
@@ -186,8 +188,8 @@ pub(super) fn replay_indexed_session(
         // subagent's spend that followed it belongs to this range: apply what
         // the sweep read, or the gauges drift. A killed turn's spend lands in
         // the row it opened, before the next turn reports its own.
-        while next_outcome < applied_offsets.len() && applied_offsets[next_outcome] < end {
-            let event = &outcomes[next_outcome];
+        while next_outcome < outcomes.len() && outcomes[next_outcome].0 < end {
+            let event = &outcomes[next_outcome].1;
             next_outcome += 1;
             replay_selected_session_events(std::slice::from_ref(event), |ev| {
                 app.apply_file_backed_replay_event(ev);

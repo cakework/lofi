@@ -524,6 +524,37 @@ impl SessionCursor {
         load_indexed_path(&self.path, &index, leaf.as_deref())
     }
 
+    /// Count assistant messages on the selected lineage after the latest
+    /// compaction marker, using only the cached compaction index. Returns
+    /// `usize::MAX` when the selected lineage has never compacted.
+    /// # Errors
+    /// Propagates indexing failures when the compaction index must be loaded.
+    pub fn assistant_messages_since_last_compact(&self) -> Result<usize> {
+        let leaf = self.lock_leaf();
+        let count_in = |index: &[EventIndex]| -> Result<usize> {
+            let lineage = super::index::lineage_indices(index, leaf.as_deref())?;
+            let Some(last_compaction) = lineage
+                .iter()
+                .rposition(|&i| index[i].kind == IndexKind::Compaction)
+            else {
+                return Ok(usize::MAX);
+            };
+            Ok(lineage[last_compaction + 1..]
+                .iter()
+                .filter(|&&i| index[i].kind == IndexKind::AssistantMessage)
+                .count())
+        };
+        if let Some(index) = self.lock_compaction_index().as_ref() {
+            return count_in(index);
+        }
+        let (_meta, index, _size) = load_index(&self.path)?;
+        let index = indexed_lineage(index, leaf.as_deref())?;
+        let suffix = compaction_index_suffix(&self.path, &index)?;
+        let count = count_in(&suffix)?;
+        *self.lock_compaction_index() = Some(suffix);
+        Ok(count)
+    }
+
     /// # Errors
     /// Propagates indexing and event parsing failures.
     pub fn load_compaction_events(&self) -> Result<Vec<SessionEvent>> {

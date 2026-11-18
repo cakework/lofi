@@ -148,8 +148,8 @@ pub(super) fn attach(
             "auto_mode.model: a decision model belongs in decision_model".to_string(),
         ));
     }
-    let factory = BackendFactory::new(config.clone(), &executor.root, Vec::new())?
-        .with_resolved_registry(registry.clone());
+    let factory =
+        BackendFactory::from_resolved(config.clone(), registry.clone(), &executor.root, Vec::new());
     let evaluator = factory
         .open_resolved(Some(&query), executor.clone())
         .map_err(|error| Error::Config(format!("auto_mode.model: {error}")))?;
@@ -213,8 +213,12 @@ fn attach_decision(
     // prompt shows. Without one, the ask goes straight to the user.
     let gate = match auto_cfg.chat_query() {
         Some(chat_query) => {
-            let factory = BackendFactory::new(config.clone(), &executor.root, Vec::new())?
-                .with_resolved_registry(registry.clone());
+            let factory = BackendFactory::from_resolved(
+                config.clone(),
+                registry.clone(),
+                &executor.root,
+                Vec::new(),
+            );
             let evaluator = factory
                 .open_resolved(Some(&chat_query), executor.clone())
                 .map_err(|error| Error::Config(format!("auto_mode.model: {error}")))?;
