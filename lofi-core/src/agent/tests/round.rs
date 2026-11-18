@@ -200,13 +200,12 @@ async fn run_once_exec_without_return_or_logs_reports_success() {
 #[tokio::test]
 async fn run_once_exec_reports_unawaited_bash_failure() {
     let dir = tempdir().unwrap();
-    let agent = Agent {
-        shell_policy: lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
+    let mut agent = agent_with(vec![exec_round("lofi.bash({ cmd: 'exit 7' })")], dir.path());
+    agent.executor.shell_policy =
+        lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
             yolo: true,
             ..lofi_types::ShellPolicyConfig::default()
-        }),
-        ..agent_with(vec![exec_round("lofi.bash({ cmd: 'exit 7' })")], dir.path())
-    };
+        });
     let mut messages = vec![user_msg("go")];
 
     assert!(!agent.run_once(&mut messages).await.unwrap());
@@ -385,10 +384,7 @@ async fn two_exec_calls_pair_each_command_with_its_own_description() {
             stop_reason: None,
         },
     ];
-    let agent = Agent {
-        auto_mode: Some(auto),
-        ..agent_with(vec![two_calls], dir.path())
-    };
+    let agent = agent_with(vec![two_calls], dir.path()).with_auto_mode(auto);
     let mut messages = vec![user_msg("go")];
 
     assert!(!agent.run_once(&mut messages).await.unwrap());
@@ -419,15 +415,13 @@ async fn run_once_exec_description_reaches_the_shell_gate() {
             })
         })
     };
-    let agent = Agent {
-        auto_mode: Some(auto),
-        ..agent_with(
-            vec![exec_round(
-                "return (await lofi.bash({ cmd: 'special-cmd' })).ok",
-            )],
-            dir.path(),
-        )
-    };
+    let agent = agent_with(
+        vec![exec_round(
+            "return (await lofi.bash({ cmd: 'special-cmd' })).ok",
+        )],
+        dir.path(),
+    )
+    .with_auto_mode(auto);
     let mut messages = vec![user_msg("go")];
 
     assert!(!agent.run_once(&mut messages).await.unwrap());

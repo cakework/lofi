@@ -117,8 +117,8 @@ impl BuiltinTools {
 
         // Bound one subagent's process tree; the session itself is
         // uncapped here (its jobs end with the turn or the session).
-        if let Some(owner) = &self.job_owner {
-            if self.jobs.running_count_for(owner) >= MAX_JOBS_PER_OWNER {
+        if let Some(owner) = &self.session.job_owner {
+            if self.session.jobs.running_count_for(owner) >= MAX_JOBS_PER_OWNER {
                 return Ok(json!({
                     "ok": false,
                     "error": format!("subagent job cap reached ({MAX_JOBS_PER_OWNER} running)"),
@@ -126,13 +126,14 @@ impl BuiltinTools {
             }
         }
 
-        let generation = self.jobs.inner.generation.load(Ordering::SeqCst);
+        let generation = self.session.jobs.inner.generation.load(Ordering::SeqCst);
         // The handle names the log file as well as the job, and a tmp dir can
         // hold a file an earlier process left there (a session restart, or two
         // registries in one dir). Take the next handle instead of failing.
         let (id, log_path, log_file) = loop {
-            let id = self.jobs.inner.ids.next();
+            let id = self.session.jobs.inner.ids.next();
             let log_path = self
+                .session
                 .tmp_dir
                 .join(format!("lofi-job-{}.log", short_id(id)))
                 .to_string_lossy()
@@ -167,7 +168,7 @@ impl BuiltinTools {
         };
 
         let mut command = Command::new("sh");
-        command.arg("-c").arg(&cmd).current_dir(&self.root);
+        command.arg("-c").arg(&cmd).current_dir(&self.session.root);
         if let Some(pty) = &pty {
             let stdin = pty.slave.try_clone().map_err(Error::Io)?;
             let stdout = pty.slave.try_clone().map_err(Error::Io)?;
@@ -204,7 +205,7 @@ impl BuiltinTools {
                 .stderr(std::process::Stdio::from(stderr_file))
                 .process_group(0);
         }
-        self.bash_env.apply(&mut command);
+        self.session.bash_env.apply(&mut command);
         if tty {
             command.env("TERM", "xterm-256color");
         }
@@ -237,7 +238,7 @@ impl BuiltinTools {
                 log_path: log_path.clone(),
                 timeout_ms,
                 notify,
-                owner: self.job_owner.clone(),
+                owner: self.session.job_owner.clone(),
                 tty,
                 cols,
                 rows,
@@ -258,15 +259,17 @@ impl BuiltinTools {
         });
         {
             let mut jobs = self
+                .session
                 .jobs
                 .inner
                 .jobs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let barred = self
+                .session
                 .job_owner
                 .as_deref()
-                .is_some_and(|owner| self.jobs.owner_cancelled(owner));
+                .is_some_and(|owner| self.session.jobs.owner_cancelled(owner));
             // A kill can land between the entry check and here (e.g. while
             // a policy prompt was open): reject before the job registers.
             let cancelled = self
@@ -275,7 +278,7 @@ impl BuiltinTools {
                 .is_some_and(|f| f.load(Ordering::Relaxed));
             if barred
                 || cancelled
-                || self.jobs.inner.generation.load(Ordering::SeqCst) != generation
+                || self.session.jobs.inner.generation.load(Ordering::SeqCst) != generation
             {
                 drop(jobs);
                 if let Some(pid) = pid {
@@ -285,7 +288,7 @@ impl BuiltinTools {
                 return Err(Error::Tool(if barred {
                     format!(
                         "job: owning subagent {} was killed",
-                        self.job_owner.as_deref().unwrap_or_default()
+                        self.session.job_owner.as_deref().unwrap_or_default()
                     )
                 } else if cancelled {
                     "jobSpawn: run cancelled".into()
@@ -309,15 +312,16 @@ impl BuiltinTools {
         // outlive this exec worker, so prefer the runtime the registry was
         // built on over this call's.
         let driver = run_job(
-            Arc::downgrade(&self.jobs.inner),
+            Arc::downgrade(&self.session.jobs.inner),
             handle,
             child,
             deadline,
             generation,
             driver_master,
-            self.bash_env.clone(),
+            self.session.bash_env.clone(),
         );
         let runtime = self
+            .session
             .jobs
             .inner
             .driver_runtime
@@ -335,7 +339,7 @@ impl BuiltinTools {
             "id": short_id(id),
             "state": "running",
             "command": cmd,
-            "directory": self.root.display().to_string(),
+            "directory": self.session.root.display().to_string(),
             "pid": pid,
             "timeoutMs": timeout_ms,
             "logPath": log_path,
@@ -356,14 +360,14 @@ impl BuiltinTools {
     #[allow(clippy::unused_async)]
     pub async fn job_status(&self, args: Value) -> Result<Value> {
         let id = parse_id(&args)?;
-        let Some(handle) = self.jobs.get(id) else {
+        let Some(handle) = self.session.jobs.get(id) else {
             return Ok(no_such_job(id));
         };
         let job = handle
             .data
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(job.to_json(&self.root))
+        Ok(job.to_json(&self.session.root))
     }
 
     /// List every job this session spawned, newest first. Each entry is the
@@ -377,6 +381,7 @@ impl BuiltinTools {
     #[allow(clippy::unused_async)]
     pub async fn job_list(&self, _args: Value) -> Result<Value> {
         let entries: Vec<Value> = self
+            .session
             .jobs
             .list()
             .into_iter()
@@ -385,7 +390,7 @@ impl BuiltinTools {
                     .data
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                job.to_json(&self.root)
+                job.to_json(&self.session.root)
             })
             .collect();
         Ok(json!({ "ok": true, "jobs": entries }))
@@ -402,7 +407,7 @@ impl BuiltinTools {
     /// the log file cannot be read.
     pub async fn job_read(&self, args: Value) -> Result<Value> {
         let id = parse_id(&args)?;
-        let Some(handle) = self.jobs.get(id) else {
+        let Some(handle) = self.session.jobs.get(id) else {
             return Ok(no_such_job(id));
         };
         let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0);
@@ -426,7 +431,7 @@ impl BuiltinTools {
             Err(e) => return Err(Error::Io(e)),
         };
         let mut chunk = String::from_utf8_lossy(&bytes).into_owned();
-        self.bash_env.redact(&mut chunk);
+        self.session.bash_env.redact(&mut chunk);
         Ok(json!({
             "ok": true,
             "id": short_id(id),
@@ -447,7 +452,7 @@ impl BuiltinTools {
     #[allow(clippy::unused_async)]
     pub async fn job_screen(&self, args: Value) -> Result<Value> {
         let id = parse_id(&args)?;
-        let Some(handle) = self.jobs.get(id) else {
+        let Some(handle) = self.session.jobs.get(id) else {
             return Ok(no_such_job(id));
         };
         let screen = handle
@@ -467,7 +472,7 @@ impl BuiltinTools {
             .iter()
             .map(|line| {
                 let mut text: String = line.spans.iter().map(|span| span.text.as_str()).collect();
-                self.bash_env.redact(&mut text);
+                self.session.bash_env.redact(&mut text);
                 text.trim_end().to_string()
             })
             .collect();
@@ -487,7 +492,7 @@ impl BuiltinTools {
     #[allow(clippy::unused_async)]
     pub async fn job_kill(&self, args: Value) -> Result<Value> {
         let id = parse_id(&args)?;
-        let Some(handle) = self.jobs.get(id) else {
+        let Some(handle) = self.session.jobs.get(id) else {
             return Ok(no_such_job(id));
         };
         let reason = args
@@ -495,12 +500,12 @@ impl BuiltinTools {
             .and_then(Value::as_str)
             .unwrap_or("killed by agent")
             .to_owned();
-        let was_running = self.jobs.kill(id);
+        let was_running = self.session.jobs.kill(id);
         let job = handle
             .data
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut v = job.to_json(&self.root);
+        let mut v = job.to_json(&self.session.root);
         v["reason"] = json!(reason);
         v["killed"] = json!(was_running);
         Ok(v)
@@ -517,7 +522,7 @@ impl BuiltinTools {
     #[allow(clippy::unused_async)]
     pub async fn job_notify(&self, args: Value) -> Result<Value> {
         let id = parse_id(&args)?;
-        let Some(handle) = self.jobs.get(id) else {
+        let Some(handle) = self.session.jobs.get(id) else {
             return Ok(no_such_job(id));
         };
         let mut job = handle
@@ -562,7 +567,7 @@ impl BuiltinTools {
     #[allow(clippy::unused_async)]
     pub async fn job_type(&self, args: Value) -> Result<Value> {
         let id = parse_id(&args)?;
-        let Some(handle) = self.jobs.get(id) else {
+        let Some(handle) = self.session.jobs.get(id) else {
             return Ok(no_such_job(id));
         };
         let text = require_str("jobType", &args, "text")?;
@@ -581,7 +586,7 @@ impl BuiltinTools {
     #[allow(clippy::unused_async)]
     pub async fn job_key_press(&self, args: Value) -> Result<Value> {
         let id = parse_id(&args)?;
-        let Some(handle) = self.jobs.get(id) else {
+        let Some(handle) = self.session.jobs.get(id) else {
             return Ok(no_such_job(id));
         };
         let key = require_str("jobKeyPress", &args, "key")?;

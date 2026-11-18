@@ -10,7 +10,7 @@ impl BuiltinTools {
         let path = require_str("write", &args, "path")?;
         let text = require_str("write", &args, "text")?;
         let content = text.clone();
-        reject_symlink_leaf(&self.root, &path, &format!("write {path}"))?;
+        reject_symlink_leaf(&self.session.root, &path, &format!("write {path}"))?;
         let resolved = self.resolve_mutate(&path).await?;
         reject_non_regular(&format!("write {path}"), &resolved)?;
         let label = path.clone();
@@ -18,6 +18,7 @@ impl BuiltinTools {
         // it is created private and only here; a workspace path keeps the
         // modes the workspace gives it.
         let host_file = self
+            .session
             .memory
             .as_ref()
             .filter(|file| file.path == resolved)

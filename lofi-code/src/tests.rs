@@ -33,40 +33,22 @@ use tempfile::tempdir;
 fn ctx(root: &std::path::Path) -> ExecCtx {
     let tmp_dir = std::env::temp_dir().join("lofi-test");
     let _ = std::fs::create_dir_all(&tmp_dir);
-    ExecCtx {
-        root: root.to_path_buf(),
+    let session = crate::ToolSession::new(
+        root.to_path_buf(),
         tmp_dir,
-        strings: HashMap::new(),
-        on_tool_event: None,
-        recall: None,
-        result: None,
-        bash_env: BashEnv::default(),
-        shell_policy: crate::policy::defaults::resolve(&lofi_types::ShellPolicyConfig::default()),
-        confirm: None,
-        approve_dir: None,
-        grants: Vec::new(),
-        auto_mode: None,
-        intent: None,
-        approval_timeout: None,
-        policy_override: crate::policy::PolicyOverride::default(),
-        skills_dir: None,
-        memory: None,
-        truncate: crate::tools::truncate::TruncatedCap::default(),
-        jobs: crate::tools::JobRegistry::new(),
-        timers: crate::tools::TimerRegistry::new(),
-        job_owner: None,
-        on_job_acquired: None,
-        subagent: None,
-        models: None,
-    }
+        BashEnv::default(),
+        crate::policy::defaults::resolve(&lofi_types::ShellPolicyConfig::default()),
+    );
+    ExecCtx::from_session(std::sync::Arc::new(session))
 }
 
 fn trusted_ctx(root: &std::path::Path) -> ExecCtx {
     let mut ctx = ctx(root);
-    ctx.shell_policy = crate::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        yolo: true,
-        ..lofi_types::ShellPolicyConfig::default()
-    });
+    std::sync::Arc::make_mut(&mut ctx.session).shell_policy =
+        crate::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
+            yolo: true,
+            ..lofi_types::ShellPolicyConfig::default()
+        });
     ctx
 }
 
@@ -346,32 +328,8 @@ async fn exec_strings_exposed_as_lofi_strings() {
     let dir = tempdir().unwrap();
     let mut strings = HashMap::new();
     strings.insert("greeting".to_string(), "hello".to_string());
-    let cx = ExecCtx {
-        root: dir.path().to_path_buf(),
-        tmp_dir: std::env::temp_dir().join("lofi-test"),
-        strings,
-        on_tool_event: None,
-        recall: None,
-        result: None,
-        bash_env: BashEnv::default(),
-        shell_policy: crate::policy::defaults::resolve(&lofi_types::ShellPolicyConfig::default()),
-        confirm: None,
-        approve_dir: None,
-        grants: Vec::new(),
-        auto_mode: None,
-        intent: None,
-        approval_timeout: None,
-        policy_override: crate::policy::PolicyOverride::default(),
-        skills_dir: None,
-        memory: None,
-        truncate: crate::tools::truncate::TruncatedCap::default(),
-        jobs: crate::tools::JobRegistry::new(),
-        timers: crate::tools::TimerRegistry::new(),
-        job_owner: None,
-        on_job_acquired: None,
-        subagent: None,
-        models: None,
-    };
+    let mut cx = ctx(dir.path());
+    cx.strings = strings;
     let res = exec(
         "return lofi_strings.greeting;",
         &cx,
@@ -1074,7 +1032,7 @@ async fn exec_usage_without_hook_reports_unavailable() {
 async fn exec_models_lists_choices() {
     let dir = tempdir().unwrap();
     let mut c = ctx(dir.path());
-    c.models = Some(Arc::new(
+    std::sync::Arc::make_mut(&mut c.session).models = Some(Arc::new(
         || json!({ "models": [{ "model": "p/m", "name": "M", "thinking_levels": ["off"], "service_tiers": [] }] }),
     ));
     let res = exec(
@@ -1433,7 +1391,11 @@ async fn exec_starts_no_command_whose_own_timeout_has_already_passed() {
     // No clock at all, so the run is not what refuses this: the command's own
     // zero timeout is. A spawn from here fails, so an I/O error would report
     // instead if the check ran after it.
-    c.root = dir.path().join("no-such-workdir");
+    c.session = std::sync::Arc::new(
+        (*c.session)
+            .clone()
+            .with_root(dir.path().join("no-such-workdir")),
+    );
 
     let res = exec(
         "return await lofi.bash({ cmd: 'echo hi', timeoutMs: 0, steer: false });",

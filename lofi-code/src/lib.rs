@@ -33,7 +33,8 @@ pub use ctx::{
     ApproveDirFn, AutoModeFn, AutoModeHintHandle, AutoModeHints, AutoModeHintsHandle,
     AutoModeOutcome, AutoModeQuery, ConfirmFn, ConfirmPrompt, ConfirmReason, DirApproval, ExecCtx,
     ExecImage, ExecOptions, ExecResult, GrantedDir, JobAcquireFn, JobRelease, JobReleaseFn,
-    ModelsFn, RecallFn, ResultFn, SubagentFn, SubagentOp, ToolEvent, DEFAULT_GUEST_TIMEOUT,
+    ModelsFn, RecallFn, ResultFn, SubagentFn, SubagentOp, ToolEvent, ToolSession,
+    DEFAULT_GUEST_TIMEOUT,
 };
 pub use run::exec;
 pub use tools::fs::canonicalize_up;

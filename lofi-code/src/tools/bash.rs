@@ -79,11 +79,14 @@ impl BuiltinTools {
         // Allow-all auto-passes allow and ask decisions but explicit deny
         // rules still block; deny-all is absolute and overrides even the
         // allow list.
-        let mode = self.policy_override.effective(self.auto_mode.is_some());
+        let mode = self
+            .session
+            .policy_override
+            .effective(self.session.auto_mode.is_some());
         if mode == lofi_types::BashApprovalMode::DenyAll {
             return Some(self.blocked_result(cmd, "blocked by session policy: deny all commands"));
         }
-        let decision = self.shell_policy.evaluate(cmd);
+        let decision = self.session.shell_policy.evaluate(cmd);
         let suffix = decision
             .matched_command
             .as_deref()
@@ -93,7 +96,7 @@ impl BuiltinTools {
         // only what would otherwise run or prompt. The backgrounding deny
         // has no opt-out: it stays a refusal with and without steering.
         if steer && decision.action != lofi_types::PolicyAction::Deny {
-            if let Some(msg) = super::steer::refusal_for(cmd, &self.shell_policy.wrappers) {
+            if let Some(msg) = super::steer::refusal_for(cmd, &self.session.shell_policy.wrappers) {
                 return Some(self.blocked_result(cmd, &msg));
             }
         }
@@ -127,9 +130,9 @@ impl BuiltinTools {
                     // An explicit `ask (manual)` pick bypasses an available
                     // auto mode; `ask (auto)` falls back to the manual
                     // prompt when no auto mode is configured.
-                    let use_auto =
-                        mode == lofi_types::BashApprovalMode::AskAuto && self.auto_mode.is_some();
-                    match (use_auto, &self.auto_mode) {
+                    let use_auto = mode == lofi_types::BashApprovalMode::AskAuto
+                        && self.session.auto_mode.is_some();
+                    match (use_auto, &self.session.auto_mode) {
                         (true, Some(auto_mode)) => self.auto_mode_decision(cmd, auto_mode).await,
                         _ => {
                             self.confirm_decision(
@@ -198,7 +201,7 @@ impl BuiltinTools {
             "output": output,
             "code": Value::Null,
             "command": cmd,
-            "directory": self.root.display().to_string(),
+            "directory": self.session.root.display().to_string(),
             "signal": Value::Null,
             "duration_ms": duration_ms,
             "status": status,
@@ -214,7 +217,7 @@ impl BuiltinTools {
             "output": output,
             "code": Value::Null,
             "command": cmd,
-            "directory": self.root.display().to_string(),
+            "directory": self.session.root.display().to_string(),
             "signal": Value::Null,
             "duration_ms": 0,
             "status": "blocked",
@@ -367,12 +370,12 @@ impl BuiltinTools {
         command
             .arg("-c")
             .arg(cmd)
-            .current_dir(&self.root)
+            .current_dir(&self.session.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        self.bash_env.apply(&mut command);
+        self.session.bash_env.apply(&mut command);
         command
     }
 
@@ -401,7 +404,7 @@ impl BuiltinTools {
                     "output": output,
                     "code": status.code(),
                     "command": cmd,
-                    "directory": self.root.display().to_string(),
+                    "directory": self.session.root.display().to_string(),
                     "signal": status.signal(),
                     "duration_ms": duration_ms,
                     // One vocabulary with a run and a job: a signal death is a
@@ -544,7 +547,7 @@ impl BuiltinTools {
         let mut merged = out;
         merged.extend_from_slice(&err);
         let mut full = String::from_utf8_lossy(&merged).into_owned();
-        self.bash_env.redact(&mut full);
+        self.session.bash_env.redact(&mut full);
 
         self.bash_result_json(
             &cmd,
@@ -565,7 +568,7 @@ impl BuiltinTools {
         // A command's conventional final newline terminates its last line; it
         // is not an additional blank line and must not consume one tail slot.
         let truncation_input = full.strip_suffix('\n').unwrap_or(full);
-        let cap = self.truncate;
+        let cap = self.session.truncate;
         let t = truncate_tail_with(truncation_input, cap.max_lines, cap.max_bytes);
         if !t.truncated && !pipe_capped {
             return full.to_string();
@@ -605,7 +608,7 @@ impl BuiltinTools {
         use std::os::unix::fs::OpenOptionsExt as _;
 
         let id = temp_id();
-        let path = self.tmp_dir.join(format!("lofi-bash-{id}.log"));
+        let path = self.session.tmp_dir.join(format!("lofi-bash-{id}.log"));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -614,7 +617,7 @@ impl BuiltinTools {
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
         drop(f);
-        std::fs::File::open(&self.tmp_dir)?.sync_all()?;
+        std::fs::File::open(&self.session.tmp_dir)?.sync_all()?;
         Ok(path.to_string_lossy().into_owned())
     }
 }

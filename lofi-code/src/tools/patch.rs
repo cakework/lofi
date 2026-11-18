@@ -22,7 +22,7 @@ impl BuiltinTools {
     pub async fn patch(&self, args: Value) -> Result<Value> {
         let path = require_str("patch", &args, "path")?;
         let diff_text = require_str("patch", &args, "patch")?;
-        reject_symlink_leaf(&self.root, &path, &format!("patch {path}"))?;
+        reject_symlink_leaf(&self.session.root, &path, &format!("patch {path}"))?;
         let resolved = self.resolve_mutate(&path).await?;
         reject_non_regular(&format!("patch {path}"), &resolved)?;
         let label = path.clone();

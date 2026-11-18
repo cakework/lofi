@@ -94,7 +94,7 @@ impl BuiltinTools {
             all_lines[start..].join("\n")
         };
         let start_line = start + 1;
-        let cap = self.truncate;
+        let cap = self.session.truncate;
         let t = truncate_head_with(&selected, cap.max_lines, cap.max_bytes);
         let limit_remaining = limit.is_some() && start + t.output_lines < all_lines.len();
         let truncated = t.truncated || limit_remaining;

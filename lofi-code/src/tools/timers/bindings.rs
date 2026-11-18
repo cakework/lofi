@@ -81,6 +81,7 @@ impl BuiltinTools {
         // the completion notice arrives as a new user message once the turn
         // ends, not while the sleep holds the exec open.
         let notifying = self
+            .session
             .jobs
             .snapshot()
             .iter()
@@ -118,9 +119,11 @@ impl BuiltinTools {
         if !self.timer_slot_available() {
             return Ok(timer_cap_reached());
         }
-        let id = self
-            .timers
-            .schedule_at(self.job_owner.as_deref(), at_time, message.clone());
+        let id = self.session.timers.schedule_at(
+            self.session.job_owner.as_deref(),
+            at_time,
+            message.clone(),
+        );
         Ok(json!({
             "ok": true,
             "id": lofi_types::short_id(id),
@@ -155,9 +158,11 @@ impl BuiltinTools {
         if !self.timer_slot_available() {
             return Ok(timer_cap_reached());
         }
-        let id = self
-            .timers
-            .schedule_every(self.job_owner.as_deref(), interval, message.clone());
+        let id = self.session.timers.schedule_every(
+            self.session.job_owner.as_deref(),
+            interval,
+            message.clone(),
+        );
         Ok(json!({
             "ok": true,
             "id": lofi_types::short_id(id),
@@ -173,17 +178,20 @@ impl BuiltinTools {
     /// Cannot fail; the signature stays uniform with the other bindings.
     #[allow(clippy::unused_async)]
     pub async fn notify_cancel(&self, _args: Value) -> Result<Value> {
-        let cancelled = self.timers.cancel_owner(self.job_owner.as_deref());
+        let cancelled = self
+            .session
+            .timers
+            .cancel_owner(self.session.job_owner.as_deref());
         Ok(json!({ "ok": true, "cancelled": cancelled }))
     }
 
     /// Subagent timers stay bounded; the session's own are uncapped here,
     /// matching the job cap.
     fn timer_slot_available(&self) -> bool {
-        let Some(owner) = self.job_owner.as_deref() else {
+        let Some(owner) = self.session.job_owner.as_deref() else {
             return true;
         };
-        self.timers.pending_for(Some(owner)) < MAX_TIMERS_PER_OWNER
+        self.session.timers.pending_for(Some(owner)) < MAX_TIMERS_PER_OWNER
     }
 }
 

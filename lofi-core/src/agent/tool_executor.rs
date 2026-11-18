@@ -236,6 +236,7 @@ pub struct ToolExecutor {
     pub(super) subagent_support: Option<super::SubagentSupport>,
     /// `lofi.models` hook, `None` where the host has no model registry.
     pub(super) models: Option<lofi_code::ModelsFn>,
+    pub(super) session_cache: Arc<std::sync::OnceLock<Arc<lofi_code::ToolSession>>>,
 }
 
 /// Hooks for one tool call. All callbacks belong to the owning session.
@@ -329,7 +330,36 @@ impl ToolExecutor {
             subagents: super::SubagentRegistry::with_ids(ids),
             subagent_support: None,
             models: None,
+            session_cache: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+
+    pub(crate) fn invalidate_session(&mut self) {
+        self.session_cache = Arc::new(std::sync::OnceLock::new());
+    }
+
+    fn tool_session(&self) -> Arc<lofi_code::ToolSession> {
+        self.session_cache
+            .get_or_init(|| {
+                let mut session = lofi_code::ToolSession::new(
+                    self.root.clone(),
+                    self.tmp_dir.clone(),
+                    self.bash_env.clone(),
+                    self.shell_policy.clone(),
+                )
+                .with_skills_dir(self.skills_dir.clone())
+                .with_grants(self.grants.clone())
+                .with_memory(self.memory.clone());
+                session.auto_mode.clone_from(&self.auto_mode);
+                session.policy_override = self.policy_override.clone();
+                session.truncate = self.truncate;
+                session.jobs = self.jobs.clone();
+                session.timers = self.timers.clone();
+                session.job_owner.clone_from(&self.job_owner);
+                session.models.clone_from(&self.models);
+                Arc::new(session)
+            })
+            .clone()
     }
 
     /// Configure shell approval without loading unrelated model providers.
@@ -385,6 +415,7 @@ impl ToolExecutor {
     pub fn with_subagent_support(mut self, support: super::SubagentSupport) -> Self {
         self.models = Some(support.models_fn());
         self.subagent_support = Some(support);
+        self.invalidate_session();
         self
     }
 
@@ -403,6 +434,7 @@ impl ToolExecutor {
         self.subagent = None;
         self.models = None;
         self.subagent_support = None;
+        self.invalidate_session();
         self
     }
 
@@ -418,6 +450,7 @@ impl ToolExecutor {
     #[must_use]
     pub fn with_skills_dir(mut self, path: Option<PathBuf>) -> Self {
         self.skills_dir = path;
+        self.invalidate_session();
         self
     }
 
@@ -440,6 +473,7 @@ impl ToolExecutor {
         // also form an Arc cycle with the entries that hold the children.
         self.subagents = super::SubagentRegistry::default();
         self.subagent_support = None;
+        self.invalidate_session();
         self.reset_exec_worker()
     }
 
@@ -472,6 +506,7 @@ impl ToolExecutor {
     #[must_use]
     pub fn with_auto_mode(mut self, auto_mode: Option<lofi_code::AutoModeFn>) -> Self {
         self.auto_mode = auto_mode;
+        self.invalidate_session();
         self
     }
 
@@ -881,18 +916,13 @@ impl ToolExecutor {
                 }) as lofi_code::SubagentFn
             });
             let exec_ctx = ExecCtx {
-                root: self.root.clone(),
-                tmp_dir: self.tmp_dir.clone(),
+                session: self.tool_session(),
                 strings,
                 recall: recall.clone(),
                 result: result.clone(),
                 on_tool_event: Some(on_tool_event),
-                bash_env: self.bash_env.clone(),
-                shell_policy: self.shell_policy.clone(),
                 confirm,
                 approve_dir,
-                grants: self.grants.clone(),
-                auto_mode: self.auto_mode.clone(),
                 // The stated description travels with this call's context,
                 // so the gate judges this call's commands with this call's
                 // intent however the call's future is dropped or queued.
@@ -913,16 +943,8 @@ impl ToolExecutor {
                                 wait.min(left).max(std::time::Duration::from_millis(1))
                             })
                     }),
-                policy_override: self.policy_override.clone(),
-                skills_dir: self.skills_dir.clone(),
-                memory: self.memory.clone(),
-                truncate: self.truncate,
-                jobs: self.jobs.clone(),
-                timers: self.timers.clone(),
-                job_owner: self.job_owner.clone(),
                 on_job_acquired: on_job_acquired.clone(),
                 subagent: subagent.clone(),
-                models: self.models.clone(),
             };
             let outcome = self
                 .sandbox_worker()

@@ -48,13 +48,13 @@ impl BuiltinTools {
     fn resolve_skill_path(&self, name: &str) -> Result<(PathBuf, &'static str)> {
         validate_skill_name(name)?;
 
-        let ws_skills = self.root.join(".lofi").join("skills");
+        let ws_skills = self.session.root.join(".lofi").join("skills");
         let ws_path = ws_skills.join(name).join(SKILL_FILE);
         if ws_path.is_file() {
             return Ok((ws_path, "workspace"));
         }
 
-        if let Some(dir) = &self.skills_dir {
+        if let Some(dir) = &self.session.skills_dir {
             let g_path = dir.join(name).join(SKILL_FILE);
             if g_path.is_file() {
                 return Ok((g_path, "global"));
@@ -68,11 +68,11 @@ impl BuiltinTools {
         let mut map: std::collections::BTreeMap<String, (String, String, String)> =
             std::collections::BTreeMap::new();
 
-        if let Some(dir) = &self.skills_dir {
+        if let Some(dir) = &self.session.skills_dir {
             Self::walk_skills(dir, "global", &mut map)?;
         }
 
-        let ws_skills = self.root.join(".lofi").join("skills");
+        let ws_skills = self.session.root.join(".lofi").join("skills");
         Self::walk_skills(&ws_skills, "workspace", &mut map)?;
 
         if map.len() > MAX_SKILLS {

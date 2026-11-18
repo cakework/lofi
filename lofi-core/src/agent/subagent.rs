@@ -1174,23 +1174,23 @@ impl Agent {
     /// agent has no subagent support (nested subagent agents).
     #[must_use]
     pub fn subagent_hook(&self) -> Option<SubagentFn> {
-        let Some(support) = self.subagent_support.clone() else {
+        let Some(support) = self.executor.subagent_support.clone() else {
             // A child cannot manage runs, but it keeps the mailbox: the hook
             // answers the three mailbox ops and reports every other op as
             // unavailable.
-            return self.mailbox.clone().map(mailbox_hook);
+            return self.executor.mailbox.clone().map(mailbox_hook);
         };
         Some(backend_hook(
             Arc::new(self.clone()),
             support,
-            self.subagents.clone(),
+            self.executor.subagents.clone(),
         ))
     }
 
     /// Attach subagent support so the agent's sandbox exposes `lofi.subagent`.
     #[must_use]
     pub fn with_subagent_support(mut self, support: SubagentSupport) -> Self {
-        self.subagent_support = Some(support);
+        self.executor = self.executor.with_subagent_support(support);
         self
     }
 
@@ -1198,8 +1198,10 @@ impl Agent {
     /// agent has no subagent support.
     #[must_use]
     pub fn with_subagent_persistence(mut self, persist_sessions: bool) -> Self {
-        if let Some(support) = self.subagent_support.take() {
-            self.subagent_support = Some(support.with_persistence(persist_sessions));
+        if let Some(support) = self.executor.subagent_support.take() {
+            self.executor = self
+                .executor
+                .with_subagent_support(support.with_persistence(persist_sessions));
         }
         self
     }
@@ -3245,6 +3247,7 @@ pub(super) fn isolate_auto_mode(executor: &mut ToolExecutor, support: &SubagentS
     if support.config.shell_policy.auto_mode.is_none() {
         executor.auto_mode = None;
         executor.auto_mode_config = None;
+        executor.invalidate_session();
         return;
     }
     // The session config is unresolved and its provider table is pruned to the
@@ -3252,6 +3255,7 @@ pub(super) fn isolate_auto_mode(executor: &mut ToolExecutor, support: &SubagentS
     // opened: same catalog entry, same resolved credentials.
     let Some(config) = executor.auto_mode_config.clone() else {
         executor.auto_mode = None;
+        executor.invalidate_session();
         return;
     };
     let mut child = executor.clone();
@@ -3266,6 +3270,7 @@ pub(super) fn isolate_auto_mode(executor: &mut ToolExecutor, support: &SubagentS
             executor.auto_mode_config = None;
         }
     }
+    executor.invalidate_session();
 }
 
 /// The child's execution state: the session's jobs, policy, truncation and

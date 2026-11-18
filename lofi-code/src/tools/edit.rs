@@ -13,7 +13,7 @@ impl BuiltinTools {
         let new = require_str("edit", &args, "new")?;
         let old_echo = old.clone();
         let new_echo = new.clone();
-        reject_symlink_leaf(&self.root, &path, &format!("edit {path}"))?;
+        reject_symlink_leaf(&self.session.root, &path, &format!("edit {path}"))?;
         let resolved = self.resolve_mutate(&path).await?;
         reject_non_regular(&format!("edit {path}"), &resolved)?;
         let label = path.clone();

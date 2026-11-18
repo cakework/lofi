@@ -41,6 +41,7 @@ pub async fn configure(
     else {
         executor.auto_mode = None;
         executor.auto_mode_config = None;
+        executor.invalidate_session();
         return Ok(executor);
     };
     let _env_guard = crate::config_loader::apply_env_specs(env);
@@ -101,6 +102,7 @@ pub(super) fn attach(
     else {
         executor.auto_mode = None;
         executor.auto_mode_config = None;
+        executor.invalidate_session();
         return Ok(());
     };
     // Two optional gates: a decision model gates first, and a chat model
@@ -162,6 +164,7 @@ pub(super) fn attach(
         &hints,
     ));
     executor.auto_mode_config = Some(std::sync::Arc::new(config.clone()));
+    executor.invalidate_session();
     Ok(())
 }
 
@@ -235,6 +238,7 @@ fn attach_decision(
     };
     executor.auto_mode = Some(gate);
     executor.auto_mode_config = Some(std::sync::Arc::new(config.clone()));
+    executor.invalidate_session();
     Ok(())
 }
 

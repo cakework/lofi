@@ -10,42 +10,22 @@ use serde_json::{json, Value};
 fn ctx(root: &Path) -> ExecCtx {
     let tmp_dir = std::env::temp_dir().join("lofi-test");
     let _ = std::fs::create_dir_all(&tmp_dir);
-    ExecCtx {
-        root: root.to_path_buf(),
+    let session = lofi_code::ToolSession::new(
+        root.to_path_buf(),
         tmp_dir,
-        strings: HashMap::new(),
-        on_tool_event: None,
-        recall: None,
-        result: None,
-        bash_env: BashEnv::default(),
-        shell_policy: lofi_code::policy::defaults::resolve(
-            &lofi_types::ShellPolicyConfig::default(),
-        ),
-        confirm: None,
-        approve_dir: None,
-        grants: Vec::new(),
-        auto_mode: None,
-        intent: None,
-        approval_timeout: None,
-        policy_override: lofi_code::policy::PolicyOverride::default(),
-        skills_dir: None,
-        memory: None,
-        truncate: lofi_code::TruncatedCap::default(),
-        jobs: lofi_code::tools::JobRegistry::new(),
-        timers: lofi_code::tools::TimerRegistry::new(),
-        job_owner: None,
-        on_job_acquired: None,
-        subagent: None,
-        models: None,
-    }
+        BashEnv::default(),
+        lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig::default()),
+    );
+    ExecCtx::from_session(std::sync::Arc::new(session))
 }
 
 fn trusted_ctx(root: &Path) -> ExecCtx {
     let mut ctx = ctx(root);
-    ctx.shell_policy = lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        yolo: true,
-        ..lofi_types::ShellPolicyConfig::default()
-    });
+    std::sync::Arc::make_mut(&mut ctx.session).shell_policy =
+        lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
+            yolo: true,
+            ..lofi_types::ShellPolicyConfig::default()
+        });
     ctx
 }
 
@@ -53,6 +33,7 @@ async fn wait_for_job(cx: &ExecCtx, id: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let running = cx
+            .session
             .jobs
             .snapshot()
             .into_iter()
@@ -362,34 +343,8 @@ async fn strings_exposed_as_lofi_strings() {
     let dir = tempfile::tempdir().unwrap();
     let mut strings = HashMap::new();
     strings.insert("greeting".to_string(), "hello".to_string());
-    let cx = ExecCtx {
-        root: dir.path().to_path_buf(),
-        tmp_dir: std::env::temp_dir().join("lofi-test"),
-        strings,
-        on_tool_event: None,
-        recall: None,
-        result: None,
-        bash_env: BashEnv::default(),
-        shell_policy: lofi_code::policy::defaults::resolve(
-            &lofi_types::ShellPolicyConfig::default(),
-        ),
-        confirm: None,
-        approve_dir: None,
-        grants: Vec::new(),
-        auto_mode: None,
-        intent: None,
-        approval_timeout: None,
-        policy_override: lofi_code::policy::PolicyOverride::default(),
-        skills_dir: None,
-        memory: None,
-        truncate: lofi_code::TruncatedCap::default(),
-        jobs: lofi_code::tools::JobRegistry::new(),
-        timers: lofi_code::tools::TimerRegistry::new(),
-        job_owner: None,
-        on_job_acquired: None,
-        subagent: None,
-        models: None,
-    };
+    let mut cx = ctx(dir.path());
+    cx.strings = strings;
     let res = exec(
         "return lofi_strings.greeting;",
         &cx,
@@ -438,14 +393,15 @@ async fn exec_bash_steering_matches_the_parsed_command() {
 async fn exec_bash_policy_deny_beats_steering() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.shell_policy = lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        yolo: true,
-        deny: vec![lofi_types::CommandEntry {
-            match_str: "sleep".into(),
-            mode: lofi_types::MatchMode::Prefix,
-        }],
-        ..lofi_types::ShellPolicyConfig::default()
-    });
+    std::sync::Arc::make_mut(&mut cx.session).shell_policy =
+        lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
+            yolo: true,
+            deny: vec![lofi_types::CommandEntry {
+                match_str: "sleep".into(),
+                mode: lofi_types::MatchMode::Prefix,
+            }],
+            ..lofi_types::ShellPolicyConfig::default()
+        });
     let src = "const on = await lofi.bash({ cmd: 'sleep 0.1' }); const off = await lofi.bash({ cmd: 'sleep 0.1', steer: false }); return { onPolicy: on.output.includes('blocked by shell policy'), onSteering: on.output.includes('Steering'), offPolicy: off.output.includes('blocked by shell policy'), offSteering: off.output.includes('Steering') };";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(
@@ -585,11 +541,13 @@ async fn memory_tool_reports_content_and_the_file_tools_update_it() {
     let dir = tempfile::tempdir().unwrap();
     let memory = dir.path().join("state").join("memory.md");
     let mut cx = ctx(dir.path());
-    cx.memory = Some(lofi_types::HostFile {
-        path: memory.clone(),
-        dir_mode: 0o700,
-        file_mode: 0o600,
-    });
+    cx.session = std::sync::Arc::new((*cx.session).clone().with_memory(Some(
+        lofi_types::HostFile {
+            path: memory.clone(),
+            dir_mode: 0o700,
+            file_mode: 0o600,
+        },
+    )));
 
     // A read with no memory yet reports the path and an empty text.
     let res = exec("return await lofi.memory();", &cx, &ExecOptions::default())
@@ -647,34 +605,8 @@ async fn write_and_edit_emit_written_content_as_result() {
         Arc::new(move |ev: ToolEvent| events.lock().unwrap().push(ev))
             as Arc<dyn Fn(ToolEvent) + Send + Sync>
     };
-    let cx = ExecCtx {
-        root: dir.path().to_path_buf(),
-        tmp_dir: std::env::temp_dir().join("lofi-test"),
-        strings: HashMap::new(),
-        on_tool_event: Some(cb),
-        recall: None,
-        result: None,
-        bash_env: BashEnv::default(),
-        shell_policy: lofi_code::policy::defaults::resolve(
-            &lofi_types::ShellPolicyConfig::default(),
-        ),
-        confirm: None,
-        approve_dir: None,
-        grants: Vec::new(),
-        auto_mode: None,
-        intent: None,
-        approval_timeout: None,
-        policy_override: lofi_code::policy::PolicyOverride::default(),
-        skills_dir: None,
-        memory: None,
-        truncate: lofi_code::TruncatedCap::default(),
-        jobs: lofi_code::tools::JobRegistry::new(),
-        timers: lofi_code::tools::TimerRegistry::new(),
-        job_owner: None,
-        on_job_acquired: None,
-        subagent: None,
-        models: None,
-    };
+    let mut cx = ctx(dir.path());
+    cx.on_tool_event = Some(cb);
     let src = "await lofi.write({path:'a.txt', text:'written line one\\nwritten line two'}); \
                await lofi.edit({path:'a.txt', old:'written line one', new:'edited line one'}); \
                return 'ok';";
@@ -718,34 +650,11 @@ async fn hook_backed_tools_emit_tool_events() {
     });
     let result: lofi_code::ResultFn = Arc::new(|id: &str| format!("result for {id}"));
     let models: lofi_code::ModelsFn = Arc::new(|| serde_json::json!({ "models": [] }));
-    let cx = ExecCtx {
-        root: dir.path().to_path_buf(),
-        tmp_dir: std::env::temp_dir().join("lofi-test"),
-        strings: HashMap::new(),
-        on_tool_event: Some(cb),
-        recall: Some(recall),
-        result: Some(result),
-        bash_env: BashEnv::default(),
-        shell_policy: lofi_code::policy::defaults::resolve(
-            &lofi_types::ShellPolicyConfig::default(),
-        ),
-        confirm: None,
-        approve_dir: None,
-        grants: Vec::new(),
-        auto_mode: None,
-        intent: None,
-        approval_timeout: None,
-        policy_override: lofi_code::policy::PolicyOverride::default(),
-        skills_dir: None,
-        memory: None,
-        truncate: lofi_code::TruncatedCap::default(),
-        jobs: lofi_code::tools::JobRegistry::new(),
-        timers: lofi_code::tools::TimerRegistry::new(),
-        job_owner: None,
-        on_job_acquired: None,
-        subagent: None,
-        models: Some(models),
-    };
+    let mut cx = ctx(dir.path());
+    cx.on_tool_event = Some(cb);
+    cx.recall = Some(recall);
+    cx.result = Some(result);
+    std::sync::Arc::make_mut(&mut cx.session).models = Some(models);
     let src = "await lofi.docs('lofi.read'); \
                await lofi.docsSearch('read'); \
                await lofi.models(); \
@@ -825,7 +734,7 @@ async fn exec_honours_configured_truncate_cap() {
     )
     .unwrap();
     let mut c = ctx(dir.path());
-    c.truncate = lofi_code::TruncatedCap {
+    std::sync::Arc::make_mut(&mut c.session).truncate = lofi_code::TruncatedCap {
         max_lines: 3,
         max_bytes: 1 << 30,
     };
@@ -849,7 +758,7 @@ async fn job_spawn_returns_immediately_and_completes() {
     // first one spawned, or the whole feature is a no-op.
     let jobs = lofi_code::tools::JobRegistry::new();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = jobs.clone();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = jobs.clone();
     let spawn = exec(
         "const r = await lofi.jobSpawn({ cmd: 'echo bg-ok' }); return r;",
         &cx,
@@ -875,7 +784,7 @@ async fn sleep_notes_a_running_background_job() {
     let dir = tempfile::tempdir().unwrap();
     let jobs = lofi_code::tools::JobRegistry::new();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = jobs.clone();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = jobs.clone();
     let spawn = exec(
         "return await lofi.jobSpawn({ cmd: 'sleep 30' });",
         &cx,
@@ -913,7 +822,7 @@ async fn job_completion_keeps_its_spawn_owner() {
     let second_finished = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let mut first = trusted_ctx(dir.path());
-    first.jobs = jobs.clone();
+    std::sync::Arc::make_mut(&mut first.session).jobs = jobs.clone();
     first.on_job_acquired = Some({
         let finished = first_finished.clone();
         std::sync::Arc::new(move |_, _cmd| {
@@ -933,7 +842,7 @@ async fn job_completion_keeps_its_spawn_owner() {
     let id = spawn.value["id"].as_str().unwrap();
 
     let mut second = trusted_ctx(dir.path());
-    second.jobs = jobs;
+    std::sync::Arc::make_mut(&mut second.session).jobs = jobs;
     second.on_job_acquired = Some({
         let finished = second_finished.clone();
         std::sync::Arc::new(move |_, _cmd| {
@@ -966,7 +875,7 @@ async fn job_completion_keeps_its_spawn_owner() {
 async fn job_spawn_without_timeout_has_no_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let spawn = exec(
         "const r = await lofi.jobSpawn({ cmd: 'echo x' }); return r.timeoutMs;",
         &cx,
@@ -982,7 +891,7 @@ async fn job_spawn_without_timeout_has_no_deadline() {
 async fn job_read_pages_output_over_a_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let spawned = exec(
         r#"return await lofi.jobSpawn({ cmd: 'printf "l1\nl2\nl3\n"' });"#,
         &cx,
@@ -1005,7 +914,7 @@ async fn job_read_pages_output_over_a_cursor() {
 async fn job_screen_returns_the_current_parsed_tty_rows() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let spawned = exec(
         r#"return await lofi.jobSpawn({ cmd: "printf 'old\\033[2K\\rnew'", tty: true, cols: 12, rows: 2 });"#,
         &cx,
@@ -1045,7 +954,7 @@ async fn job_kill_is_idempotent_and_kills_process_group() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("survivor");
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     // Foreground chain: a backgrounded subshell would be refused by shell
     // policy before the spawn ever reached the registry. Killing the PGID
     // must still take down the foreground child; if it ever returns, sleep
@@ -1065,7 +974,7 @@ async fn job_completion_queues_a_notice() {
     let dir = tempfile::tempdir().unwrap();
     let jobs = lofi_code::tools::JobRegistry::new();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = jobs.clone();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = jobs.clone();
     let spawned = exec(
         "return await lofi.jobSpawn({ cmd: 'exit 3' });",
         &cx,
@@ -1093,7 +1002,7 @@ async fn job_periodic_tick_goes_to_ui_not_model() {
     let dir = tempfile::tempdir().unwrap();
     let jobs = lofi_code::tools::JobRegistry::new();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = jobs.clone();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = jobs.clone();
     // Spawn a job that emits one line then sleeps; enable a 5s-floor tick.
     let src = "const s = await lofi.jobSpawn({ cmd: 'echo hello; sleep 20' }); await lofi.jobNotify({ id: s.id, intervalMs: 5000 }); return s.id;";
     exec(src, &cx, &ExecOptions::default()).await.unwrap();
@@ -1114,7 +1023,7 @@ async fn job_terminal_queues_a_notice() {
     let dir = tempfile::tempdir().unwrap();
     let jobs = lofi_code::tools::JobRegistry::new();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = jobs.clone();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = jobs.clone();
     let spawned = exec(
         "const s = await lofi.jobSpawn({ cmd: 'sleep 0.1' }); await lofi.jobNotify({ id: s.id, intervalMs: 5000 }); return s;",
         &cx,
@@ -1130,7 +1039,7 @@ async fn job_terminal_queues_a_notice() {
 async fn job_notify_bare_enables_periodic_at_default() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let src = "const s = await lofi.jobSpawn({ cmd: 'sleep 5' }); const n = await lofi.jobNotify({ id: s.id }); await lofi.jobKill({ id: s.id }); return n;";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value["notify"], json!(true));
@@ -1145,7 +1054,7 @@ async fn job_spawn_notify_interval_wires_through_to_status() {
     // job runs terminal-only.
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let src = "const s = await lofi.jobSpawn({ cmd: 'sleep 30', notifyIntervalMs: 6000 }); const st = await lofi.jobStatus({ id: s.id }); await lofi.jobKill({ id: s.id }); return { notify: st.notify, iv: st.notifyIntervalMs };";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value["notify"], json!(true));
@@ -1156,7 +1065,7 @@ async fn job_spawn_notify_interval_wires_through_to_status() {
 async fn job_spawn_notify_false_silences_everything() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let src = "const s = await lofi.jobSpawn({ cmd: 'sleep 30', notify: false }); const st = await lofi.jobStatus({ id: s.id }); await lofi.jobKill({ id: s.id }); return st.notify;";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value, json!(false));
@@ -1166,7 +1075,7 @@ async fn job_spawn_notify_false_silences_everything() {
 async fn job_notify_clamps_interval_floor() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let src = "const s = await lofi.jobSpawn({ cmd: 'sleep 5' }); const n = await lofi.jobNotify({ id: s.id, intervalMs: 100 }); await lofi.jobKill({ id: s.id }); return n.intervalMs;";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value, json!(5_000));
@@ -1177,7 +1086,7 @@ async fn job_notify_disabled_suppresses_notice() {
     let dir = tempfile::tempdir().unwrap();
     let jobs = lofi_code::tools::JobRegistry::new();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = jobs.clone();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = jobs.clone();
     let spawned = exec(
         "const s = await lofi.jobSpawn({ cmd: 'sleep 0.1' }); await lofi.jobNotify({ id: s.id, enabled: false }); return s;",
         &cx,
@@ -1193,7 +1102,7 @@ async fn job_notify_disabled_suppresses_notice() {
 async fn job_unknown_id_returns_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let mut cx = trusted_ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let src = "return await lofi.jobStatus({ id: '999' });";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value["ok"], json!(false));
@@ -1206,7 +1115,7 @@ async fn job_spawn_honours_shell_policy_deny() {
     // match; a background job must not bypass that.
     let dir = tempfile::tempdir().unwrap();
     let mut cx = ctx(dir.path());
-    cx.jobs = lofi_code::tools::JobRegistry::new();
+    std::sync::Arc::make_mut(&mut cx.session).jobs = lofi_code::tools::JobRegistry::new();
     let src = "return await lofi.jobSpawn({ cmd: 'echo hi' });";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value["ok"], json!(false));
@@ -1231,7 +1140,7 @@ async fn notify_at_queues_a_wake_up_notice() {
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value, json!(true));
     assert_eq!(
-        cx.timers.take_notices(),
+        cx.session.timers.take_notices(),
         vec!["notifyAt fired: check the build"]
     );
 }
@@ -1245,7 +1154,7 @@ async fn notify_cancel_cancels_pending_timers() {
                return (await lofi.notifyCancel()).cancelled;";
     let res = exec(src, &cx, &ExecOptions::default()).await.unwrap();
     assert_eq!(res.value, json!(2));
-    assert!(cx.timers.take_notices().is_empty());
+    assert!(cx.session.timers.take_notices().is_empty());
 }
 
 #[tokio::test]

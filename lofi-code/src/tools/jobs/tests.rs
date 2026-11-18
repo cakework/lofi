@@ -904,6 +904,7 @@ async fn tty_job_exposes_its_parsed_terminal_screen() {
     wait_for_log(&tools, &id, "parsed-marker").await;
 
     let screen = tools
+        .session
         .jobs
         .screen(lofi_types::parse_short_id(&id).unwrap())
         .unwrap();
@@ -930,7 +931,7 @@ async fn tty_job_exposes_its_parsed_terminal_screen() {
     assert_eq!(visible["cols"], json!(24));
     assert_eq!(visible["rows"], json!(3));
     assert_eq!(visible["lines"][0], json!("parsed-marker"));
-    assert!(tools.jobs.snapshot()[0].tty);
+    assert!(tools.session.jobs.snapshot()[0].tty);
     tools.job_kill(json!({ "id": id })).await.unwrap();
 }
 
@@ -1061,7 +1062,7 @@ async fn tty_job_queues_one_idle_notice() {
     let id = spawned["id"].as_str().unwrap().to_owned();
     // One idle window plus a little scheduling slack.
     tokio::time::sleep(Duration::from_millis(900)).await;
-    let notices = tools.jobs.take_notices();
+    let notices = tools.session.jobs.take_notices();
     let idle = notices.iter().find(|n| n.text.contains("idle"));
     assert!(idle.is_some(), "notices: {notices:?}");
     assert!(idle.unwrap().text.contains("Name?"), "notices: {notices:?}");

@@ -376,13 +376,14 @@ fn a_child_gets_its_own_context_and_no_parent_evaluator() {
 fn a_child_shares_the_parent_policy_including_an_ask_rule() {
     let dir = tempdir().unwrap();
     let mut agent = agent_with(Vec::new(), dir.path());
-    agent.shell_policy = lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        ask: vec![lofi_types::CommandEntry {
-            match_str: "git push".to_string(),
-            mode: lofi_types::MatchMode::Prefix,
-        }],
-        ..Default::default()
-    });
+    agent.executor.shell_policy =
+        lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
+            ask: vec![lofi_types::CommandEntry {
+                match_str: "git push".to_string(),
+                mode: lofi_types::MatchMode::Prefix,
+            }],
+            ..Default::default()
+        });
     let backend: &dyn crate::backend::Backend = &agent;
     let support = crate::agent::subagent::SubagentSupport::new(
         crate::models::ModelRegistry::default(),

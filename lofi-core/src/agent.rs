@@ -193,68 +193,17 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Cheaply cloneable because the provider is held in an `Arc`.
+/// Cheaply cloneable because the provider and session handles are reference-counted.
 #[derive(Clone)]
 pub struct Agent {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) model: Model,
-    root: PathBuf,
-    tmp_dir: PathBuf,
-    tmp_lease: Option<Arc<state::SessionTempDir>>,
-    memory: Option<lofi_types::HostFile>,
+    pub(crate) executor: ToolExecutor,
     retry: crate::retry::RetryPolicy,
     pub(crate) system_prompt: String,
     max_output_tokens: Option<u64>,
     compaction: lofi_types::CompactionConfig,
-    bash_env: BashEnv,
-    shell_policy: ResolvedPolicy,
-    truncate: lofi_code::TruncatedCap,
-    image: lofi_types::ImageConfig,
     auto_continue: lofi_types::AutoContinuePolicy,
-    confirm_tx: Option<tokio::sync::mpsc::UnboundedSender<ConfirmRequest>>,
-    confirm_counter: Arc<AtomicU64>,
-    confirm_watch: Arc<tool_executor::ConfirmWatch>,
-    /// Tool calls this session is running; a child's idle deadline pauses.
-    activity: Arc<tool_executor::ActivityWatch>,
-    auto_mode: Option<lofi_code::AutoModeFn>,
-    /// Config the evaluator was opened from, with its provider resolved.
-    auto_mode_config: Option<Arc<lofi_types::Config>>,
-    /// Turn context for the auto-mode evaluator: the request a command
-    /// answers. The turn loop writes it at the start of each turn.
-    auto_mode_hints: lofi_code::AutoModeHintHandle,
-    /// Session-scoped `/policy` approval override. Shared with the TUI so
-    /// the dialog pick reaches tools built by later execs, and cloned into
-    /// every rebuilt agent so a model switch keeps the choice.
-    policy_override: lofi_code::policy::PolicyOverride,
-    skills_dir: Option<PathBuf>,
-    /// Config-sourced granted directories outside the workspace root, with
-    /// their access levels. Session approvals are remembered per workspace
-    /// in the state document instead, and flow through the grant hook.
-    grants: Vec<lofi_code::GrantedDir>,
-    /// Session-scoped background jobs. Shared with every exec so a job
-    /// spawned in one round is visible to the next. The host shuts down
-    /// survivors when the session ends.
-    jobs: lofi_code::tools::JobRegistry,
-    /// Session-scoped wake-up timers (`lofi.notifyAt`/`lofi.notifyEvery`)
-    /// shared with every exec; the host polls fired notices and hands them
-    /// back to the agent as notice prompts.
-    timers: lofi_code::tools::TimerRegistry,
-    /// Owning subagent run id; set on child agents so their spawned jobs
-    /// are tagged for kill-by-owner and the per-owner cap.
-    job_owner: Option<String>,
-    /// Mailbox capability of a child agent: its own inbox plus the right to
-    /// write to the parent. `None` on a session agent, which addresses runs
-    /// through the registry instead.
-    mailbox: Option<mailbox::MailboxScope>,
-    /// Session-shared sandbox thread, born with the first exec. Guest work
-    /// on the single-threaded host runtime would freeze the UI; the worker
-    /// keeps the sandbox off it for the agent's lifetime.
-    exec_worker: std::sync::Arc<std::sync::OnceLock<lofi_code::ExecWorker>>,
-    /// Registry and config the subagent hook needs to resolve model
-    /// overrides. `None` disables `lofi.subagent` (nested subagent agents).
-    subagent_support: Option<SubagentSupport>,
-    /// Spawned subagents of this session, resumable by id.
-    subagents: SubagentRegistry,
     /// The config and registry this backend was opened from. Model selection
     /// rebuilds the transport from here, so no caller keeps a second copy.
     pub(crate) source: Option<Arc<backend::NativeSource>>,
@@ -287,22 +236,14 @@ impl Agent {
         // subagent, and a timer can never share an id.
         let ids = lofi_types::IdSpace::new();
         let memory = state::WorkspaceMemory::open(&root).ok().map(Into::into);
-        Self {
-            provider: Arc::from(provider),
-            model,
+        let executor = ToolExecutor {
             root,
             tmp_dir,
             tmp_lease: None,
-            memory,
-            retry: crate::retry::RetryPolicy::default(),
-            system_prompt,
-            max_output_tokens,
-            compaction,
             bash_env,
             shell_policy,
             truncate,
             image,
-            auto_continue: lofi_types::AutoContinuePolicy::default(),
             confirm_tx: None,
             confirm_counter: Arc::new(AtomicU64::new(0)),
             confirm_watch: Arc::new(tool_executor::ConfirmWatch::default()),
@@ -313,36 +254,74 @@ impl Agent {
             policy_override: lofi_code::policy::PolicyOverride::default(),
             skills_dir: None,
             grants: Vec::new(),
+            memory,
             jobs: lofi_code::tools::JobRegistry::with_ids(ids.clone()),
             timers: lofi_code::tools::TimerRegistry::with_ids(ids.clone()),
             job_owner: None,
-            mailbox: None,
             exec_worker: std::sync::Arc::new(std::sync::OnceLock::new()),
-            subagent_support: None,
+            subagent: None,
+            mailbox: None,
             subagents: SubagentRegistry::with_ids(ids),
+            subagent_support: None,
+            models: None,
+            session_cache: Arc::new(std::sync::OnceLock::new()),
+        };
+        Self::from_executor(provider, model, executor, system_prompt, compaction)
+            .with_max_output_tokens(max_output_tokens)
+    }
+
+    #[must_use]
+    pub(crate) fn from_executor(
+        provider: Box<dyn Provider>,
+        model: Model,
+        mut executor: ToolExecutor,
+        system_prompt: String,
+        compaction: lofi_types::CompactionConfig,
+    ) -> Self {
+        executor.models = executor
+            .subagent_support
+            .as_ref()
+            .map(SubagentSupport::models_fn);
+        executor.invalidate_session();
+        Self {
+            provider: Arc::from(provider),
+            model,
+            executor,
+            retry: crate::retry::RetryPolicy::default(),
+            system_prompt,
+            max_output_tokens: None,
+            compaction,
+            auto_continue: lofi_types::AutoContinuePolicy::default(),
             source: None,
         }
     }
 
+    fn with_max_output_tokens(mut self, max_output_tokens: Option<u64>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
     /// Attaches config-sourced granted directories outside the workspace
     /// root. A model switch keeps them because every rebuild clones the
-    /// field.
+    /// executor.
     #[must_use]
     pub fn with_grants(mut self, grants: Vec<lofi_code::GrantedDir>) -> Self {
-        self.grants = grants;
+        self.executor.grants = grants;
+        self.executor.invalidate_session();
         self
     }
 
     /// The config-sourced grants, for the grant hook and the paths manager.
     #[must_use]
     pub fn grants(&self) -> &[lofi_code::GrantedDir] {
-        &self.grants
+        &self.executor.grants
     }
 
     fn with_tmp_lease(mut self, lease: state::SessionTempDir) -> Self {
         let lease = Arc::new(lease);
-        self.tmp_dir = lease.path().to_path_buf();
-        self.tmp_lease = Some(lease);
+        self.executor.tmp_dir = lease.path().to_path_buf();
+        self.executor.tmp_lease = Some(lease);
+        self.executor.invalidate_session();
         self
     }
 
@@ -351,153 +330,39 @@ impl Agent {
         Self {
             provider: Arc::from(provider),
             model,
-            root: self.root.clone(),
-            tmp_dir: self.tmp_dir.clone(),
-            tmp_lease: self.tmp_lease.clone(),
-            memory: self.memory.clone(),
-            retry: self.retry,
-            system_prompt: self.system_prompt.clone(),
-            max_output_tokens: self.max_output_tokens,
-            compaction: self.compaction.clone(),
-            bash_env: self.bash_env.clone(),
-            shell_policy: self.shell_policy.clone(),
-            truncate: self.truncate,
-            image: self.image,
-            auto_continue: self.auto_continue,
-            confirm_tx: self.confirm_tx.clone(),
-            confirm_counter: self.confirm_counter.clone(),
-            confirm_watch: self.confirm_watch.clone(),
-            activity: self.activity.clone(),
-            auto_mode: self.auto_mode.clone(),
-            auto_mode_config: self.auto_mode_config.clone(),
-            auto_mode_hints: self.auto_mode_hints.clone(),
-            policy_override: self.policy_override.clone(),
-            skills_dir: self.skills_dir.clone(),
-            grants: self.grants.clone(),
-            jobs: self.jobs.clone(),
-            timers: self.timers.clone(),
-            job_owner: self.job_owner.clone(),
-            mailbox: self.mailbox.clone(),
-            exec_worker: self.exec_worker.clone(),
-            subagent_support: self.subagent_support.clone(),
-            subagents: self.subagents.clone(),
-            source: self.source.clone(),
+            ..self.clone()
         }
     }
 
     #[must_use]
     pub fn with_system_prompt(&self, system_prompt: String) -> Self {
         Self {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            root: self.root.clone(),
-            tmp_dir: self.tmp_dir.clone(),
-            tmp_lease: self.tmp_lease.clone(),
-            memory: self.memory.clone(),
-            retry: self.retry,
             system_prompt,
-            max_output_tokens: self.max_output_tokens,
-            compaction: self.compaction.clone(),
-            bash_env: self.bash_env.clone(),
-            shell_policy: self.shell_policy.clone(),
-            confirm_tx: self.confirm_tx.clone(),
-            confirm_counter: self.confirm_counter.clone(),
-            confirm_watch: self.confirm_watch.clone(),
-            activity: self.activity.clone(),
-            auto_mode: self.auto_mode.clone(),
-            auto_mode_config: self.auto_mode_config.clone(),
-            auto_mode_hints: self.auto_mode_hints.clone(),
-            policy_override: self.policy_override.clone(),
-            skills_dir: self.skills_dir.clone(),
-            grants: self.grants.clone(),
-            jobs: self.jobs.clone(),
-            timers: self.timers.clone(),
-            job_owner: self.job_owner.clone(),
-            mailbox: self.mailbox.clone(),
-            exec_worker: self.exec_worker.clone(),
-            subagent_support: self.subagent_support.clone(),
-            subagents: self.subagents.clone(),
-            truncate: self.truncate,
-            image: self.image,
-            auto_continue: self.auto_continue,
-            source: self.source.clone(),
+            ..self.clone()
         }
     }
 
     #[must_use]
     pub fn with_skills_dir(&self, skills_dir: Option<PathBuf>) -> Self {
-        Self {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            root: self.root.clone(),
-            tmp_dir: self.tmp_dir.clone(),
-            tmp_lease: self.tmp_lease.clone(),
-            memory: self.memory.clone(),
-            retry: self.retry,
-            system_prompt: self.system_prompt.clone(),
-            max_output_tokens: self.max_output_tokens,
-            compaction: self.compaction.clone(),
-            bash_env: self.bash_env.clone(),
-            shell_policy: self.shell_policy.clone(),
-            confirm_tx: self.confirm_tx.clone(),
-            confirm_counter: self.confirm_counter.clone(),
-            confirm_watch: self.confirm_watch.clone(),
-            activity: self.activity.clone(),
-            auto_mode: self.auto_mode.clone(),
-            auto_mode_config: self.auto_mode_config.clone(),
-            auto_mode_hints: self.auto_mode_hints.clone(),
-            policy_override: self.policy_override.clone(),
-            skills_dir,
-            grants: self.grants.clone(),
-            jobs: self.jobs.clone(),
-            timers: self.timers.clone(),
-            job_owner: self.job_owner.clone(),
-            mailbox: self.mailbox.clone(),
-            exec_worker: self.exec_worker.clone(),
-            subagent_support: self.subagent_support.clone(),
-            subagents: self.subagents.clone(),
-            truncate: self.truncate,
-            image: self.image,
-            auto_continue: self.auto_continue,
-            source: self.source.clone(),
-        }
+        let mut next = self.clone();
+        next.executor = next.executor.with_skills_dir(skills_dir);
+        next
     }
 
-    /// Replace every session-scoped field from an executor. Both backends own
-    /// the same kind of executor, so a switch or a fork moves between them
-    /// without copying twenty fields by hand.
+    /// Replace every session-scoped field from an executor.
     #[must_use]
     pub fn with_executor(&self, executor: &ToolExecutor) -> Self {
-        Self {
-            root: executor.root.clone(),
-            tmp_dir: executor.tmp_dir.clone(),
-            tmp_lease: executor.tmp_lease.clone(),
-            memory: executor.memory.clone(),
-            bash_env: executor.bash_env.clone(),
-            shell_policy: executor.shell_policy.clone(),
-            truncate: executor.truncate,
-            image: executor.image,
-            confirm_tx: executor.confirm_tx.clone(),
-            confirm_counter: executor.confirm_counter.clone(),
-            confirm_watch: executor.confirm_watch.clone(),
-            activity: executor.activity.clone(),
-            auto_mode: executor.auto_mode.clone(),
-            auto_mode_config: executor.auto_mode_config.clone(),
-            auto_mode_hints: executor.auto_mode_hints.clone(),
-            policy_override: executor.policy_override.clone(),
-            skills_dir: executor.skills_dir.clone(),
-            grants: executor.grants.clone(),
-            jobs: executor.jobs.clone(),
-            timers: executor.timers.clone(),
-            job_owner: executor.job_owner.clone(),
-            exec_worker: executor.exec_worker.clone(),
-            mailbox: executor.mailbox.clone(),
-            // Session state lives in the executor, so a backend opened from
-            // the same executor joins the runs the session already has.
-            subagents: executor.subagents.clone(),
-            subagent_support: executor.subagent_support.clone(),
-            ..self.clone()
+        let mut next = self.clone();
+        next.executor = executor.clone();
+        if next.executor.models.is_none() && next.executor.subagent_support.is_some() {
+            next.executor.models = next
+                .executor
+                .subagent_support
+                .as_ref()
+                .map(SubagentSupport::models_fn);
+            next.executor.invalidate_session();
         }
+        next
     }
 
     /// A new conversation that shares the backend configuration and nothing
@@ -505,9 +370,12 @@ impl Agent {
     #[must_use]
     pub fn forked(&self, executor: &ToolExecutor) -> Self {
         let mut child = self.with_executor(executor);
-        child.mailbox = None;
-        child.subagent_support = None;
-        child.subagents = SubagentRegistry::default();
+        child.executor.mailbox = None;
+        child.executor.subagent = None;
+        child.executor.models = None;
+        child.executor.subagent_support = None;
+        child.executor.subagents = SubagentRegistry::default();
+        child.executor.invalidate_session();
         child
     }
 
@@ -539,99 +407,56 @@ impl Agent {
         &self,
         confirm_tx: tokio::sync::mpsc::UnboundedSender<ConfirmRequest>,
     ) -> Self {
-        Self {
-            confirm_tx: Some(confirm_tx),
-            ..self.clone()
-        }
+        let mut next = self.clone();
+        next.executor.confirm_tx = Some(confirm_tx);
+        next
     }
 
     /// Share the session's jobs, policy and sandbox with a backend.
     #[must_use]
     pub fn tool_executor(&self) -> ToolExecutor {
-        ToolExecutor {
-            root: self.root.clone(),
-            tmp_dir: self.tmp_dir.clone(),
-            tmp_lease: self.tmp_lease.clone(),
-            memory: self.memory.clone(),
-            bash_env: self.bash_env.clone(),
-            shell_policy: self.shell_policy.clone(),
-            truncate: self.truncate,
-            image: self.image,
-            confirm_tx: self.confirm_tx.clone(),
-            confirm_counter: self.confirm_counter.clone(),
-            confirm_watch: self.confirm_watch.clone(),
-            activity: self.activity.clone(),
-            auto_mode: self.auto_mode.clone(),
-            auto_mode_config: self.auto_mode_config.clone(),
-            auto_mode_hints: self.auto_mode_hints.clone(),
-            policy_override: self.policy_override.clone(),
-            skills_dir: self.skills_dir.clone(),
-            grants: self.grants.clone(),
-            jobs: self.jobs.clone(),
-            timers: self.timers.clone(),
-            job_owner: self.job_owner.clone(),
-            exec_worker: self.exec_worker.clone(),
-            subagent: self.subagent_hook(),
-            mailbox: self.mailbox.clone(),
-            subagents: self.subagents.clone(),
-            subagent_support: self.subagent_support.clone(),
-            models: self
+        let mut executor = self.executor.clone();
+        executor.subagent = self.subagent_hook();
+        if executor.models.is_none() && executor.subagent_support.is_some() {
+            executor.models = executor
                 .subagent_support
                 .as_ref()
-                .map(SubagentSupport::models_fn),
+                .map(SubagentSupport::models_fn);
+            executor.invalidate_session();
         }
+        executor
     }
 
     /// Keep execution state when switching from another backend.
     #[must_use]
-    pub fn with_tool_executor(mut self, executor: ToolExecutor) -> Self {
-        self.root = executor.root;
-        self.tmp_dir = executor.tmp_dir;
-        self.tmp_lease = executor.tmp_lease;
-        self.memory = executor.memory;
-        self.bash_env = executor.bash_env;
-        self.shell_policy = executor.shell_policy;
-        self.truncate = executor.truncate;
-        self.image = executor.image;
-        self.confirm_tx = executor.confirm_tx;
-        self.confirm_counter = executor.confirm_counter;
-        self.confirm_watch = executor.confirm_watch;
-        self.activity = executor.activity;
-        self.auto_mode = executor.auto_mode;
-        self.auto_mode_config = executor.auto_mode_config;
-        self.auto_mode_hints = executor.auto_mode_hints;
-        self.policy_override = executor.policy_override;
-        self.skills_dir = executor.skills_dir;
-        self.grants = executor.grants;
-        self.jobs = executor.jobs;
-        self.timers = executor.timers;
-        self.exec_worker = executor.exec_worker;
-        self.job_owner = executor.job_owner;
-        // A fork built from this executor carries the mailbox the spawner
-        // chose for the child; the session agent has none either way.
-        self.mailbox = executor.mailbox;
-        // Session state follows the executor, so switching transports keeps
-        // the same runs and the same override resolution.
-        self.subagents = executor.subagents;
-        if self.subagent_support.is_none() {
-            self.subagent_support = executor.subagent_support;
+    pub fn with_tool_executor(mut self, mut executor: ToolExecutor) -> Self {
+        if let Some(support) = self.executor.subagent_support {
+            executor.models = Some(support.models_fn());
+            executor.subagent_support = Some(support);
+            executor.invalidate_session();
+        } else if executor.models.is_none() && executor.subagent_support.is_some() {
+            executor.models = executor
+                .subagent_support
+                .as_ref()
+                .map(SubagentSupport::models_fn);
+            executor.invalidate_session();
         }
+        self.executor = executor;
         self
     }
 
     #[must_use]
     pub fn with_auto_mode(&self, auto_mode: lofi_code::AutoModeFn) -> Self {
-        Self {
-            auto_mode: Some(auto_mode),
-            ..self.clone()
-        }
+        let mut next = self.clone();
+        next.executor = next.executor.with_auto_mode(Some(auto_mode));
+        next
     }
 
     /// The turn-context handle the evaluator reads. The turn loop replaces
     /// its contents at the start of every turn.
     #[must_use]
     pub fn auto_mode_hints(&self) -> &lofi_code::AutoModeHintHandle {
-        &self.auto_mode_hints
+        &self.executor.auto_mode_hints
     }
 
     #[must_use]
@@ -641,25 +466,25 @@ impl Agent {
 
     #[must_use]
     pub fn root(&self) -> &PathBuf {
-        &self.root
+        &self.executor.root
     }
 
     #[must_use]
     pub fn tmp_dir(&self) -> &PathBuf {
-        &self.tmp_dir
+        &self.executor.tmp_dir
     }
 
     /// The session-scoped `/policy` approval override handle; the TUI
     /// writes to it, every exec reads from it.
     #[must_use]
     pub fn policy_override(&self) -> &lofi_code::policy::PolicyOverride {
-        &self.policy_override
+        &self.executor.policy_override
     }
 
     /// Whether auto-mode approval evaluation is configured for this agent.
     #[must_use]
     pub fn has_auto_mode(&self) -> bool {
-        self.auto_mode.is_some()
+        self.executor.auto_mode.is_some()
     }
 
     /// The session's background-job registry. Cheap to clone (shares the
@@ -667,21 +492,21 @@ impl Agent {
     /// and to kill jobs from the `/job` modal.
     #[must_use]
     pub fn jobs(&self) -> lofi_code::tools::JobRegistry {
-        self.jobs.clone()
+        self.executor.jobs.clone()
     }
 
     /// Session-scoped wake-up timers, for a host to poll the notices fired
     /// since its last pull.
     #[must_use]
     pub fn timers(&self) -> lofi_code::tools::TimerRegistry {
-        self.timers.clone()
+        self.executor.timers.clone()
     }
 
     /// The session's subagent registry (shared by every clone). The UI keeps
     /// a handle so a new session can drop the entries of the old one.
     #[must_use]
     pub fn subagents(&self) -> SubagentRegistry {
-        self.subagents.clone()
+        self.executor.subagents.clone()
     }
 
     /// The raw model identity stamped onto [`AgentEvent::TurnEnd`] (and the

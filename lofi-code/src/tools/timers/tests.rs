@@ -200,7 +200,10 @@ async fn notify_at_schedules_and_fires() {
         .unwrap();
     assert_eq!(res["ok"], json!(true));
     assert_eq!(res["message"], json!("hi"));
-    assert_eq!(tools.timers.take_notices(), vec!["notifyAt fired: hi"]);
+    assert_eq!(
+        tools.session.timers.take_notices(),
+        vec!["notifyAt fired: hi"]
+    );
 }
 
 #[tokio::test]
@@ -253,7 +256,7 @@ async fn notify_cancel_cancels_both_kinds() {
     let res = tools.notify_cancel(Value::Null).await.unwrap();
     assert_eq!(res["ok"], json!(true));
     assert_eq!(res["cancelled"], json!(2));
-    assert!(tools.timers.take_notices().is_empty());
+    assert!(tools.session.timers.take_notices().is_empty());
 }
 
 #[tokio::test]

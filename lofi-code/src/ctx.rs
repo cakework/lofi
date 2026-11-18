@@ -280,27 +280,124 @@ pub enum ToolEvent {
     },
 }
 
+/// Session-scoped sandbox configuration shared across `exec` invocations.
+/// Canonicalizes workspace, scratch, skill, memory, and granted directory
+/// paths once so individual `exec` calls share a single `Arc<ToolSession>`.
 #[derive(Clone)]
-pub struct ExecCtx {
+pub struct ToolSession {
     pub root: PathBuf,
     pub tmp_dir: PathBuf,
+    pub(crate) read_roots: Vec<PathBuf>,
+    pub bash_env: BashEnv,
+    pub shell_policy: crate::policy::ResolvedPolicy,
+    pub grants: Vec<GrantedDir>,
+    pub auto_mode: Option<AutoModeFn>,
+    pub policy_override: crate::policy::PolicyOverride,
+    pub skills_dir: Option<PathBuf>,
+    pub memory: Option<lofi_types::HostFile>,
+    pub truncate: crate::tools::truncate::TruncatedCap,
+    pub jobs: crate::tools::JobRegistry,
+    pub timers: crate::tools::TimerRegistry,
+    pub job_owner: Option<String>,
+    pub models: Option<ModelsFn>,
+}
+
+impl ToolSession {
+    #[must_use]
+    pub fn new(
+        root: PathBuf,
+        tmp_dir: PathBuf,
+        bash_env: BashEnv,
+        shell_policy: crate::policy::ResolvedPolicy,
+    ) -> Self {
+        let root = root.canonicalize().unwrap_or(root);
+        let tmp_canon = tmp_dir.canonicalize().unwrap_or_else(|_| tmp_dir.clone());
+        Self {
+            root,
+            tmp_dir,
+            read_roots: vec![tmp_canon],
+            bash_env,
+            shell_policy,
+            grants: Vec::new(),
+            auto_mode: None,
+            policy_override: crate::policy::PolicyOverride::default(),
+            skills_dir: None,
+            memory: None,
+            truncate: crate::tools::truncate::TruncatedCap::default(),
+            jobs: crate::tools::JobRegistry::new(),
+            timers: crate::tools::TimerRegistry::new(),
+            job_owner: None,
+            models: None,
+        }
+    }
+
+    pub(crate) fn recompute_read_roots(&mut self) {
+        let mut read_roots = Vec::with_capacity(3);
+        read_roots.push(
+            self.tmp_dir
+                .canonicalize()
+                .unwrap_or_else(|_| self.tmp_dir.clone()),
+        );
+        if let Some(sd) = &self.skills_dir {
+            read_roots.push(sd.canonicalize().unwrap_or_else(|_| sd.clone()));
+        }
+        if let Some(memory) = &self.memory {
+            read_roots.push(memory.path.clone());
+        }
+        self.read_roots = read_roots;
+    }
+
+    #[must_use]
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = root.canonicalize().unwrap_or(root);
+        self
+    }
+
+    #[must_use]
+    pub fn with_skills_dir(mut self, skills_dir: Option<PathBuf>) -> Self {
+        self.skills_dir = skills_dir;
+        self.recompute_read_roots();
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, memory: Option<lofi_types::HostFile>) -> Self {
+        self.memory = memory.map(|file| {
+            let canon = crate::canonicalize_up(&file.path).unwrap_or(file.path);
+            lofi_types::HostFile {
+                path: canon,
+                ..file
+            }
+        });
+        self.recompute_read_roots();
+        self
+    }
+
+    #[must_use]
+    pub fn with_grants(mut self, grants: Vec<GrantedDir>) -> Self {
+        self.grants = grants
+            .into_iter()
+            .map(|g| GrantedDir {
+                dir: crate::canonicalize_up(&g.dir).unwrap_or(g.dir),
+                access: g.access,
+            })
+            .collect();
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct ExecCtx {
+    pub session: Arc<ToolSession>,
     pub strings: HashMap<String, String>,
     pub recall: Option<RecallFn>,
     pub result: Option<ResultFn>,
     pub on_tool_event: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
-    pub bash_env: BashEnv,
-    pub shell_policy: crate::policy::ResolvedPolicy,
     pub confirm: Option<ConfirmFn>,
     /// Grants one directory for use outside the workspace root. `None`
     /// where no confirmation channel exists (tests, nested sandboxes); a path
     /// outside every allowed root stays rejected there.
     pub approve_dir: Option<ApproveDirFn>,
-    /// Config-sourced grants outside the workspace root, canonicalized
-    /// through missing trailing components. Session approvals flow through
-    /// `approve_dir` instead, so a refused or removed grant stops applying
-    /// at once.
-    pub grants: Vec<GrantedDir>,
-    pub auto_mode: Option<AutoModeFn>,
     /// The exec call's stated `description`, so the auto-mode gate judges
     /// this call's shell commands with the call's own intent. Bounded to the
     /// description cap (a 200-character head plus its cut marker) by the
@@ -310,25 +407,6 @@ pub struct ExecCtx {
     /// How long an auto-mode ask prompt waits for the user before auto mode
     /// denies it on its own. `None` disables the auto-deny.
     pub approval_timeout: Option<Duration>,
-    /// Session-scoped `/policy` approval override shared with the owning
-    /// agent.
-    pub policy_override: crate::policy::PolicyOverride,
-    pub skills_dir: Option<PathBuf>,
-    /// Workspace memory file `lofi.memory` reports, with the modes its
-    /// first write applies. `None` where no workspace state directory
-    /// exists (nested sandboxes, tests).
-    pub memory: Option<lofi_types::HostFile>,
-    /// Visible-output cap applied to file reads and bash output.
-    pub truncate: crate::tools::truncate::TruncatedCap,
-    /// Session-scoped background job registry shared with the owning
-    /// agent.
-    pub jobs: crate::tools::JobRegistry,
-    /// Session-scoped wake-up timer registry shared with the owning agent.
-    pub timers: crate::tools::TimerRegistry,
-    /// Owning subagent run id when this exec belongs to one. Jobs spawned
-    /// here are tagged with it so the subagent can be cancelled with its
-    /// process tree.
-    pub job_owner: Option<String>,
     /// Fired at successful `jobSpawn`. `None` keeps lifecycle in-memory
     /// only (pre-session resume, tests, `--no-session`). The callback
     /// returns the completion hook retained by that job.
@@ -337,29 +415,45 @@ pub struct ExecCtx {
     /// (nested subagent sandboxes, tests); `lofi.subagent` stays bound and
     /// reports the context as unavailable.
     pub subagent: Option<SubagentFn>,
-    /// Lists available models. `None` where the host has no registry;
-    /// `lofi.models` stays bound and reports the context as unavailable.
-    pub models: Option<ModelsFn>,
+}
+
+impl ExecCtx {
+    #[must_use]
+    pub fn from_session(session: Arc<ToolSession>) -> Self {
+        Self {
+            session,
+            strings: HashMap::new(),
+            recall: None,
+            result: None,
+            on_tool_event: None,
+            confirm: None,
+            approve_dir: None,
+            intent: None,
+            approval_timeout: None,
+            on_job_acquired: None,
+            subagent: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecCtx")
-            .field("root", &self.root)
-            .field("tmp_dir", &self.tmp_dir)
-            .field("memory", &self.memory)
+            .field("root", &self.session.root)
+            .field("tmp_dir", &self.session.tmp_dir)
+            .field("memory", &self.session.memory)
             .field("strings", &self.strings)
             .field("recall", &self.recall.is_some())
             .field("result", &self.result.is_some())
             .field("on_tool_event", &self.on_tool_event.is_some())
-            .field("bash_env", &self.bash_env)
+            .field("bash_env", &self.session.bash_env)
             .field("shell_policy", &"<resolved>")
             .field("confirm", &self.confirm.is_some())
             .field("approve_dir", &self.approve_dir.is_some())
-            .field("auto_mode", &self.auto_mode.is_some())
+            .field("auto_mode", &self.session.auto_mode.is_some())
             .field("subagent", &self.subagent.is_some())
-            .field("models", &self.models.is_some())
-            .field("skills_dir", &self.skills_dir)
+            .field("models", &self.session.models.is_some())
+            .field("skills_dir", &self.session.skills_dir)
             .finish_non_exhaustive()
     }
 }

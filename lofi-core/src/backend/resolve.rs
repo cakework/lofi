@@ -206,28 +206,36 @@ impl BackendFactory {
                 known.join(", ")
             )));
         }
-        let (agent, _, _) = crate::agent::rebuild_agent(
-            None,
-            &self.registry,
-            &self.config,
-            Some(&query),
-            &self.root,
-            &self.env,
-        )?;
-        let support = self.support();
+        let (mut model, level) =
+            crate::agent::select_model(&self.registry, &self.config, Some(&query))?;
+        model.thinking = level;
+        let provider_cfg = self
+            .config
+            .providers
+            .get(&model.provider)
+            .ok_or_else(|| Error::Config(format!("provider not found: {}", model.provider)))?;
+        let provider = lofi_providers::open(model.api, provider_cfg)?;
+        let auto_continue = self
+            .registry
+            .auto_continue_policy(&self.config.agent, &model);
         // The prompt is the executor's own: it states the tools and the exec
         // contract, and the backend only carries it.
         let executor = executor.with_skills_dir(self.skills_dir.clone());
         let system_prompt = executor.system_prompt();
         Ok(Arc::new(
-            agent
-                .with_system_prompt(system_prompt)
-                .with_source(crate::backend::NativeSource::new(
-                    self.registry.clone(),
-                    (*self.config).clone(),
-                ))
-                .with_subagent_support(support)
-                .with_executor(&executor),
+            crate::agent::Agent::from_executor(
+                provider,
+                model,
+                executor,
+                system_prompt,
+                self.config.compaction.clone(),
+            )
+            .with_retry(self.config.retry.into())
+            .with_auto_continue(auto_continue)
+            .with_source(crate::backend::NativeSource::new(
+                self.registry.clone(),
+                (*self.config).clone(),
+            )),
         ))
     }
 

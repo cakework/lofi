@@ -93,16 +93,12 @@ pub(super) struct PendingImage {
 
 #[derive(Clone)]
 pub struct BuiltinTools {
-    root: PathBuf,
-    tmp_dir: PathBuf,
+    session: Arc<crate::ToolSession>,
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
     tool_counter: Arc<AtomicU64>,
     image_counter: Arc<AtomicU64>,
     pending_images: Arc<Mutex<std::collections::HashMap<u64, PendingImage>>>,
-    bash_env: BashEnv,
-    shell_policy: crate::policy::ResolvedPolicy,
     confirm: Option<crate::ConfirmFn>,
-    auto_mode: Option<crate::AutoModeFn>,
     /// The exec call's stated `description`, carried from the call's
     /// context so the gate judges the call's commands with the call's own
     /// intent. `None` outside an exec call.
@@ -113,38 +109,46 @@ pub struct BuiltinTools {
     /// The bound this exec's work runs under: the call's own `timeoutMs`,
     /// carried into every tool it starts.
     clock: lofi_types::Deadline,
-    /// Session-scoped `/policy` override shared with the owning agent so a
-    /// dialog pick applies to every later exec in the session.
-    policy_override: crate::policy::PolicyOverride,
-    skills_dir: Option<PathBuf>,
-    /// Workspace memory file `lofi.memory` reports, with the modes its
-    /// first write applies. `None` keeps the tool bound but unavailable
-    /// (tests, nested sandboxes).
-    memory: Option<HostFile>,
-    read_roots: Vec<PathBuf>,
-    /// Granted directories outside the workspace root, with their access.
-    grants: Vec<crate::GrantedDir>,
     /// Grants one directory for use outside the workspace root.
     approve_dir: Option<crate::ApproveDirFn>,
     cancel: Option<Arc<AtomicBool>>,
-    /// Background jobs spawned by this session. Shared with the owning
-    /// agent so jobs survive across the per-exec tool bundles. Explicit host
-    /// shutdown kills survivors; dropping the last clone is the fallback.
-    jobs: JobRegistry,
-    /// Wake-up timers scheduled by this session (`lofi.notifyAt` and
-    /// `lofi.notifyEvery`). Shared with the owning agent so the host can
-    /// hand each fired notice back to the agent.
-    timers: TimerRegistry,
-    /// Owning subagent run id when this tool bundle serves one. Spawned
-    /// jobs and timers are tagged with it for kill-by-owner and the
-    /// per-owner cap.
-    job_owner: Option<String>,
     on_job_acquired: Option<crate::JobAcquireFn>,
-    /// Visible-output caps for tool results (file reads and bash output).
-    truncate: truncate::TruncatedCap,
 }
 
 impl BuiltinTools {
+    #[must_use]
+    pub fn from_session(session: Arc<crate::ToolSession>) -> Self {
+        Self {
+            session,
+            tool_cb: None,
+            tool_counter: Arc::new(AtomicU64::new(0)),
+            image_counter: Arc::new(AtomicU64::new(0)),
+            pending_images: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            confirm: None,
+            intent: None,
+            approval_timeout: None,
+            clock: lofi_types::Deadline::NONE,
+            approve_dir: None,
+            cancel: None,
+            on_job_acquired: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_tool_event(
+        mut self,
+        tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
+    ) -> Self {
+        self.tool_cb = tool_cb;
+        self
+    }
+
+    #[must_use]
+    pub fn with_confirm(mut self, confirm: Option<crate::ConfirmFn>) -> Self {
+        self.confirm = confirm;
+        self
+    }
+
     #[must_use]
     pub fn with_tool_cb(
         root: PathBuf,
@@ -178,41 +182,12 @@ impl BuiltinTools {
         auto_mode: Option<crate::AutoModeFn>,
         skills_dir: Option<PathBuf>,
     ) -> Self {
-        let root = root.canonicalize().unwrap_or(root);
-        let mut read_roots = Vec::new();
-        let tmp_canon = tmp_dir.canonicalize().unwrap_or_else(|_| tmp_dir.clone());
-        read_roots.push(tmp_canon);
-        if let Some(sd) = &skills_dir {
-            let sd_canon = sd.canonicalize().unwrap_or_else(|_| sd.clone());
-            read_roots.push(sd_canon);
-        }
-        Self {
-            root,
-            tmp_dir,
-            tool_cb,
-            tool_counter: Arc::new(AtomicU64::new(0)),
-            image_counter: Arc::new(AtomicU64::new(0)),
-            pending_images: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            bash_env,
-            shell_policy,
-            confirm,
-            auto_mode,
-            intent: None,
-            approval_timeout: None,
-            clock: lofi_types::Deadline::NONE,
-            policy_override: crate::policy::PolicyOverride::default(),
-            skills_dir,
-            memory: None,
-            read_roots,
-            grants: Vec::new(),
-            approve_dir: None,
-            cancel: None,
-            jobs: JobRegistry::new(),
-            timers: TimerRegistry::new(),
-            job_owner: None,
-            on_job_acquired: None,
-            truncate: truncate::TruncatedCap::default(),
-        }
+        let mut session = crate::ToolSession::new(root, tmp_dir, bash_env, shell_policy)
+            .with_skills_dir(skills_dir);
+        session.auto_mode = auto_mode;
+        Self::from_session(Arc::new(session))
+            .with_tool_event(tool_cb)
+            .with_confirm(confirm)
     }
 
     /// Sets the exec call's stated description, so auto mode judges this
@@ -244,7 +219,7 @@ impl BuiltinTools {
     /// not see a job spawned by the previous one.
     #[must_use]
     pub fn with_jobs(mut self, jobs: JobRegistry) -> Self {
-        self.jobs = jobs;
+        Arc::make_mut(&mut self.session).jobs = jobs;
         self
     }
 
@@ -253,7 +228,7 @@ impl BuiltinTools {
     /// call could not fire on the next.
     #[must_use]
     pub fn with_timers(mut self, timers: TimerRegistry) -> Self {
-        self.timers = timers;
+        Arc::make_mut(&mut self.session).timers = timers;
         self
     }
 
@@ -262,7 +237,7 @@ impl BuiltinTools {
     /// `notifyCancel` drops exactly its own timers.
     #[must_use]
     pub fn with_job_owner(mut self, owner: Option<String>) -> Self {
-        self.job_owner = owner;
+        Arc::make_mut(&mut self.session).job_owner = owner;
         self
     }
 
@@ -275,7 +250,7 @@ impl BuiltinTools {
     /// Shares the session-scoped `/policy` approval override.
     #[must_use]
     pub fn with_policy_override(mut self, policy_override: crate::policy::PolicyOverride) -> Self {
-        self.policy_override = policy_override;
+        Arc::make_mut(&mut self.session).policy_override = policy_override;
         self
     }
 
@@ -291,7 +266,8 @@ impl BuiltinTools {
     /// matches what a later resolution computes.
     #[must_use]
     pub fn with_grants(mut self, grants: Vec<crate::GrantedDir>) -> Self {
-        self.grants = grants
+        let session = Arc::make_mut(&mut self.session);
+        session.grants = grants
             .into_iter()
             .map(|g| crate::GrantedDir {
                 dir: canonicalize_up(&g.dir).unwrap_or(g.dir),
@@ -304,13 +280,13 @@ impl BuiltinTools {
     /// Sets the visible-output cap applied to reads and bash output.
     #[must_use]
     pub fn with_truncate(mut self, truncate: truncate::TruncatedCap) -> Self {
-        self.truncate = truncate;
+        Arc::make_mut(&mut self.session).truncate = truncate;
         self
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.session.root
     }
 
     pub(super) fn register_image(&self, file: std::fs::File, bytes: usize) -> Result<u64> {
@@ -337,17 +313,17 @@ impl BuiltinTools {
 
     #[must_use]
     pub fn tmp_dir(&self) -> &Path {
-        &self.tmp_dir
+        &self.session.tmp_dir
     }
 
     #[must_use]
     pub fn bash_env(&self) -> &BashEnv {
-        &self.bash_env
+        &self.session.bash_env
     }
 
     #[must_use]
     pub fn shell_policy(&self) -> &crate::policy::ResolvedPolicy {
-        &self.shell_policy
+        &self.session.shell_policy
     }
 
     #[must_use]
@@ -357,7 +333,7 @@ impl BuiltinTools {
 
     #[must_use]
     pub fn auto_mode(&self) -> Option<&crate::AutoModeFn> {
-        self.auto_mode.as_ref()
+        self.session.auto_mode.as_ref()
     }
 
     /// Set how long an auto-mode ask prompt waits before auto mode denies
@@ -377,7 +353,7 @@ impl BuiltinTools {
 
     #[must_use]
     pub fn skills_dir(&self) -> Option<&Path> {
-        self.skills_dir.as_deref()
+        self.session.skills_dir.as_deref()
     }
 
     /// Attaches the workspace memory file `lofi.memory` reports. The path
@@ -386,16 +362,15 @@ impl BuiltinTools {
     /// write without a prompt.
     #[must_use]
     pub fn with_memory(mut self, memory: Option<HostFile>) -> Self {
-        if let Some(memory) = memory {
-            let canon = canonicalize_up(&memory.path).unwrap_or_else(|| memory.path.clone());
-            self.read_roots.push(canon.clone());
-            self.memory = Some(HostFile {
+        let session = Arc::make_mut(&mut self.session);
+        session.memory = memory.map(|file| {
+            let canon = canonicalize_up(&file.path).unwrap_or(file.path);
+            HostFile {
                 path: canon,
-                ..memory
-            });
-        } else {
-            self.memory = None;
-        }
+                ..file
+            }
+        });
+        session.recompute_read_roots();
         self
     }
 
@@ -405,9 +380,14 @@ impl BuiltinTools {
     /// Returns [`Error::Tool`] when no memory path is attached or the read
     /// fails.
     pub(crate) fn memory_read(&self) -> Result<serde_json::Value> {
-        let path = self.memory.as_ref().map(|file| &file.path).ok_or_else(|| {
-            Error::Tool("lofi.memory is not available in this context".to_string())
-        })?;
+        let path = self
+            .session
+            .memory
+            .as_ref()
+            .map(|file| &file.path)
+            .ok_or_else(|| {
+                Error::Tool("lofi.memory is not available in this context".to_string())
+            })?;
         let text = memory::read(path)?;
         Ok(serde_json::json!({
             "path": path.to_string_lossy(),
@@ -418,8 +398,8 @@ impl BuiltinTools {
     /// The roots a read may use: the builtin read roots plus every granted
     /// directory, whatever its level.
     fn read_roots_with_grants(&self) -> Vec<PathBuf> {
-        let mut roots = self.read_roots.clone();
-        roots.extend(self.grants.iter().map(|g| g.dir.clone()));
+        let mut roots = self.session.read_roots.clone();
+        roots.extend(self.session.grants.iter().map(|g| g.dir.clone()));
         roots
     }
 
@@ -427,12 +407,13 @@ impl BuiltinTools {
     /// the memory file.
     fn write_roots(&self) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = self
+            .session
             .grants
             .iter()
             .filter(|g| g.access.allows(lofi_types::Access::Write))
             .map(|g| g.dir.clone())
             .collect();
-        if let Some(memory) = &self.memory {
+        if let Some(memory) = &self.session.memory {
             roots.push(memory.path.clone());
         }
         roots
@@ -443,8 +424,9 @@ impl BuiltinTools {
     /// resolved path and the root that contains it, which
     /// `ls`/`find`/`grep` strip from results.
     pub(super) async fn resolve_read(&self, p: &str) -> Result<(PathBuf, PathBuf)> {
-        let mut roots = Vec::with_capacity(1 + self.read_roots.len() + self.grants.len());
-        roots.push(self.root.clone());
+        let mut roots =
+            Vec::with_capacity(1 + self.session.read_roots.len() + self.session.grants.len());
+        roots.push(self.session.root.clone());
         roots.extend(self.read_roots_with_grants());
         self.resolve_with_approval(p, roots, lofi_types::Access::Read)
             .await
@@ -459,18 +441,19 @@ impl BuiltinTools {
     pub(super) async fn resolve_mutate(&self, p: &str) -> Result<PathBuf> {
         // Writable without a prompt: the workspace root, write grants, and
         // the memory file.
-        if let Ok((resolved, _)) = resolve_for_read(&self.root, &self.write_roots(), p) {
+        if let Ok((resolved, _)) = resolve_for_read(&self.session.root, &self.write_roots(), p) {
             return Ok(resolved);
         }
         // A builtin read root (tmp, skills) is read-only without a prompt:
         // no grant names it, so a widening prompt has nothing to widen.
         let builtin: Vec<PathBuf> = self
+            .session
             .read_roots
             .iter()
-            .filter(|r| self.memory.as_ref().is_none_or(|m| *r != &m.path))
+            .filter(|r| self.session.memory.as_ref().is_none_or(|m| *r != &m.path))
             .cloned()
             .collect();
-        if resolve_for_read(&self.root, &builtin, p).is_ok() {
+        if resolve_for_read(&self.session.root, &builtin, p).is_ok() {
             return Err(Error::Tool(format!("path is read-only: {p}")));
         }
         self.resolve_with_approval(p, self.write_roots(), lofi_types::Access::Write)
@@ -494,7 +477,7 @@ impl BuiltinTools {
         requested: lofi_types::Access,
     ) -> Result<(PathBuf, PathBuf)> {
         let mut roots = Vec::with_capacity(1 + extra_roots.len());
-        roots.push(self.root.clone());
+        roots.push(self.session.root.clone());
         roots.extend(extra_roots);
         match resolve_for_read(&roots[0], &roots[1..], p) {
             Err(err)

@@ -3070,13 +3070,14 @@ async fn a_childs_job_outlives_the_childs_call() {
     });
     let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
     // The job's log lands under the temp dir, which has to exist.
-    agent.tmp_dir = dir.path().to_path_buf();
+    agent.executor.tmp_dir = dir.path().to_path_buf();
     // The child's executor is the template's, so this is the policy it runs
     // under. This test is about the clock, not the policy.
-    agent.shell_policy = lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
-        yolo: true,
-        ..lofi_types::ShellPolicyConfig::default()
-    });
+    agent.executor.shell_policy =
+        lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig {
+            yolo: true,
+            ..lofi_types::ShellPolicyConfig::default()
+        });
     agent.provider = provider.clone();
     let hook = agent.subagent_hook().unwrap();
 

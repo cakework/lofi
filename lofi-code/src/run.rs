@@ -278,36 +278,22 @@ pub async fn exec(src: &str, ctx: &ExecCtx, opts: &ExecOptions) -> Result<ExecRe
         .deadline
         .map_or(lofi_types::Deadline::NONE, lofi_types::Deadline::at);
     let tools = Arc::new(
-        BuiltinTools::with_skills_dir(
-            ctx.root.clone(),
-            ctx.on_tool_event.clone(),
-            ctx.tmp_dir.clone(),
-            ctx.bash_env.clone(),
-            ctx.shell_policy.clone(),
-            ctx.confirm.clone(),
-            ctx.auto_mode.clone(),
-            ctx.skills_dir.clone(),
-        )
-        .with_policy_override(ctx.policy_override.clone())
-        .with_intent(ctx.intent.clone())
-        .with_approval_timeout(ctx.approval_timeout)
-        .with_clock(tool_clock)
-        .with_approve_dir(ctx.approve_dir.clone())
-        .with_grants(ctx.grants.clone())
-        .with_cancel(opts.cancel.clone())
-        .with_truncate(ctx.truncate)
-        .with_jobs(ctx.jobs.clone())
-        .with_timers(ctx.timers.clone())
-        .with_job_owner(ctx.job_owner.clone())
-        .with_on_job_acquired(ctx.on_job_acquired.clone())
-        .with_memory(ctx.memory.clone()),
+        BuiltinTools::from_session(ctx.session.clone())
+            .with_tool_event(ctx.on_tool_event.clone())
+            .with_confirm(ctx.confirm.clone())
+            .with_intent(ctx.intent.clone())
+            .with_approval_timeout(ctx.approval_timeout)
+            .with_clock(tool_clock)
+            .with_approve_dir(ctx.approve_dir.clone())
+            .with_cancel(opts.cancel.clone())
+            .with_on_job_acquired(ctx.on_job_acquired.clone()),
     );
     let strings = ctx.strings.clone();
     let recall = ctx.recall.clone();
     let result = ctx.result.clone();
-    let skills_dir = ctx.skills_dir.clone();
+    let skills_dir = ctx.session.skills_dir.clone();
     let subagent = ctx.subagent.clone();
-    let models = ctx.models.clone();
+    let models = ctx.session.models.clone();
     let logs = Arc::new(Mutex::new(String::new()));
 
     // The allowance this call was given, read before the guest starts: the

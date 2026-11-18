@@ -203,22 +203,16 @@ fn model() -> Model {
 }
 
 fn agent_with(rounds: Vec<Vec<StreamingEvent>>, root: &std::path::Path) -> Agent {
-    Agent {
-        exec_worker: std::sync::Arc::new(std::sync::OnceLock::new()),
-        provider: Arc::new(MockProvider::new(rounds)),
-        model: model(),
+    let executor = ToolExecutor {
         root: root.to_path_buf(),
         tmp_dir: std::env::temp_dir().join("lofi-agent-test"),
         tmp_lease: None,
-        memory: None,
-        retry: crate::retry::RetryPolicy::default(),
-        system_prompt: "sys".to_string(),
-        max_output_tokens: None,
-        compaction: lofi_types::CompactionConfig::default(),
         bash_env: lofi_code::BashEnv::default(),
         shell_policy: lofi_code::policy::defaults::resolve(
             &lofi_types::ShellPolicyConfig::default(),
         ),
+        truncate: lofi_code::TruncatedCap::default(),
+        image: lofi_types::ImageConfig::default(),
         confirm_tx: None,
         confirm_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         confirm_watch: std::sync::Arc::new(super::tool_executor::ConfirmWatch::default()),
@@ -229,15 +223,27 @@ fn agent_with(rounds: Vec<Vec<StreamingEvent>>, root: &std::path::Path) -> Agent
         policy_override: lofi_code::policy::PolicyOverride::default(),
         skills_dir: None,
         grants: Vec::new(),
+        memory: None,
         jobs: lofi_code::tools::JobRegistry::new(),
         timers: lofi_code::tools::TimerRegistry::new(),
         job_owner: None,
+        exec_worker: std::sync::Arc::new(std::sync::OnceLock::new()),
+        subagent: None,
         mailbox: None,
-        truncate: lofi_code::TruncatedCap::default(),
-        image: lofi_types::ImageConfig::default(),
-        auto_continue: lofi_types::AutoContinuePolicy::default(),
-        subagent_support: None,
         subagents: SubagentRegistry::default(),
+        subagent_support: None,
+        models: None,
+        session_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    Agent {
+        provider: Arc::new(MockProvider::new(rounds)),
+        model: model(),
+        executor,
+        retry: crate::retry::RetryPolicy::default(),
+        system_prompt: "sys".to_string(),
+        max_output_tokens: None,
+        compaction: lofi_types::CompactionConfig::default(),
+        auto_continue: lofi_types::AutoContinuePolicy::default(),
         source: None,
     }
 }

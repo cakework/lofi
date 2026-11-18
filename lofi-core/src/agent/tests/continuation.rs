@@ -958,49 +958,17 @@ async fn run_continuation_force_stops_at_hard_cap() {
         ]
     };
     let agent = Agent {
-        exec_worker: std::sync::Arc::new(std::sync::OnceLock::new()),
-        provider: Arc::new(MockProvider::new(vec![tool_round(10), tool_round(500)])),
         model: {
             let mut m = model();
             m.context_window = Some(100);
             m
         },
-        root: dir.path().to_path_buf(),
-        tmp_dir: std::env::temp_dir().join("lofi-agent-test"),
-        tmp_lease: None,
-        memory: None,
-        retry: crate::retry::RetryPolicy::default(),
-        system_prompt: "sys".to_string(),
-        max_output_tokens: None,
         // hard cap = 100 - 20 = 80
         compaction: lofi_types::CompactionConfig {
             reserved_context_tokens: 20,
             ..Default::default()
         },
-        auto_mode_config: None,
-        bash_env: lofi_code::BashEnv::default(),
-        shell_policy: lofi_code::policy::defaults::resolve(
-            &lofi_types::ShellPolicyConfig::default(),
-        ),
-        confirm_tx: None,
-        confirm_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        confirm_watch: std::sync::Arc::new(super::super::tool_executor::ConfirmWatch::default()),
-        activity: std::sync::Arc::new(super::super::tool_executor::ActivityWatch::default()),
-        auto_mode: None,
-        auto_mode_hints: super::super::auto_mode::hint_handle(),
-        policy_override: lofi_code::policy::PolicyOverride::default(),
-        skills_dir: None,
-        grants: Vec::new(),
-        jobs: lofi_code::tools::JobRegistry::new(),
-        timers: lofi_code::tools::TimerRegistry::new(),
-        truncate: lofi_code::TruncatedCap::default(),
-        image: lofi_types::ImageConfig::default(),
-        auto_continue: lofi_types::AutoContinuePolicy::default(),
-        subagent_support: None,
-        subagents: SubagentRegistry::default(),
-        job_owner: None,
-        mailbox: None,
-        source: None,
+        ..agent_with(vec![tool_round(10), tool_round(500)], dir.path())
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let mut messages = vec![user_msg("go")];
@@ -1063,49 +1031,18 @@ async fn run_continuation_image_byte_pressure_stops_before_send() {
         },
     ]]));
     let agent = Agent {
-        exec_worker: std::sync::Arc::new(std::sync::OnceLock::new()),
         provider: provider.clone(),
         model: {
             let mut m = model();
             m.supports_image = true;
             m
         },
-        root: dir.path().to_path_buf(),
-        tmp_dir: std::env::temp_dir().join("lofi-agent-test"),
-        tmp_lease: None,
-        memory: None,
-        retry: crate::retry::RetryPolicy::default(),
-        system_prompt: "sys".to_string(),
-        max_output_tokens: None,
         // token cap sits at the window, so the byte cap is the trigger
         compaction: lofi_types::CompactionConfig {
             reserved_context_tokens: 0,
             ..Default::default()
         },
-        auto_mode_config: None,
-        bash_env: lofi_code::BashEnv::default(),
-        shell_policy: lofi_code::policy::defaults::resolve(
-            &lofi_types::ShellPolicyConfig::default(),
-        ),
-        confirm_tx: None,
-        confirm_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        confirm_watch: std::sync::Arc::new(super::super::tool_executor::ConfirmWatch::default()),
-        activity: std::sync::Arc::new(super::super::tool_executor::ActivityWatch::default()),
-        auto_mode: None,
-        auto_mode_hints: super::super::auto_mode::hint_handle(),
-        policy_override: lofi_code::policy::PolicyOverride::default(),
-        skills_dir: None,
-        grants: Vec::new(),
-        jobs: lofi_code::tools::JobRegistry::new(),
-        timers: lofi_code::tools::TimerRegistry::new(),
-        truncate: lofi_code::TruncatedCap::default(),
-        image: lofi_types::ImageConfig::default(),
-        auto_continue: lofi_types::AutoContinuePolicy::default(),
-        subagent_support: None,
-        subagents: SubagentRegistry::default(),
-        job_owner: None,
-        mailbox: None,
-        source: None,
+        ..agent_with(Vec::new(), dir.path())
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let mut messages = oversized_image_messages();
