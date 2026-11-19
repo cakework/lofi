@@ -131,8 +131,7 @@ impl App {
         if let (Some(tx), Some(sink)) = (self.picker_load_tx.clone(), self.session.sink.as_ref()) {
             self.modal = Some(ActiveModal::Tree {
                 picker: TreePickerState {
-                    entries: Vec::new(),
-                    selected: 0,
+                    list: PickerList::empty(),
                     generation,
                     loading: true,
                 },
@@ -154,8 +153,7 @@ impl App {
                         let selected = entries.len().saturating_sub(1);
                         self.modal = Some(ActiveModal::Tree {
                             picker: TreePickerState {
-                                entries,
-                                selected,
+                                list: PickerList::new(entries, selected),
                                 generation,
                                 loading: false,
                             },
@@ -192,15 +190,17 @@ impl App {
                 return;
             }
             let generation = picker.generation;
+            let len = picker.list.len();
             let start = picker
+                .list
                 .selected
                 .saturating_sub(VIEW_ROWS.saturating_sub(1))
-                .min(picker.entries.len().saturating_sub(VIEW_ROWS));
-            let end = (start + VIEW_ROWS).min(picker.entries.len());
+                .min(len.saturating_sub(VIEW_ROWS));
+            let end = (start + VIEW_ROWS).min(len);
             let prefetch_start = start.saturating_sub(VIEW_ROWS);
             let requested: Vec<_> = (prefetch_start..end)
-                .filter(|row| !picker.entries[*row].hydrated && !pending.contains(row))
-                .map(|row| (row, picker.entries[row].clone()))
+                .filter(|row| !picker.list.items[*row].hydrated && !pending.contains(row))
+                .map(|row| (row, picker.list.items[row].clone()))
                 .collect();
             if requested.is_empty() {
                 return;
@@ -308,9 +308,9 @@ impl App {
         picker: TreePickerState,
         snapshot: Option<u64>,
     ) {
-        let entry = picker.entries.get(picker.selected).cloned();
+        let entry = picker.list.current().cloned();
         self.picker_generation.fetch_add(1, Ordering::Relaxed);
-        self.release_tree_resources(picker.entries, snapshot);
+        self.release_tree_resources(picker.list.items, snapshot);
         if self.busy() {
             self.notify(
                 NotifyKind::Warn,

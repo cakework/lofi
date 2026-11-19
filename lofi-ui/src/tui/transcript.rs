@@ -956,6 +956,57 @@ impl App {
     }
 }
 
+/// Discard successful `exec` result bodies for collapsed views while recording
+/// which tool ids still have durable output available on disk.
+pub(in crate::tui) fn strip_collapsed_exec_results(
+    events: &mut [SessionEvent],
+) -> std::collections::HashSet<String> {
+    let mut exec_ids = std::collections::HashSet::new();
+    let mut available_exec_results = std::collections::HashSet::new();
+    for event in events {
+        let SessionEventKind::Message(message) = &mut event.kind else {
+            continue;
+        };
+        if message.role == Role::Assistant {
+            exec_ids.extend(message.blocks.iter().filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, .. } if name == "exec" => Some(id.clone()),
+                _ => None,
+            }));
+        }
+        for block in &mut message.blocks {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: false,
+                ..
+            } = block
+            {
+                if exec_ids.contains(tool_use_id) {
+                    if !content.is_empty() {
+                        available_exec_results.insert(tool_use_id.clone());
+                    }
+                    content.clear();
+                    content.shrink_to_fit();
+                }
+            }
+        }
+    }
+    available_exec_results
+}
+
+pub(in crate::tui) fn restore_result_availability(
+    turn: &mut Turn,
+    available_exec_results: &std::collections::HashSet<String>,
+) {
+    for block in &mut turn.blocks {
+        if let Block::Tool(tool) = block {
+            if available_exec_results.contains(&tool.id) {
+                tool.result_availability = ResultAvailability::Available;
+            }
+        }
+    }
+}
+
 impl Transcript {
     /// Remember the first durable-transcript read failure seen this frame;
     /// rendering holds `&App`, so interior mutability defers the notify to
@@ -964,19 +1015,6 @@ impl Transcript {
         let mut alert = self.alert.borrow_mut();
         if alert.is_none() {
             *alert = Some(message);
-        }
-    }
-
-    fn restore_result_availability(
-        turn: &mut Turn,
-        available_exec_results: &std::collections::HashSet<String>,
-    ) {
-        for block in &mut turn.blocks {
-            if let Block::Tool(tool) = block {
-                if available_exec_results.contains(&tool.id) {
-                    tool.result_availability = ResultAvailability::Available;
-                }
-            }
         }
     }
 
@@ -1051,45 +1089,11 @@ impl Transcript {
                 return Arc::new(empty);
             }
         };
-        let mut exec_ids = std::collections::HashSet::new();
-        let mut available_exec_results = std::collections::HashSet::new();
-        for event in &mut events {
-            // Successful exec results are not rendered at all in collapsed
-            // mode (the nested native-tool rows already show the work). Track
-            // exec call ids from assistant messages, then discard only their
-            // matching hidden result bodies. Results of other tools and all
-            // errors remain intact because their collapsed previews are
-            // visible. Expanded rows reparse the exact durable content.
-            if !expanded {
-                if let SessionEventKind::Message(message) = &mut event.kind {
-                    if message.role == Role::Assistant {
-                        exec_ids.extend(message.blocks.iter().filter_map(|block| match block {
-                            ContentBlock::ToolUse { id, name, .. } if name == "exec" => {
-                                Some(id.clone())
-                            }
-                            _ => None,
-                        }));
-                    }
-                    for block in &mut message.blocks {
-                        if let ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error: false,
-                            ..
-                        } = block
-                        {
-                            if exec_ids.contains(tool_use_id) {
-                                if !content.is_empty() {
-                                    available_exec_results.insert(tool_use_id.clone());
-                                }
-                                content.clear();
-                                content.shrink_to_fit();
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let available_exec_results = if expanded {
+            std::collections::HashSet::new()
+        } else {
+            strip_collapsed_exec_results(&mut events)
+        };
         let turns = if selected_offsets.is_some() {
             turns_from_selected_session_events(&events)
         } else {
@@ -1106,7 +1110,7 @@ impl Transcript {
             }
         }
         assign_detail_ids(&mut turn, idx);
-        Self::restore_result_availability(&mut turn, &available_exec_results);
+        restore_result_availability(&mut turn, &available_exec_results);
         if !expanded {
             view::blocks::compact_native_previews(&mut turn);
         }

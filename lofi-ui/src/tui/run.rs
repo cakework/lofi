@@ -240,27 +240,28 @@ impl Drop for TerminalGuard {
 /// `agent` is `None` when no model is configured: the UI still launches and
 /// shows `no_models_hint` in the log; submitting a prompt re-surfaces the
 /// hint instead of running.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run(
-    agent: Option<BackendRef>,
-    model_label: String,
-    thinking: ThinkingLevel,
-    service_tier: ServiceTier,
-    ui_theme: lofi_types::ThemeMode,
-    session: SessionConfig,
-    no_models_hint: Option<String>,
-    ctx_limit: u64,
-    compaction: lofi_types::CompactionConfig,
-    switcher: Option<ModelSwitcher>,
-    system_prompt: String,
-) -> Result<()> {
+pub(crate) struct TuiLaunch {
+    pub(crate) agent: Option<BackendRef>,
+    pub(crate) model_label: String,
+    pub(crate) thinking: ThinkingLevel,
+    pub(crate) service_tier: ServiceTier,
+    pub(crate) ui_theme: lofi_types::ThemeMode,
+    pub(crate) session: SessionConfig,
+    pub(crate) no_models_hint: Option<String>,
+    pub(crate) ctx_limit: u64,
+    pub(crate) compaction: lofi_types::CompactionConfig,
+    pub(crate) switcher: Option<ModelSwitcher>,
+    pub(crate) system_prompt: String,
+}
+
+pub(crate) async fn run(launch: TuiLaunch) -> Result<()> {
     tty_events::ensure_terminal_input().map_err(Error::Io)?;
     enable_raw_mode().map_err(Error::Io)?;
     let setup = (|| -> std::io::Result<_> {
         // Name the window and report the cwd before the first frame: a
         // terminal or a mux keeps the title it already holds until something
         // replaces it.
-        window::announce(&session.cwd);
+        window::announce(&launch.session.cwd);
         let mut stdout = io::stdout();
         execute!(
             stdout,
@@ -291,21 +292,7 @@ pub(crate) async fn run(
     let local = LocalSet::new();
     let result = std::panic::AssertUnwindSafe(local.run_until(async move {
         // `run_loop` exceeds clippy's large_futures stack limit.
-        Box::pin(run_loop(
-            &mut guard,
-            agent,
-            ui_theme,
-            model_label,
-            thinking,
-            service_tier,
-            session,
-            no_models_hint,
-            ctx_limit,
-            compaction,
-            switcher,
-            system_prompt,
-        ))
-        .await
+        Box::pin(run_loop(&mut guard, launch)).await
     }))
     .catch_unwind()
     .await;
@@ -326,21 +313,21 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .unwrap_or("unknown panic")
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) async fn run_loop(
-    guard: &mut TerminalGuard,
-    mut agent: Option<BackendRef>,
-    theme_mode: lofi_types::ThemeMode,
-    model_label: String,
-    thinking: ThinkingLevel,
-    service_tier: ServiceTier,
-    session: SessionConfig,
-    no_models_hint: Option<String>,
-    ctx_limit: u64,
-    compaction: lofi_types::CompactionConfig,
-    switcher: Option<ModelSwitcher>,
-    system_prompt: String,
-) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_loop(guard: &mut TerminalGuard, launch: TuiLaunch) -> Result<()> {
+    let TuiLaunch {
+        mut agent,
+        model_label,
+        thinking,
+        service_tier,
+        ui_theme: theme_mode,
+        session,
+        no_models_hint,
+        ctx_limit,
+        compaction,
+        switcher,
+        system_prompt,
+    } = launch;
     let SessionConfig {
         sink,
         cursor,
@@ -362,10 +349,10 @@ pub(crate) async fn run_loop(
         system_prompt,
     );
     if let Some(backend) = agent.as_ref() {
-        app.selected_model_label =
+        app.model.selected_label =
             Some(format!("{}/{}", backend.name(), backend.selection().model));
     }
-    app.model_choices = model_choices;
+    app.model.choices = model_choices;
     app.lifecycle.set_workspace_root(cwd.clone());
     app.session = SessionState { sink, cursor, cwd };
     if let Some(cursor) = app.session.cursor.clone() {
@@ -391,7 +378,7 @@ pub(crate) async fn run_loop(
     // including the final one. Viewport materialization owns the bounded
     // display working set from this point onward.
     app.bump_render_epoch();
-    app.no_models_hint = no_models_hint.clone();
+    app.model.no_models_hint = no_models_hint.clone();
     if let Some(hint) = no_models_hint {
         // Lead with the hint so the user sees why nothing will run.
         app.transcript.insert_turn(
@@ -503,7 +490,9 @@ pub(crate) async fn run_loop(
                 }
             } => {
                 if let Some(e) = ev {
-                    app.run_event_at = Some(Instant::now());
+                    if let Some(active) = app.active_run.as_mut() {
+                        active.event_at = Instant::now();
+                    }
                     if let Some(run) = current_run.as_ref() {
                         attach_run_cursor(&mut app, run);
                     }
@@ -588,7 +577,7 @@ pub(crate) async fn run_loop(
                                 }
                             } else {
                                 app.maybe_auto_compact();
-                                if !app.lifecycle_busy && app.run.is_none() {
+                                if !app.lifecycle_busy && !app.run_active() {
                                     if let Some(queued) = app.prompt_queue.first().cloned() {
                                         app.prompt_queue.remove(0);
                                         spawn_prompt(
@@ -659,7 +648,7 @@ pub(crate) async fn run_loop(
                         if !app.should_quit {
                             handle_event(&ev, &mut app, agent.as_ref(), &mut current_run);
                         }
-                    if let Some(q) = app.pending_model_switch.take() {
+                    if let Some(q) = app.model.pending_switch.take() {
                         // The query names the backend and the selection, so
                         // one path switches a model and a transport alike.
                         if let Some(switcher) = switcher.as_ref() {
@@ -669,8 +658,8 @@ pub(crate) async fn run_loop(
                                     let choice = new_agent.choice();
                                     let label =
                                         format!("{}/{}", new_agent.name(), selection.model);
-                                    app.reported_context = None;
-                                    app.selected_model_label = None;
+                                    app.usage.reported_context = None;
+                                    app.model.selected_label = None;
                                     app.apply_model_switch(
                                         &label,
                                         selection.thinking,
@@ -678,7 +667,7 @@ pub(crate) async fn run_loop(
                                         choice.context_window,
                                     );
                                     let new_agent = new_agent.with_confirm_tx(confirm_tx.clone());
-                                    app.no_models_hint = None;
+                                    app.model.no_models_hint = None;
                                     app.system_prompt = new_agent.system_prompt().into();
                                     let executor = new_agent.tool_executor();
                                     let old_subagents = app.subagents();
@@ -820,10 +809,8 @@ pub(crate) async fn run_loop(
                 if app.refresh_confirmations() || !app.confirms.pending.is_empty() {
                     dirty = true;
                 }
-                if app.run.is_some() {
-                    if let Some(s) = app.run.as_mut() {
-                        *s = s.wrapping_add(1);
-                    }
+                if let Some(active) = app.active_run.as_mut() {
+                    active.spinner = active.spinner.wrapping_add(1);
                     dirty = true;
                 }
                 let jobs_shown_now = !app.running_jobs().is_empty();

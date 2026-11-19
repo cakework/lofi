@@ -12,10 +12,8 @@ impl App {
         compaction: lofi_types::CompactionConfig,
         system_prompt: String,
     ) -> Self {
-        let thinking_label =
-            (thinking != ThinkingLevel::Off).then(|| format!(":{}", thinking.as_str()));
-        let service_label =
-            (service_tier != ServiceTier::Auto).then(|| format!("@{}", service_tier.as_str()));
+        let model = ModelSelectionState::new(model_label, thinking, service_tier, ctx_limit);
+        let ctx_window = model.ctx_limit;
         Self {
             transcript: Transcript::new(),
             layout: TranscriptLayout::new(),
@@ -23,44 +21,16 @@ impl App {
             viewport: ViewportState::default(),
             modal: None,
             confirms: ConfirmQueue::default(),
-            lifecycle: AgentLifecycle::new(
-                compaction,
-                if ctx_limit > 0 {
-                    ctx_limit
-                } else {
-                    DEFAULT_CTX_LIMIT
-                },
-            ),
+            lifecycle: AgentLifecycle::new(compaction, ctx_window),
             system_prompt,
-            model_label,
-            selected_model_label: None,
-            thinking_label,
-            thinking,
-            service_label,
-            service_tier,
-            status_usage: None,
-            reported_context: None,
-            ctx_limit: if ctx_limit > 0 {
-                ctx_limit
-            } else {
-                DEFAULT_CTX_LIMIT
-            },
-            settled_usage_fresh: false,
-            compacted: false,
+            model,
+            usage: UsageState::default(),
             context_pressure: None,
-            cost: 0.0,
-            turn_cost: 0.0,
-            turn_has_round_usage: false,
-            total_in: 0,
-            total_out: 0,
             prompt_queue: Vec::new(),
             mailbox_wake: None,
             startup_notices: Vec::new(),
             notices_in_flight: false,
-            run: None,
-            run_start: None,
-            run_model_label: None,
-            run_selected_model_label: None,
+            active_run: None,
             retry: None,
             pending_prompt_start: false,
             lifecycle_tx: None,
@@ -79,14 +49,9 @@ impl App {
             picker_load_tx: None,
             picker_generation: Arc::new(AtomicU64::new(0)),
             executor: None,
-            model_choices: Vec::new(),
-            pending_model_switch: None,
-            no_models_hint: None,
             theme: Theme::default(),
             theme_manager: theme::ThemeManager::default(),
             ctrl_c_at: None,
-            cancel_at: None,
-            run_event_at: None,
             yank_notify: None,
             notify: None,
             render_profile: Box::default(),
@@ -97,12 +62,11 @@ impl App {
     }
 
     pub(super) fn session_model(&self) -> String {
-        format!(
-            "{}{}{}",
-            self.model_label,
-            self.thinking_label.as_deref().unwrap_or(""),
-            self.service_label.as_deref().unwrap_or("")
-        )
+        self.model.session_label()
+    }
+
+    pub(crate) fn begin_active_run(&mut self) -> &mut ActiveRunState {
+        self.active_run.insert(ActiveRunState::start(&self.model))
     }
 
     /// Apply one event while rebuilding a file-backed transcript. At each
@@ -122,15 +86,13 @@ impl App {
     #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
     pub(super) fn apply_event(&mut self, ev: AgentEvent) {
         if let AgentEvent::RunStart = ev {
-            self.turn_cost = 0.0;
-            self.turn_has_round_usage = false;
-            self.settled_usage_fresh = false;
+            self.usage.reset_turn();
             return;
         }
         if let AgentEvent::Prompt { prompt, kind } = ev {
             // A live run dates its prompt publication; replay of a resumed
             // file has no run and must not sample once per turn.
-            if self.run.is_some() {
+            if self.run_active() {
                 self.debug_sample("core_prompt");
             }
             // spawn_agent_run pre-pushes the prompt at submit time so it
@@ -152,9 +114,7 @@ impl App {
             return;
         }
         if let AgentEvent::TurnContinue = ev {
-            self.turn_cost = 0.0;
-            self.turn_has_round_usage = false;
-            self.settled_usage_fresh = false;
+            self.usage.reset_turn();
             return;
         }
         match ev {
@@ -220,25 +180,30 @@ impl App {
                 return;
             }
             AgentEvent::ModelReported { id, display } => {
-                let run_label = self.run_model_label.as_ref().unwrap_or(&self.model_label);
+                let run_label = self
+                    .active_run
+                    .as_ref()
+                    .and_then(|r| r.model_label.as_deref())
+                    .unwrap_or(&self.model.label);
                 if let Some((provider, _)) = run_label.split_once('/') {
                     // The report names the model only. Keep the effort and the
                     // tier the turn runs with, so the working line keeps them.
-                    let suffix = format!(
-                        "{}{}",
-                        self.thinking_label.as_deref().unwrap_or(""),
-                        self.service_label.as_deref().unwrap_or("")
-                    );
+                    let suffix = self.model.suffix();
                     let response_label = format!("{provider}/{id}{suffix}");
                     let display_label = format!("{provider}/{display}");
-                    if self
-                        .run_selected_model_label
+                    let same_selection = self
+                        .active_run
                         .as_ref()
-                        .is_none_or(|selected| Some(selected) == self.selected_model_label.as_ref())
-                    {
-                        self.model_label = display_label;
+                        .and_then(|r| r.selected_model_label.as_deref())
+                        .is_none_or(|selected| {
+                            Some(selected) == self.model.selected_label.as_deref()
+                        });
+                    if same_selection {
+                        self.model.label = display_label;
                     }
-                    self.run_model_label = Some(response_label);
+                    if let Some(active) = self.active_run.as_mut() {
+                        active.model_label = Some(response_label);
+                    }
                 }
                 return;
             }
@@ -249,16 +214,14 @@ impl App {
                 if let Some(size) = context.and_then(|context| context.size) {
                     self.lifecycle.set_context_window(size);
                 }
-                self.reported_context = context;
+                self.usage.reported_context = context;
                 return;
             }
             AgentEvent::SubagentUsage { cost, usage } => {
                 // Subagent spend folds into the session totals only: child
                 // tokens never occupy the parent context window, so the
                 // gauge (`status_usage`) and the turn fold stay untouched.
-                self.cost += cost;
-                self.total_in += usage.input_tokens;
-                self.total_out += usage.output_tokens;
+                self.usage.fold_subagent(cost, usage);
                 return;
             }
             AgentEvent::RoundUsage { cost, usage } => {
@@ -268,27 +231,27 @@ impl App {
                 // footer can show a live running total. Tokens accumulate
                 // directly into the session totals; `TurnEnd` skips
                 // re-adding them when `turn_has_round_usage` is set.
-                self.turn_cost = cost;
-                self.turn_has_round_usage = true;
-                self.total_in += usage.input_tokens;
-                self.total_out += usage.output_tokens;
-                self.status_usage = Some(usage);
-                self.settled_usage_fresh = true;
-                self.compacted = false;
+                self.usage.turn_cost = cost;
+                self.usage.turn_has_round_usage = true;
+                self.usage.total_in += usage.input_tokens;
+                self.usage.total_out += usage.output_tokens;
+                self.usage.status_usage = Some(usage);
+                self.usage.settled_usage_fresh = true;
+                self.usage.compacted = false;
                 return;
             }
             AgentEvent::TurnEnd { cost, usage, .. } => {
-                if self.turn_has_round_usage {
-                    self.cost += self.turn_cost;
+                if self.usage.turn_has_round_usage {
+                    self.usage.cost += self.usage.turn_cost;
                 } else {
-                    self.cost += cost;
-                    self.total_in += usage.input_tokens;
-                    self.total_out += usage.output_tokens;
-                    self.status_usage = Some(usage);
+                    self.usage.cost += cost;
+                    self.usage.total_in += usage.input_tokens;
+                    self.usage.total_out += usage.output_tokens;
+                    self.usage.status_usage = Some(usage);
                 }
-                self.turn_cost = 0.0;
-                self.turn_has_round_usage = false;
-                self.compacted = false;
+                self.usage.turn_cost = 0.0;
+                self.usage.turn_has_round_usage = false;
+                self.usage.compacted = false;
             }
             AgentEvent::TurnFailed { cost, usage, .. }
             | AgentEvent::TurnCancelled { cost, usage, .. } => {
@@ -298,17 +261,16 @@ impl App {
                 // the cumulative cost; the resume path applies the bundled
                 // totals. `status_usage` updates either way so the gauge
                 // reflects the failed turn's last round.
-                if self.turn_has_round_usage {
-                    self.cost += self.turn_cost;
-                    self.status_usage = Some(usage);
+                if self.usage.turn_has_round_usage {
+                    self.usage.cost += self.usage.turn_cost;
                 } else {
-                    self.cost += cost;
-                    self.total_in += usage.input_tokens;
-                    self.total_out += usage.output_tokens;
-                    self.status_usage = Some(usage);
+                    self.usage.cost += cost;
+                    self.usage.total_in += usage.input_tokens;
+                    self.usage.total_out += usage.output_tokens;
                 }
-                self.turn_cost = 0.0;
-                self.turn_has_round_usage = false;
+                self.usage.status_usage = Some(usage);
+                self.usage.turn_cost = 0.0;
+                self.usage.turn_has_round_usage = false;
             }
             AgentEvent::ContextPressure {
                 resume,
@@ -323,16 +285,16 @@ impl App {
                 // block is rendered — the compaction marker (from
                 // `compact_now`) is the visible signal, and the continue
                 // appends to this turn.
-                if self.turn_has_round_usage {
-                    self.cost += self.turn_cost;
+                if self.usage.turn_has_round_usage {
+                    self.usage.cost += self.usage.turn_cost;
                 } else {
-                    self.cost += cost;
-                    self.total_in += usage.input_tokens;
-                    self.total_out += usage.output_tokens;
+                    self.usage.cost += cost;
+                    self.usage.total_in += usage.input_tokens;
+                    self.usage.total_out += usage.output_tokens;
                 }
-                self.status_usage = Some(usage);
-                self.turn_cost = 0.0;
-                self.turn_has_round_usage = false;
+                self.usage.status_usage = Some(usage);
+                self.usage.turn_cost = 0.0;
+                self.usage.turn_has_round_usage = false;
                 self.context_pressure = Some(resume);
                 return;
             }
@@ -340,13 +302,13 @@ impl App {
                 // The transcript's last turn never settled: the process died
                 // before its terminal marker. Its checkpoints kept the spend,
                 // so the resumed totals match what the provider billed.
-                self.cost += cost;
-                self.total_in += usage.input_tokens;
-                self.total_out += usage.output_tokens;
-                self.status_usage = Some(usage);
+                self.usage.cost += cost;
+                self.usage.total_in += usage.input_tokens;
+                self.usage.total_out += usage.output_tokens;
+                self.usage.status_usage = Some(usage);
                 return;
             }
-            AgentEvent::Compaction { .. } => self.mark_compacted(),
+            AgentEvent::Compaction { .. } => self.usage.mark_compacted(),
             _ => {}
         }
         // `UserShellStart` (live) opens the standalone turn; a finished
@@ -411,23 +373,9 @@ impl App {
         // The turn-end marker (model, elapsed, cost, usage) arrives as an
         // `AgentEvent::TurnEnd` emitted by the engine, which also writes it
         // to the transcript — so there is nothing to stamp or persist here.
-        self.run_start = None;
-        self.run = None;
-        self.run_model_label = None;
-        self.run_selected_model_label = None;
+        self.active_run = None;
         self.retry = None;
         self.pending_prompt_start = false;
-        self.cancel_at = None;
-        self.run_event_at = None;
-    }
-
-    pub(super) fn reset_compaction_gauges(&mut self) {
-        self.status_usage = None;
-        // A rewritten history invalidates the fill the engine last reported;
-        // the next round or turn reports the new one.
-        self.reported_context = None;
-        self.settled_usage_fresh = false;
-        self.compacted = false;
     }
 
     /// Push a submitted prompt immediately instead of waiting for the
@@ -444,25 +392,23 @@ impl App {
     }
 
     pub(super) fn run_active(&self) -> bool {
-        self.run.is_some()
+        self.active_run.is_some()
     }
 
     /// Whether the user asked the current run to stop and it has not settled.
     pub(super) fn cancel_pending(&self) -> bool {
-        self.cancel_at.is_some()
+        self.active_run
+            .as_ref()
+            .is_some_and(|r| r.cancel_at.is_some())
     }
 
     /// Whether a cancel request met no answer: the turn was told to stop and
     /// has reported nothing since. The turn polls the flag itself, so silence
     /// for this long means it is blocked inside a call that never observes it.
     pub(super) fn cancel_unacknowledged(&self) -> bool {
-        let Some(requested) = self.cancel_at else {
-            return false;
-        };
-        let since = self
-            .run_event_at
-            .map_or(requested, |reported| reported.max(requested));
-        since.elapsed() >= CANCEL_STALL
+        self.active_run
+            .as_ref()
+            .is_some_and(ActiveRunState::cancel_unacknowledged)
     }
 
     pub(super) fn busy(&self) -> bool {
@@ -505,44 +451,24 @@ impl App {
     }
 
     pub(super) fn spinner_frame(&self) -> usize {
-        self.run.unwrap_or(0)
+        self.active_run.as_ref().map_or(0, |r| r.spinner)
     }
 
     pub(super) fn run_label(&self) -> String {
-        self.run_model_label
-            .clone()
+        self.active_run
+            .as_ref()
+            .and_then(|r| r.model_label.clone())
             .unwrap_or_else(|| self.session_model())
     }
 
-    /// Raw model identity for the session header (`store::create`) and for the
-    /// markers the UI writes itself (queued prompts, user shell). The App holds
-    /// the rendered `model_label` (`provider/label`) transiently; this splits
-    /// it back into raw fields so the header stores raw data, and pairs it with
-    /// the selected name so a resume re-selects what the user picked instead of
-    /// the id the backend reported.
     pub(super) fn run_model(&self) -> RunModel {
-        let (provider, id) = match self.model_label.split_once('/') {
-            Some((p, r)) => (p, r),
-            None => ("", self.model_label.as_str()),
-        };
-        let selected = self
-            .selected_model_label
-            .as_deref()
-            .and_then(|label| label.split_once('/'))
-            .filter(|(label_provider, _)| *label_provider == provider)
-            .map_or(id, |(_, selected)| selected);
-        RunModel {
-            provider: provider.to_string(),
-            id: id.to_string(),
-            selected: selected.to_string(),
-            display: (selected != id).then(|| id.to_string()),
-            thinking: self.thinking.clone(),
-            service_tier: self.service_tier.clone(),
-        }
+        self.model.run_model()
     }
 
     pub(super) fn run_elapsed(&self) -> Duration {
-        self.run_start.map(|s| s.elapsed()).unwrap_or_default()
+        self.active_run
+            .as_ref()
+            .map_or(Duration::ZERO, |r| r.started_at.elapsed())
     }
 }
 
@@ -595,17 +521,9 @@ impl App {
                 });
             }
         }
-        self.mark_compacted();
+        self.usage.mark_compacted();
         self.bump_render_epoch();
         self.debug_sample("compaction");
-    }
-
-    /// A compaction marker is in the transcript. The context gauge's last
-    /// reading reflects the pre-compaction fill; drop it so the gauge shows "c"
-    /// and waits for the next round's real (smaller) usage.
-    fn mark_compacted(&mut self) {
-        self.reset_compaction_gauges();
-        self.compacted = true;
     }
 
     fn start_lifecycle_operation(&mut self, operation: LifecycleOperation) -> bool {
@@ -708,10 +626,10 @@ impl App {
 
     /// Let core evaluate soft-compaction policy; the UI only renders outcomes.
     pub(super) fn maybe_auto_compact(&mut self) {
-        if !std::mem::take(&mut self.settled_usage_fresh) {
+        if !std::mem::take(&mut self.usage.settled_usage_fresh) {
             return;
         }
-        let Some(usage) = self.status_usage else {
+        let Some(usage) = self.usage.status_usage else {
             return;
         };
         // The gate is cheap and pure, so an under-threshold turn never

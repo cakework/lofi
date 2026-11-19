@@ -154,3 +154,45 @@ pub(super) fn detail_box(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::{App, DetailState, ServiceTier, ThinkingLevel};
+
+    #[test]
+    fn detail_row_count_matches_rendered_detail_box_at_wrap_boundary() {
+        let mut app = App::new(
+            "openai/gpt-4o".to_string(),
+            ThinkingLevel::Off,
+            ServiceTier::Auto,
+            0,
+            lofi_types::CompactionConfig::default(),
+            String::new(),
+        );
+        let key = DetailKey::Exec(0);
+        app.expanded_details.insert(
+            key.clone(),
+            DetailState {
+                turn: 0,
+                scroll: None,
+            },
+        );
+        let deco = vec![Span::raw("  ")];
+        // inner = width - (deco(2) + 3) = 10, so an 11-column line wraps onto 2
+        // rows; subtracting 2 instead of 3 would mispredict 1 row here.
+        let width = 15;
+        let line = "abcdefghijk".to_string();
+        let lines = vec![line.clone()];
+        let cx = Cx {
+            app: &app,
+            theme: app.theme,
+            width,
+            active_turn: false,
+        };
+        let rendered = detail_box(&lines, &key, false, &cx, &deco, Style::default());
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(detail_row_count(&lines, width, &deco), rendered.len());
+        assert_eq!(detail_str_row_count(&line, width, &deco), rendered.len());
+    }
+}

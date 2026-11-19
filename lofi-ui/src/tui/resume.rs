@@ -259,6 +259,6 @@ pub(super) fn restore_compaction_from_index(
 ) {
     let (compacted, status_usage) =
         lofi_core::session::replay::compaction_status_from_index(cursor, index);
-    app.compacted = compacted;
-    app.status_usage = status_usage;
+    app.usage.compacted = compacted;
+    app.usage.status_usage = status_usage;
 }

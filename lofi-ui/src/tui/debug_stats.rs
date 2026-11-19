@@ -552,7 +552,10 @@ impl DebugState {
             .cursor
             .as_ref()
             .map_or(0, store::SessionCursor::len);
-        let context_tokens = app.status_usage.map_or(0, |usage| usage.context_tokens());
+        let context_tokens = app
+            .usage
+            .status_usage
+            .map_or(0, |usage| usage.context_tokens());
         let palette = app.theme_manager.palette_directions();
         let record = serde_json::json!({
             "schema_version": 1,
@@ -618,7 +621,7 @@ impl DebugState {
             })),
             "components": components,
             "context": {
-                "run_active": app.run.is_some(),
+                "run_active": app.run_active(),
                 "model": app.session_model(),
                 "session_file": app.session.path().map(|path| path.display().to_string()),
                 "transcript_bytes": transcript_bytes,
@@ -629,8 +632,8 @@ impl DebugState {
                 "visible_log_lines": app.viewport.log_vis.len(),
                 "queued_prompts": app.prompt_queue.len(),
                 "context_tokens": context_tokens,
-                "context_limit": app.ctx_limit,
-                "compacted": app.compacted,
+                "context_limit": app.model.ctx_limit,
+                "compacted": app.usage.compacted,
                 "expanded_details": app.expanded_details.len(),
                 "pinned": app.viewport.pinned,
                 "top_line": app.viewport.top_line,

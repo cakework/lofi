@@ -113,21 +113,19 @@ impl App {
         }
         // Preserve the selection if the previously-selected command is still
         // a candidate; otherwise reset to the first match.
-        let prev = self.prompt.slash_complete.as_ref().and_then(|sc| {
-            sc.candidates
-                .get(sc.selected)
-                .and_then(|&idx| candidates.iter().position(|&c| c == idx))
-        });
+        let prev = self
+            .prompt
+            .slash_complete
+            .as_ref()
+            .and_then(|sc| sc.current())
+            .and_then(|&idx| candidates.iter().position(|&c| c == idx));
         let selected = prev.unwrap_or(0);
-        self.prompt.slash_complete = Some(SlashComplete {
-            candidates,
-            selected,
-        });
+        self.prompt.slash_complete = Some(SlashComplete::new(candidates, selected));
     }
 
     pub(in crate::tui) fn slash_complete_accept(&mut self) {
         if let Some(sc) = self.prompt.slash_complete.take() {
-            if let Some(&idx) = sc.candidates.get(sc.selected) {
+            if let Some(&idx) = sc.current() {
                 self.prompt.text = SLASH_COMMANDS[idx].0.to_string();
                 self.prompt.cursor = self.prompt.text.len();
             }
@@ -137,17 +135,13 @@ impl App {
 
     pub(in crate::tui) fn slash_complete_up(&mut self) {
         if let Some(sc) = self.prompt.slash_complete.as_mut() {
-            if sc.selected > 0 {
-                sc.selected -= 1;
-            }
+            sc.up();
         }
     }
 
     pub(in crate::tui) fn slash_complete_down(&mut self) {
         if let Some(sc) = self.prompt.slash_complete.as_mut() {
-            if sc.selected + 1 < sc.candidates.len() {
-                sc.selected += 1;
-            }
+            sc.down();
         }
     }
 
@@ -333,12 +327,9 @@ impl App {
         self.session.cursor = None;
         self.viewport.pinned = true;
         self.viewport.top_line = 0;
-        // Reset the footer usage/cost stats so a fresh session doesn't
-        // carry over the previous one's context gauge and accumulated cost.
-        self.reset_compaction_gauges();
-        self.cost = 0.0;
-        self.turn_cost = 0.0;
-        self.turn_has_round_usage = false;
+        // Reset the footer usage/cost/token stats so a fresh session doesn't
+        // carry over the previous one's context gauge, tokens, or spend.
+        self.usage.reset_session();
         self.bump_render_epoch();
     }
 

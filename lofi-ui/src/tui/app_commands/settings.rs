@@ -2,37 +2,35 @@ use super::*;
 
 impl App {
     /// `/model`: open the model-picker overlay populated from the retained
-    /// `model_choices`. The current model is pre-selected so the user sees
+    /// `model.choices`. The current model is pre-selected so the user sees
     /// where they are. No-op (with a notice) when no model is available.
     pub(in crate::tui) fn open_model_picker(&mut self) {
-        if self.model_choices.is_empty() {
+        if self.model.choices.is_empty() {
             self.notify(
                 NotifyKind::Warn,
                 "no models available (set a provider API key or configure backend models)",
             );
             return;
         }
+        let current = self.model.switch_label();
         let selected = self
-            .model_choices
+            .model
+            .choices
             .iter()
-            .position(|c| {
-                format!("{}/{}", c.provider, c.id)
-                    == self
-                        .selected_model_label
-                        .as_ref()
-                        .unwrap_or(&self.model_label)
-                        .as_str()
-            })
+            .position(|c| format!("{}/{}", c.provider, c.id) == current)
             .unwrap_or(0);
-        self.open_modal(ActiveModal::Model(ModelPickerState {
-            choices: self.model_choices.clone(),
+        self.open_modal(ActiveModal::Model(PickerList::new(
+            self.model.choices.clone(),
             selected,
-        }));
+        )));
     }
 
-    pub(in crate::tui) fn model_picker_confirm_inner(&mut self, picker: &ModelPickerState) {
-        if let Some(choice) = picker.choices.get(picker.selected) {
-            self.pending_model_switch = Some(format!("{}/{}", choice.provider, choice.id));
+    pub(in crate::tui) fn model_picker_confirm_inner(
+        &mut self,
+        picker: &PickerList<lofi_types::ModelChoice>,
+    ) {
+        if let Some(choice) = picker.current() {
+            self.model.pending_switch = Some(format!("{}/{}", choice.provider, choice.id));
         }
     }
 
@@ -56,23 +54,21 @@ impl App {
             );
             return;
         }
-        let selected = levels.iter().position(|l| l == &self.thinking).unwrap_or(0);
-        self.open_modal(ActiveModal::Thinking(ThinkingPickerState {
-            levels,
-            selected,
-        }));
+        let selected = levels
+            .iter()
+            .position(|l| l == &self.model.thinking)
+            .unwrap_or(0);
+        self.open_modal(ActiveModal::Thinking(PickerList::new(levels, selected)));
     }
 
     fn current_thinking_choices(&self) -> Vec<ThinkingLevel> {
         let mut out = vec![ThinkingLevel::Off];
-        let label = self
-            .selected_model_label
-            .as_ref()
-            .unwrap_or(&self.model_label);
+        let label = self.model.switch_label();
         if let Some(c) = self
-            .model_choices
+            .model
+            .choices
             .iter()
-            .find(|c| format!("{}/{}", c.provider, c.id) == label.as_str())
+            .find(|c| format!("{}/{}", c.provider, c.id) == label)
         {
             for level in &c.thinking_levels {
                 if level != &ThinkingLevel::Off && !out.contains(level) {
@@ -98,17 +94,19 @@ impl App {
         }
         let selected = tiers
             .iter()
-            .position(|t| t == &self.service_tier)
+            .position(|t| t == &self.model.service_tier)
             .unwrap_or(0);
-        self.open_modal(ActiveModal::Service(ServicePickerState { tiers, selected }));
+        self.open_modal(ActiveModal::Service(PickerList::new(tiers, selected)));
     }
 
     fn current_service_choices(&self) -> Vec<ServiceTier> {
         let mut out = vec![ServiceTier::Auto];
+        let label = self.model.switch_label();
         if let Some(c) = self
-            .model_choices
+            .model
+            .choices
             .iter()
-            .find(|c| format!("{}/{}", c.provider, c.id) == self.model_label)
+            .find(|c| format!("{}/{}", c.provider, c.id) == label)
         {
             for tier in &c.service_tiers {
                 if tier != &ServiceTier::Auto && !out.contains(tier) {
@@ -119,19 +117,17 @@ impl App {
         out
     }
 
-    pub(in crate::tui) fn service_picker_confirm_inner(&mut self, picker: &ServicePickerState) {
-        if let Some(tier) = picker.tiers.get(picker.selected) {
-            let tier_suffix = if tier == &ServiceTier::Auto {
-                String::new()
-            } else {
-                format!("@{}", tier.as_str())
-            };
-            self.pending_model_switch = Some(format!(
-                "{}:{}{}",
-                self.switch_label(),
-                self.thinking.as_str(),
-                tier_suffix
-            ));
+    pub(in crate::tui) fn service_picker_confirm_inner(
+        &mut self,
+        picker: &PickerList<ServiceTier>,
+    ) {
+        if let Some(tier) = picker.current() {
+            let query = self.model.format_switch_query(
+                self.model.switch_label(),
+                &self.model.thinking,
+                tier,
+            );
+            self.model.pending_switch = Some(query);
         }
     }
 
@@ -145,16 +141,19 @@ impl App {
     /// `/theme`: open the color-scheme picker (Auto / Light / Dark),
     /// pre-selected on the currently active mode.
     pub(in crate::tui) fn open_theme_picker(&mut self) {
-        let modes = ThemePickerState::MODES;
+        let modes = THEME_MODES.to_vec();
         let selected = modes
             .iter()
             .position(|m| *m == self.theme_manager.mode())
             .unwrap_or(0);
-        self.open_modal(ActiveModal::Theme(ThemePickerState { modes, selected }));
+        self.open_modal(ActiveModal::Theme(PickerList::new(modes, selected)));
     }
 
-    pub(in crate::tui) fn theme_picker_confirm_inner(&mut self, picker: &ThemePickerState) {
-        if let Some(&mode) = picker.modes.get(picker.selected) {
+    pub(in crate::tui) fn theme_picker_confirm_inner(
+        &mut self,
+        picker: &PickerList<lofi_types::ThemeMode>,
+    ) {
+        if let Some(&mode) = picker.current() {
             self.update_theme(theme::ThemeEvent::SetMode(mode));
         }
     }
@@ -174,10 +173,10 @@ impl App {
             self.notify(NotifyKind::Error, "no agent: /paths is unavailable");
             return;
         };
-        self.open_modal(ActiveModal::Paths(PathsPickerState {
-            rows: paths.snapshot().rows,
-            selected: 0,
-        }));
+        self.open_modal(ActiveModal::Paths(PickerList::new(
+            paths.snapshot().rows,
+            0,
+        )));
     }
 
     /// Applies a `/paths` row edit through the paths handle and refreshes
@@ -193,49 +192,35 @@ impl App {
             self.notify(NotifyKind::Error, format!("paths change failed: {error}"));
         }
         let rows = paths.snapshot().rows;
-        if let Some(picker) = self.paths_picker_mut() {
-            picker.rows = rows;
-            picker.selected = picker.selected.min(picker.rows.len().saturating_sub(1));
+        if let Some(ActiveModal::Paths(picker)) = &mut self.modal {
+            picker.items = rows;
+            picker.clamp();
         }
     }
 
     /// Key handling for the `/paths` modal. `space`/`enter` toggles a state
     /// row's access, `d` forgets it; other rows only navigate.
     pub(in crate::tui) fn handle_paths_key(&mut self, k: &KeyEvent) -> bool {
-        let Some(picker) = self.paths_picker_mut() else {
+        let Some(ActiveModal::Paths(picker)) = &mut self.modal else {
             return false;
         };
-        let len = picker.rows.len();
-        if len == 0 {
+        if picker.is_empty() {
             if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.close_modal();
             }
             return true;
         }
-        let selected = picker.selected;
-        let row = picker.rows[selected].clone();
+        if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.close_modal();
+            return true;
+        }
+        if picker.handle_nav_key(k, true) {
+            return true;
+        }
+        let Some(row) = picker.current().cloned() else {
+            return true;
+        };
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.close_modal();
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.selected = (selected + 1).min(len - 1);
-            }
-            KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                picker.selected = (selected + 1).min(len - 1);
-            }
-            KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                picker.selected = selected.saturating_sub(1);
-            }
-            KeyCode::Tab => {
-                picker.selected = (selected + 1) % len;
-            }
-            KeyCode::BackTab => {
-                picker.selected = if selected == 0 { len - 1 } else { selected - 1 };
-            }
             KeyCode::Char(' ' | 't') | KeyCode::Enter
                 if row.source == lofi_core::paths::PathSource::State =>
             {
@@ -276,11 +261,14 @@ impl App {
         modes.push(lofi_types::BashApprovalMode::DenyAll);
         let current = override_handle.effective(auto_mode);
         let selected = modes.iter().position(|m| *m == current).unwrap_or(1);
-        self.open_modal(ActiveModal::Policy(PolicyPickerState { modes, selected }));
+        self.open_modal(ActiveModal::Policy(PickerList::new(modes, selected)));
     }
 
-    pub(in crate::tui) fn policy_picker_confirm_inner(&mut self, picker: &PolicyPickerState) {
-        if let Some(mode) = picker.modes.get(picker.selected) {
+    pub(in crate::tui) fn policy_picker_confirm_inner(
+        &mut self,
+        picker: &PickerList<lofi_types::BashApprovalMode>,
+    ) {
+        if let Some(mode) = picker.current() {
             if let Some(override_handle) = self.policy_override() {
                 override_handle.set(Some(*mode));
             }
@@ -294,9 +282,17 @@ impl App {
         }
     }
 
-    pub(in crate::tui) fn thinking_picker_confirm_inner(&mut self, picker: &ThinkingPickerState) {
-        if let Some(level) = picker.levels.get(picker.selected) {
-            self.pending_model_switch = Some(format!("{}:{}", self.switch_label(), level.as_str()));
+    pub(in crate::tui) fn thinking_picker_confirm_inner(
+        &mut self,
+        picker: &PickerList<ThinkingLevel>,
+    ) {
+        if let Some(level) = picker.current() {
+            let query = self.model.format_switch_query(
+                self.model.switch_label(),
+                level,
+                &self.model.service_tier,
+            );
+            self.model.pending_switch = Some(query);
         }
     }
 
@@ -307,14 +303,6 @@ impl App {
         }
     }
 
-    /// The label a model switch must carry: the selected entry for an
-    /// external backend, whose displayed model is what the CLI reports.
-    fn switch_label(&self) -> String {
-        self.selected_model_label
-            .clone()
-            .unwrap_or_else(|| self.model_label.clone())
-    }
-
     pub(in crate::tui) fn apply_model_switch(
         &mut self,
         label: &str,
@@ -322,22 +310,22 @@ impl App {
         tier: ServiceTier,
         context_window: Option<u64>,
     ) {
-        self.model_label = label.to_string();
-        self.thinking_label = (level != ThinkingLevel::Off).then(|| format!(":{}", level.as_str()));
-        self.thinking = level;
-        self.service_label = (tier != ServiceTier::Auto).then(|| format!("@{}", tier.as_str()));
-        self.service_tier = tier;
-        self.ctx_limit = context_window
+        self.model.label = label.to_string();
+        self.model.thinking_label =
+            (level != ThinkingLevel::Off).then(|| format!(":{}", level.as_str()));
+        self.model.thinking = level;
+        self.model.service_label =
+            (tier != ServiceTier::Auto).then(|| format!("@{}", tier.as_str()));
+        self.model.service_tier = tier;
+        self.model.ctx_limit = context_window
             .filter(|&l| l > 0)
             .unwrap_or(DEFAULT_CTX_LIMIT);
-        self.lifecycle.set_context_window(self.ctx_limit);
+        self.lifecycle.set_context_window(self.model.ctx_limit);
         self.notify(
             NotifyKind::Info,
             format!(
-                "switched to {}{}{} for the next turn",
-                label,
-                self.thinking_label.as_deref().unwrap_or(""),
-                self.service_label.as_deref().unwrap_or("")
+                "switched to {} for the next turn",
+                self.model.session_label()
             ),
         );
         self.bump_render_epoch();

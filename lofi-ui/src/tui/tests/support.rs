@@ -276,3 +276,17 @@ pub(super) fn background_modal(tab: BackgroundTab) -> Box<BackgroundModalState> 
         confirm: None,
     })
 }
+
+pub(super) fn tree_picker(a: &App) -> Option<&TreePickerState> {
+    match &a.modal {
+        Some(ActiveModal::Tree { picker, .. }) => Some(picker),
+        _ => None,
+    }
+}
+
+pub(super) fn tree_picker_mut(a: &mut App) -> Option<&mut TreePickerState> {
+    match &mut a.modal {
+        Some(ActiveModal::Tree { picker, .. }) => Some(picker),
+        _ => None,
+    }
+}

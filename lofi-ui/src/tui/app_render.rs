@@ -47,11 +47,11 @@ impl App {
     /// `io` keeps the in/out token counts.
     fn footer_left_segments(&self, labels: bool, io: bool) -> Vec<String> {
         let mut segments: Vec<String> = Vec::new();
-        if io && (self.total_in > 0 || self.total_out > 0) {
+        if io && (self.usage.total_in > 0 || self.usage.total_out > 0) {
             segments.push(format!(
                 "↑{} ↓{}",
-                compact_count(self.total_in),
-                compact_count(self.total_out)
+                compact_count(self.usage.total_in),
+                compact_count(self.usage.total_out)
             ));
         }
         // Cache tokens are included so the gauge reflects the real window
@@ -60,12 +60,12 @@ impl App {
         // reports cache activity, append the hit rate as `N% cached`.
         // The transport's own context report wins; otherwise the last
         // round's usage is the fill. Both transports read this one rule.
-        let used = self.reported_context.map_or_else(
-            || self.status_usage.map_or(0, |u| u.context_tokens()),
+        let used = self.usage.reported_context.map_or_else(
+            || self.usage.status_usage.map_or(0, |u| u.context_tokens()),
             |context| context.used,
         );
         let cached_suffix = if labels {
-            self.status_usage.and_then(|u| {
+            self.usage.status_usage.and_then(|u| {
                 let prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
                 if prompt > 0 && (u.cache_read_tokens > 0 || u.cache_write_tokens > 0) {
                     let rate = u.cache_read_tokens as f64 / prompt as f64 * 100.0;
@@ -77,7 +77,7 @@ impl App {
         } else {
             None
         };
-        let used_str = if self.compacted {
+        let used_str = if self.usage.compacted {
             "c".to_string()
         } else {
             compact_count(used)
@@ -86,9 +86,10 @@ impl App {
         // A transport that reports its own window (the CLI child) is the
         // authority; otherwise the configured model window is.
         let size = self
+            .usage
             .reported_context
             .and_then(|context| context.size)
-            .unwrap_or(self.ctx_limit);
+            .unwrap_or(self.model.ctx_limit);
         segments.push(format!(
             "{}{}/{}{}",
             context_label,
@@ -213,21 +214,17 @@ impl App {
             spans.push(Span::styled(" · ", t.muted_style()));
         }
         spans.push(Span::styled(
-            fmt_cost(self.cost + self.turn_cost),
+            fmt_cost(self.usage.cost + self.usage.turn_cost),
             t.muted_style(),
         ));
         Line::from(spans)
     }
 
     pub(crate) fn render_footer_right(&self) -> Line<'static> {
-        let mut label = self.model_label.clone();
-        if let Some(tl) = &self.thinking_label {
-            label.push_str(tl);
-        }
-        if let Some(st) = &self.service_label {
-            label.push_str(st);
-        }
-        Line::from(vec![Span::styled(label, self.theme.muted_style())])
+        Line::from(vec![Span::styled(
+            self.model.session_label(),
+            self.theme.muted_style(),
+        )])
     }
 }
 

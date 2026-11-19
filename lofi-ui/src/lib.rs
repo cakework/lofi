@@ -130,19 +130,19 @@ pub async fn run_interactive(opts: InteractiveOptions) -> Result<()> {
     let ctx_limit = choice.context_window.filter(|&l| l > 0).unwrap_or(0);
     let system_prompt = backend.system_prompt().to_string();
     let switcher = tui::ModelSwitcher::new(factory).with_subagent_persistence(!opts.no_session);
-    Box::pin(tui::run(
-        Some(backend),
-        label,
-        selection.thinking,
-        selection.service_tier,
-        config.ui.theme,
+    Box::pin(tui::run(tui::TuiLaunch {
+        agent: Some(backend),
+        model_label: label,
+        thinking: selection.thinking,
+        service_tier: selection.service_tier,
+        ui_theme: config.ui.theme,
         session,
-        None,
+        no_models_hint: None,
         ctx_limit,
-        config.compaction,
-        Some(switcher),
+        compaction: config.compaction,
+        switcher: Some(switcher),
         system_prompt,
-    ))
+    }))
     .await
 }
 
@@ -162,19 +162,19 @@ async fn no_model_tui(
         executor,
     } = bootstrap;
     let switcher = tui::ModelSwitcher::new(factory).with_tool_executor(executor);
-    Box::pin(tui::run(
-        None,
-        "(no model)".to_string(),
-        ThinkingLevel::Off,
-        ServiceTier::Auto,
-        config.ui.theme,
+    Box::pin(tui::run(tui::TuiLaunch {
+        agent: None,
+        model_label: "(no model)".to_string(),
+        thinking: ThinkingLevel::Off,
+        service_tier: ServiceTier::Auto,
+        ui_theme: config.ui.theme,
         session,
-        Some(hint),
-        0,
-        config.compaction,
-        Some(switcher),
-        String::new(),
-    ))
+        no_models_hint: Some(hint),
+        ctx_limit: 0,
+        compaction: config.compaction,
+        switcher: Some(switcher),
+        system_prompt: String::new(),
+    }))
     .await
 }
 

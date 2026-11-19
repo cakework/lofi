@@ -154,18 +154,34 @@ fn slash_clear_help_session_resume_new() {
     assert!(msg.contains("unknown command"));
 
     assert!(a.slash_command("/resume"));
-    assert!(a.picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Resume(_))));
     let (msg, kind) = a.notify_badge().expect("/resume notified");
     assert_eq!(kind, NotifyKind::Warn);
     assert!(msg.contains("disabled"));
 
+    a.apply_event(AgentEvent::TurnEnd {
+        model: "m".into(),
+        elapsed_ms: 10,
+        cost: 0.42,
+        usage: Usage {
+            input_tokens: 321,
+            output_tokens: 123,
+            ..Usage::default()
+        },
+        stop_reason: None,
+    });
+    assert_eq!(a.usage.total_in, 321);
+    assert_eq!(a.usage.total_out, 123);
+
     assert!(a.slash_command("/new"));
     assert!(a.transcript.turns.is_empty());
     assert!(a.session.cursor.is_none());
-    assert!(a.status_usage.is_none());
-    assert_eq!(a.cost, 0.0);
-    assert_eq!(a.turn_cost, 0.0);
-    assert!(!a.turn_has_round_usage);
+    assert!(a.usage.status_usage.is_none());
+    assert_eq!(a.usage.cost, 0.0);
+    assert_eq!(a.usage.turn_cost, 0.0);
+    assert!(!a.usage.turn_has_round_usage);
+    assert_eq!(a.usage.total_in, 0);
+    assert_eq!(a.usage.total_out, 0);
 
     assert!(a.slash_command("/quit"));
     assert!(a.should_quit);
@@ -372,18 +388,20 @@ fn topmost_permission_dialog_handles_input_before_tree_picker() {
     let mut run = None;
     a.open_modal(ActiveModal::Tree {
         picker: TreePickerState {
-            entries: vec![TreeEntry {
-                branch_point: "root".into(),
-                label: "user: earlier prompt".into(),
-                prefix: "- ".into(),
-                prefill: Box::default(),
-                is_active: true,
-                source_index: 0,
-                source_offset: 0,
-                source_kind: store::IndexKind::UserPrompt,
-                hydrated: true,
-            }],
-            selected: 0,
+            list: PickerList::new(
+                vec![TreeEntry {
+                    branch_point: "root".into(),
+                    label: "user: earlier prompt".into(),
+                    prefix: "- ".into(),
+                    prefill: Box::default(),
+                    is_active: true,
+                    source_index: 0,
+                    source_offset: 0,
+                    source_kind: store::IndexKind::UserPrompt,
+                    hydrated: true,
+                }],
+                0,
+            ),
             generation: 0,
             loading: false,
         },
@@ -397,10 +415,10 @@ fn topmost_permission_dialog_handles_input_before_tree_picker() {
 
     assert_eq!(response.try_recv(), Ok(lofi_core::ConfirmResponse::Deny));
     assert!(a.confirms.pending.is_empty());
-    assert!(a.tree_picker().is_some());
+    assert!(tree_picker(&a).is_some());
 
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
-    assert!(a.tree_picker().is_none());
+    assert!(tree_picker(&a).is_none());
 }
 
 #[test]
@@ -439,24 +457,29 @@ fn paths_modal_lists_rows_and_edits_only_state_rows() {
         ]),
     );
     a.open_paths_picker();
-    let picker = a.paths_picker().unwrap();
+    let Some(ActiveModal::Paths(picker)) = &a.modal else {
+        panic!("expected paths picker");
+    };
     // The workspace row, the config grant row, no state rows.
-    assert_eq!(picker.rows.len(), 2);
-    assert_eq!(picker.rows[1].source, lofi_core::paths::PathSource::Config);
-    assert_eq!(picker.rows[1].access, lofi_types::Access::Read);
+    assert_eq!(picker.len(), 2);
+    assert_eq!(picker.items[1].source, lofi_core::paths::PathSource::Config);
+    assert_eq!(picker.items[1].access, lofi_types::Access::Read);
 
     // Toggling a config row is a no-op: the config file owns it.
     a.handle_paths_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-    assert_eq!(
-        a.paths_picker().unwrap().rows[1].access,
-        lofi_types::Access::Read
-    );
+    let Some(ActiveModal::Paths(picker)) = &a.modal else {
+        panic!("expected paths picker");
+    };
+    assert_eq!(picker.items[1].access, lofi_types::Access::Read);
 
     // Forgetting a config row is a no-op too, and escape closes.
     a.handle_paths_key(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-    assert_eq!(a.paths_picker().unwrap().rows.len(), 2);
+    let Some(ActiveModal::Paths(picker)) = &a.modal else {
+        panic!("expected paths picker");
+    };
+    assert_eq!(picker.len(), 2);
     a.handle_paths_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(a.paths_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Paths(_))));
 }
 
 #[test]
@@ -920,31 +943,33 @@ fn tree_picker_is_centered() {
     let mut a = app();
     a.open_modal(ActiveModal::Tree {
         picker: TreePickerState {
-            entries: vec![
-                TreeEntry {
-                    branch_point: "x".into(),
-                    label: "agent: hi".into(),
-                    prefix: "`- ".into(),
-                    prefill: Box::default(),
-                    is_active: true,
-                    source_index: 0,
-                    source_offset: 0,
-                    source_kind: store::IndexKind::TurnEnd,
-                    hydrated: true,
-                },
-                TreeEntry {
-                    branch_point: "y".into(),
-                    label: "user: yo".into(),
-                    prefix: "|- ".into(),
-                    prefill: Box::default(),
-                    is_active: false,
-                    source_index: 1,
-                    source_offset: 0,
-                    source_kind: store::IndexKind::UserPrompt,
-                    hydrated: true,
-                },
-            ],
-            selected: 0,
+            list: PickerList::new(
+                vec![
+                    TreeEntry {
+                        branch_point: "x".into(),
+                        label: "agent: hi".into(),
+                        prefix: "`- ".into(),
+                        prefill: Box::default(),
+                        is_active: true,
+                        source_index: 0,
+                        source_offset: 0,
+                        source_kind: store::IndexKind::TurnEnd,
+                        hydrated: true,
+                    },
+                    TreeEntry {
+                        branch_point: "y".into(),
+                        label: "user: yo".into(),
+                        prefix: "|- ".into(),
+                        prefill: Box::default(),
+                        is_active: false,
+                        source_index: 1,
+                        source_offset: 0,
+                        source_kind: store::IndexKind::UserPrompt,
+                        hydrated: true,
+                    },
+                ],
+                0,
+            ),
             generation: 0,
             loading: false,
         },
@@ -992,18 +1017,20 @@ fn tree_picker_renders_a_loading_placeholder_for_a_skeleton_row() {
     let mut a = app();
     a.open_modal(ActiveModal::Tree {
         picker: TreePickerState {
-            entries: vec![TreeEntry {
-                branch_point: Box::default(),
-                label: Box::default(),
-                prefix: "- ".into(),
-                prefill: Box::default(),
-                is_active: true,
-                source_index: 0,
-                source_offset: 0,
-                source_kind: store::IndexKind::UserPrompt,
-                hydrated: false,
-            }],
-            selected: 0,
+            list: PickerList::new(
+                vec![TreeEntry {
+                    branch_point: Box::default(),
+                    label: Box::default(),
+                    prefix: "- ".into(),
+                    prefill: Box::default(),
+                    is_active: true,
+                    source_index: 0,
+                    source_offset: 0,
+                    source_kind: store::IndexKind::UserPrompt,
+                    hydrated: false,
+                }],
+                0,
+            ),
             generation: 0,
             loading: false,
         },
@@ -1086,7 +1113,7 @@ fn slash_complete_filters_and_accepts() {
     a.prompt.text = "/".to_string();
     a.refresh_slash_complete();
     let sc = a.prompt.slash_complete.as_ref().expect("popover open");
-    assert_eq!(sc.candidates.len(), SLASH_COMMANDS.len());
+    assert_eq!(sc.len(), SLASH_COMMANDS.len());
     a.prompt.text = "/tr".to_string();
     a.refresh_slash_complete();
     let sc = a.prompt.slash_complete.as_ref().expect("popover open");
@@ -1096,7 +1123,7 @@ fn slash_complete_filters_and_accepts() {
         .iter()
         .position(|(c, _)| *c == "/tree")
         .unwrap();
-    assert_eq!(sc.candidates, vec![tree_idx]);
+    assert_eq!(sc.items, vec![tree_idx]);
     a.prompt.text = "/tree".to_string();
     a.refresh_slash_complete();
     assert!(a.prompt.slash_complete.is_none());
@@ -1121,7 +1148,7 @@ fn slash_complete_enter_accepts_tab_wraps() {
     let mut run = None;
     a.prompt.text = "/".to_string();
     a.refresh_slash_complete();
-    let len = a.prompt.slash_complete.as_ref().unwrap().candidates.len();
+    let len = a.prompt.slash_complete.as_ref().unwrap().len();
     for _ in 0..len {
         handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
     }
@@ -1139,10 +1166,7 @@ fn slash_complete_single_item_tab_accepts() {
     let mut run = None;
     a.prompt.text = "/tr".to_string();
     a.refresh_slash_complete();
-    assert_eq!(
-        a.prompt.slash_complete.as_ref().unwrap().candidates.len(),
-        1
-    );
+    assert_eq!(a.prompt.slash_complete.as_ref().unwrap().len(), 1);
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
     assert_eq!(a.prompt.text, "/tree");
     assert!(a.prompt.slash_complete.is_none());

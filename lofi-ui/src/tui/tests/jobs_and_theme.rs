@@ -157,9 +157,11 @@ fn theme_picker_opens_preselected_on_current_mode() {
     let mut a = app();
     a.update_theme(theme::ThemeEvent::SetMode(ThemeMode::Dark));
     a.open_theme_picker();
-    let picker = a.theme_picker().unwrap();
-    assert_eq!(picker.modes.len(), 3);
-    assert_eq!(picker.modes[picker.selected], ThemeMode::Dark);
+    let Some(ActiveModal::Theme(picker)) = &a.modal else {
+        panic!("expected theme picker");
+    };
+    assert_eq!(picker.len(), 3);
+    assert_eq!(picker.items[picker.selected], ThemeMode::Dark);
     assert!(a.modal_open());
 }
 
@@ -173,9 +175,12 @@ fn theme_picker_confirm_updates_mode_and_clears_frozen_cache() {
     assert!(a.layout.frozen_render.contains(0));
     a.open_theme_picker();
     // Move from Dark (idx 2) to Light (idx 1).
-    a.theme_picker_mut().unwrap().selected = 1;
+    let Some(ActiveModal::Theme(picker)) = &mut a.modal else {
+        panic!("expected theme picker");
+    };
+    picker.selected = 1;
     a.theme_picker_confirm();
-    assert!(a.theme_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Theme(_))));
     assert_eq!(a.theme_manager.mode(), ThemeMode::Light);
     assert!(!a.layout.frozen_render.contains(0));
 }
@@ -374,7 +379,10 @@ fn selected_picker_item_preserves_contrast_after_palette_changes() {
             } else {
                 (1, "l")
             };
-            a.theme_picker_mut().unwrap().selected = selected;
+            let Some(ActiveModal::Theme(picker)) = &mut a.modal else {
+                panic!("expected theme picker");
+            };
+            picker.selected = selected;
             let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
             terminal
                 .draw(|f| crate::tui::view::render(f, &mut a))

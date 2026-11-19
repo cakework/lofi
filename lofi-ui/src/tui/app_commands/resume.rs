@@ -66,16 +66,18 @@ impl App {
                     .fetch_add(1, Ordering::Relaxed)
                     .wrapping_add(1);
                 self.modal = Some(ActiveModal::Resume(PickerState {
-                    entries: files
-                        .iter()
-                        .cloned()
-                        .map(|file| PickerEntry {
-                            file,
-                            preview: None,
-                            details: None,
-                        })
-                        .collect(),
-                    selected: 0,
+                    list: PickerList::new(
+                        files
+                            .iter()
+                            .cloned()
+                            .map(|file| PickerEntry {
+                                file,
+                                preview: None,
+                                details: None,
+                            })
+                            .collect(),
+                        0,
+                    ),
                     generation,
                 }));
                 if let (Some(tx), Some(sink)) =
@@ -85,8 +87,8 @@ impl App {
                     sink.submit_io(Box::new(move |_state| {
                         run_resume_load(generation, &generation_clock, &files, &tx);
                     }));
-                } else if let Some(picker) = self.picker_mut() {
-                    for row in &mut picker.entries {
+                } else if let Some(ActiveModal::Resume(picker)) = &mut self.modal {
+                    for row in &mut picker.list.items {
                         row.preview = row.file.quick_preview();
                         row.details = row.file.inspect();
                     }
@@ -101,27 +103,27 @@ impl App {
     pub(in crate::tui) fn apply_picker_load(&mut self, load: PickerLoad) {
         match load {
             PickerLoad::ResumePreviews { generation, rows } => {
-                let Some(picker) = self
-                    .picker_mut()
-                    .filter(|picker| picker.generation == generation)
-                else {
+                let Some(ActiveModal::Resume(picker)) = &mut self.modal else {
                     return;
                 };
+                if picker.generation != generation {
+                    return;
+                }
                 for (index, preview) in rows {
-                    if let Some(row) = picker.entries.get_mut(index) {
+                    if let Some(row) = picker.list.items.get_mut(index) {
                         row.preview = Some(preview);
                     }
                 }
             }
             PickerLoad::ResumeRows { generation, rows } => {
-                let Some(picker) = self
-                    .picker_mut()
-                    .filter(|picker| picker.generation == generation)
-                else {
+                let Some(ActiveModal::Resume(picker)) = &mut self.modal else {
                     return;
                 };
+                if picker.generation != generation {
+                    return;
+                }
                 for (index, entry) in rows {
-                    if let Some(row) = picker.entries.get_mut(index) {
+                    if let Some(row) = picker.list.items.get_mut(index) {
                         row.details = Some(entry);
                     }
                 }
@@ -132,30 +134,36 @@ impl App {
                 snapshot_id,
             } => self.apply_tree_ready(generation, entries, snapshot_id),
             PickerLoad::TreeRows { generation, rows } => {
-                let Some(ActiveModal::Tree {
-                    picker, pending, ..
-                }) = self.modal.as_mut()
-                else {
-                    self.release_tree_rows(rows);
-                    return;
-                };
-                if picker.generation != generation {
-                    self.release_tree_rows(rows);
-                    return;
-                }
-                for (index, mut entry) in rows {
-                    pending.remove(&index);
-                    entry.prefill = Box::default();
-                    if let Some(row) = picker.entries.get_mut(index) {
-                        *row = entry;
+                let retrigger = {
+                    let Some(ActiveModal::Tree {
+                        picker, pending, ..
+                    }) = self.modal.as_mut()
+                    else {
+                        self.release_tree_rows(rows);
+                        return;
+                    };
+                    if picker.generation != generation {
+                        self.release_tree_rows(rows);
+                        return;
                     }
+                    for (index, mut entry) in rows {
+                        pending.remove(&index);
+                        entry.prefill = Box::default();
+                        if let Some(row) = picker.list.items.get_mut(index) {
+                            *row = entry;
+                        }
+                    }
+                    pending.is_empty()
+                };
+                if retrigger {
+                    self.request_tree_viewport();
                 }
             }
             PickerLoad::TreeFailed { generation, error } => {
-                if self
-                    .tree_picker()
-                    .is_some_and(|picker| picker.generation == generation)
-                {
+                if matches!(
+                    &self.modal,
+                    Some(ActiveModal::Tree { picker, .. }) if picker.generation == generation
+                ) {
                     self.close_modal();
                     self.notify(
                         NotifyKind::Error,
@@ -200,12 +208,12 @@ impl App {
             pending,
         }) = &mut self.modal
         {
-            picker.selected = entries.len().saturating_sub(1);
-            picker.entries = entries;
+            let selected = entries.len().saturating_sub(1);
+            picker.list = PickerList::new(entries, selected);
             picker.loading = false;
             *snapshot = Some(snapshot_id);
             pending.clear();
-            pending.extend(picker.entries.len().saturating_sub(20)..picker.entries.len());
+            pending.extend(picker.list.len().saturating_sub(20)..picker.list.len());
         }
     }
 
@@ -220,7 +228,7 @@ impl App {
             );
             return;
         }
-        let entry = picker.entries.into_iter().nth(picker.selected);
+        let entry = picker.list.items.into_iter().nth(picker.list.selected);
         let Some(entry) = entry else {
             return;
         };
@@ -267,12 +275,10 @@ impl App {
                         turn.blocks.clear();
                     }
                 }
-                if !self.model_choices.is_empty() {
+                if !self.model.choices.is_empty() {
                     if let Some(m) = last_run_model_from_index(&cursor, &index) {
-                        let restored = restore_label(&m);
-                        let current = format!("{}:{}", self.model_label, self.thinking.as_str());
-                        if restored != current {
-                            self.pending_model_switch = Some(restored);
+                        if let Some(restored) = self.model.restore_switch_query(&m) {
+                            self.model.pending_switch = Some(restored);
                         }
                     }
                 }
@@ -291,25 +297,10 @@ impl App {
 
     #[cfg(test)]
     pub(in crate::tui) fn resume_model_switch(&self, events: &[SessionEvent]) -> Option<String> {
-        if self.model_choices.is_empty() {
+        if self.model.choices.is_empty() {
             return None;
         }
         let m = store::last_run_model(events)?;
-        let restored = restore_label(&m);
-        let current = format!("{}:{}", self.model_label, self.thinking.as_str());
-        (restored != current).then_some(restored)
+        self.model.restore_switch_query(&m)
     }
-}
-
-/// The switch query that restores a session's model and effort.
-///
-/// The marker carries the name the user selected next to the id the backend
-/// reported, because a reported id (what a CLI resolves) is not selectable.
-fn restore_label(model: &lofi_types::RunModel) -> String {
-    format!(
-        "{}/{}:{}",
-        model.provider,
-        model.selected_or_id(),
-        model.thinking.as_str()
-    )
 }

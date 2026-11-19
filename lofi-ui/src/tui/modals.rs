@@ -2,6 +2,112 @@
 use super::*;
 
 #[derive(Debug, Clone)]
+pub(crate) struct PickerList<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) selected: usize,
+    pub(crate) scroll_offset: std::cell::Cell<usize>,
+}
+
+impl<T> PickerList<T> {
+    pub(crate) fn new(items: Vec<T>, selected: usize) -> Self {
+        let selected = selected.min(items.len().saturating_sub(1));
+        Self {
+            items,
+            selected,
+            scroll_offset: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            selected: 0,
+            scroll_offset: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub(crate) fn current(&self) -> Option<&T> {
+        self.items.get(self.selected)
+    }
+
+    pub(crate) fn clamp(&mut self) {
+        self.selected = self.selected.min(self.items.len().saturating_sub(1));
+        self.scroll_offset
+            .set(self.scroll_offset.get().min(self.selected));
+    }
+
+    pub(crate) fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub(crate) fn down(&mut self) {
+        if self.selected + 1 < self.items.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub(crate) fn cycle_next(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1) % self.items.len();
+        }
+    }
+
+    pub(crate) fn cycle_prev(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = if self.selected == 0 {
+                self.items.len() - 1
+            } else {
+                self.selected - 1
+            };
+        }
+    }
+
+    pub(crate) fn handle_nav_key(&mut self, k: &KeyEvent, vim_keys: bool) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Up => self.up(),
+            KeyCode::Down => self.down(),
+            KeyCode::Char('k') if vim_keys && !ctrl => self.up(),
+            KeyCode::Char('j') if vim_keys && !ctrl => self.down(),
+            KeyCode::Char('p') if ctrl => self.up(),
+            KeyCode::Char('n') if ctrl => self.down(),
+            KeyCode::Tab => self.cycle_next(),
+            KeyCode::BackTab => self.cycle_prev(),
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// Type-erased navigation over [`PickerList<T>`] so modal and popover key
+/// handlers share one implementation without per-modal wrapper structs.
+pub(crate) trait ListNav {
+    fn len(&self) -> usize;
+    fn handle_nav_key(&mut self, k: &KeyEvent, vim_keys: bool) -> bool;
+}
+
+impl<T> ListNav for PickerList<T> {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn handle_nav_key(&mut self, k: &KeyEvent, vim_keys: bool) -> bool {
+        PickerList::handle_nav_key(self, k, vim_keys)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct PickerEntry {
     pub(crate) file: store::SessionFile,
     pub(crate) preview: Option<String>,
@@ -10,8 +116,7 @@ pub(crate) struct PickerEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PickerState {
-    pub(crate) entries: Vec<PickerEntry>,
-    pub(crate) selected: usize,
+    pub(crate) list: PickerList<PickerEntry>,
     pub(crate) generation: u64,
 }
 
@@ -110,128 +215,20 @@ pub(crate) struct Notify {
 }
 
 /// `j`/`k`/`q` remain printable because this popover overlays text input.
-#[derive(Debug, Clone)]
-pub(crate) struct SlashComplete {
-    pub(crate) candidates: Vec<usize>,
-    pub(crate) selected: usize,
-}
+pub(crate) type SlashComplete = PickerList<usize>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TreePickerState {
-    pub(crate) entries: Vec<TreeEntry>,
-    pub(crate) selected: usize,
+    pub(crate) list: PickerList<TreeEntry>,
     pub(crate) generation: u64,
     pub(crate) loading: bool,
 }
 
-/// Confirmation stays outside this trait because borrowing a modal and
-/// `&mut App` together would conflict.
-pub(crate) trait Modal {
-    fn len(&self) -> usize;
-    fn selected(&self) -> usize;
-    fn set_selected(&mut self, n: usize);
-}
-
-pub(crate) trait Popover {
-    fn len(&self) -> usize;
-    fn selected(&self) -> usize;
-    fn set_selected(&mut self, n: usize);
-}
-
-impl Modal for PickerState {
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
-
-impl Modal for TreePickerState {
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
-
-pub(crate) struct ModelPickerState {
-    pub(crate) choices: Vec<lofi_types::ModelChoice>,
-    pub(crate) selected: usize,
-}
-
-impl Modal for ModelPickerState {
-    fn len(&self) -> usize {
-        self.choices.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
-
-pub(crate) struct ThinkingPickerState {
-    pub(crate) levels: Vec<ThinkingLevel>,
-    pub(crate) selected: usize,
-}
-
-pub(crate) struct ServicePickerState {
-    pub(crate) tiers: Vec<ServiceTier>,
-    pub(crate) selected: usize,
-}
-
-pub(crate) struct ThemePickerState {
-    pub(crate) modes: [lofi_types::ThemeMode; 3],
-    pub(crate) selected: usize,
-}
-
-/// State for the `/policy` modal: the session-scoped bash approval modes
-/// the user can pick. `AskAuto` is offered only when auto mode is
-/// configured.
-pub(crate) struct PolicyPickerState {
-    pub(crate) modes: Vec<lofi_types::BashApprovalMode>,
-    pub(crate) selected: usize,
-}
-
-impl ThemePickerState {
-    pub(crate) const MODES: [lofi_types::ThemeMode; 3] = [
-        lofi_types::ThemeMode::Auto,
-        lofi_types::ThemeMode::Light,
-        lofi_types::ThemeMode::Dark,
-    ];
-}
-
-/// `/paths` modal. Lists every allowed path with its access and source.
-/// Only state rows are editable: `space` toggles read/write, `d` forgets
-/// the grant. Config rows say to edit `config.toml`; builtin rows are
-/// fixed by the session.
-pub(crate) struct PathsPickerState {
-    pub(crate) rows: Vec<lofi_core::paths::PathRow>,
-    pub(crate) selected: usize,
-}
-
-impl Modal for PathsPickerState {
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn selected(&self) -> usize {
-        self.selected
-    }
-
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
+pub(crate) const THEME_MODES: [lofi_types::ThemeMode; 3] = [
+    lofi_types::ThemeMode::Auto,
+    lofi_types::ThemeMode::Light,
+    lofi_types::ThemeMode::Dark,
+];
 
 /// The subagents tab. Lists the subagents spawned by the live session:
 /// store rows (durable, survive restarts) merged with the registry's live
@@ -541,72 +538,12 @@ impl JobViewContent {
     }
 }
 
-impl Modal for ThinkingPickerState {
-    fn len(&self) -> usize {
-        self.levels.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
-
-impl Modal for ServicePickerState {
-    fn len(&self) -> usize {
-        self.tiers.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
-
-impl Modal for PolicyPickerState {
-    fn len(&self) -> usize {
-        self.modes.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
-
 pub(crate) fn policy_mode_label(mode: lofi_types::BashApprovalMode) -> &'static str {
     match mode {
         lofi_types::BashApprovalMode::AllowAll => "allow all",
         lofi_types::BashApprovalMode::AskManual => "ask (manual)",
         lofi_types::BashApprovalMode::AskAuto => "ask (auto)",
         lofi_types::BashApprovalMode::DenyAll => "deny all",
-    }
-}
-
-impl Modal for ThemePickerState {
-    fn len(&self) -> usize {
-        self.modes.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
-    }
-}
-
-impl Popover for SlashComplete {
-    fn len(&self) -> usize {
-        self.candidates.len()
-    }
-    fn selected(&self) -> usize {
-        self.selected
-    }
-    fn set_selected(&mut self, n: usize) {
-        self.selected = n;
     }
 }
 
@@ -620,12 +557,12 @@ pub(crate) enum ActiveModal {
         snapshot: Option<u64>,
         pending: std::collections::HashSet<usize>,
     },
-    Model(ModelPickerState),
-    Thinking(ThinkingPickerState),
-    Policy(PolicyPickerState),
-    Paths(PathsPickerState),
-    Service(ServicePickerState),
-    Theme(ThemePickerState),
+    Model(PickerList<lofi_types::ModelChoice>),
+    Thinking(PickerList<ThinkingLevel>),
+    Policy(PickerList<lofi_types::BashApprovalMode>),
+    Paths(PickerList<lofi_core::paths::PathRow>),
+    Service(PickerList<ServiceTier>),
+    Theme(PickerList<lofi_types::ThemeMode>),
     Background(Box<BackgroundModalState>),
     Info(InfoModal),
 }

@@ -543,8 +543,9 @@ async fn ctrl_c_keeps_cancelling_while_the_run_still_reports() {
         session_cursor: Arc::new(std::sync::Mutex::new(None)),
         user_shell: None,
     });
-    a.cancel_at = Some(Instant::now().checked_sub(CANCEL_STALL * 2).unwrap());
-    a.run_event_at = Some(Instant::now());
+    let active = a.begin_active_run();
+    active.cancel_at = Some(Instant::now().checked_sub(CANCEL_STALL * 2).unwrap());
+    active.event_at = Instant::now();
 
     handle_event(&ctrl_key(KeyCode::Char('c')), &mut a, None, &mut run);
 
@@ -567,8 +568,9 @@ async fn ctrl_c_quits_when_a_cancel_met_no_answer() {
         user_shell: None,
     });
     let stalled = Instant::now().checked_sub(CANCEL_STALL * 2).unwrap();
-    a.cancel_at = Some(stalled);
-    a.run_event_at = Some(stalled);
+    let active = a.begin_active_run();
+    active.cancel_at = Some(stalled);
+    active.event_at = stalled;
 
     handle_event(&ctrl_key(KeyCode::Char('c')), &mut a, None, &mut run);
 
@@ -1004,7 +1006,7 @@ fn leaving_for_input_collapses_the_focused_detail() {
 fn expanding_in_flight_exec_at_viewport_bottom_keeps_body_visible() {
     let mut a = app();
     push_turn(&mut a);
-    a.run = Some(0);
+    a.begin_active_run();
     a.apply_event(AgentEvent::ToolStart {
         id: "live-exec".to_string(),
         name: "exec".to_string(),

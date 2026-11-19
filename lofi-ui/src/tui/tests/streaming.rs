@@ -19,8 +19,7 @@ fn streaming_long_text_never_drops_visible_lines() {
     }
 
     let mut a = app();
-    a.run = Some(0);
-    a.run_start = Some(Instant::now());
+    a.begin_active_run();
     a.apply_event(AgentEvent::Prompt {
         kind: lofi_types::PromptKind::User,
         prompt: "stream a long reply".to_string(),
@@ -64,7 +63,7 @@ fn streaming_long_text_never_drops_visible_lines() {
         prev = cur;
         idx = end;
     }
-    a.run = None;
+    a.active_run = None;
 }
 
 /// `render_turn_height` must equal the number of rows `render_turn_lines`
@@ -631,8 +630,7 @@ fn live_turn_cache_reveals_terminal_banner_when_run_finishes() {
         ),
     ] {
         let mut a = app();
-        a.run = Some(0);
-        a.run_start = Some(Instant::now());
+        a.begin_active_run();
         a.transcript.turns.push(Turn {
             kind: lofi_types::PromptKind::User,
             prompt: "hi".to_string(),

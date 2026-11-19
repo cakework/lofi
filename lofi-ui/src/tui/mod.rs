@@ -18,6 +18,7 @@ mod modals;
 mod replay;
 mod resume;
 mod run;
+mod spawn;
 mod text;
 mod transcript;
 use transcript::{Transcript, TranscriptLayout};
@@ -30,7 +31,7 @@ pub mod view;
 mod tests;
 
 #[allow(clippy::wildcard_imports)]
-use {input::*, replay::*, resume::*, text::*, tree::*};
+use {input::*, replay::*, resume::*, spawn::*, text::*, tree::*};
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -217,19 +218,8 @@ pub(crate) struct App {
     /// replays the exact governing prompt rather than what today's config
     /// would produce.
     system_prompt: String,
-    model_label: String,
-    /// The `provider/model` the user picked, kept while a turn reports the id
-    /// it actually ran so the header can show both.
-    selected_model_label: Option<String>,
-    thinking_label: Option<String>,
-    thinking: ThinkingLevel,
-    service_label: Option<String>,
-    service_tier: ServiceTier,
-    status_usage: Option<Usage>,
-    /// The context state the engine reported after its last step.
-    reported_context: Option<lofi_types::ContextUsage>,
-    total_in: u64,
-    total_out: u64,
+    model: ModelSelectionState,
+    usage: UsageState,
     prompt_queue: Vec<QueuedPrompt>,
     /// Text of a mailbox wake whose turn did not start yet. A wake must not
     /// cut a running turn, so it waits for the app to reach rest.
@@ -241,26 +231,12 @@ pub(crate) struct App {
     /// Each notice leaves `App` when the run publishes that notice, so a run
     /// that fails before recording one leaves it for the next.
     notices_in_flight: bool,
-    cost: f64,
-    turn_cost: f64,
-    turn_has_round_usage: bool,
-    ctx_limit: u64,
-    /// True when a settled round supplied usage that core policy has not
-    /// evaluated yet.
-    settled_usage_fresh: bool,
-    compacted: bool,
     /// Set by `ContextPressure` when the engine stopped the run at the hard
     /// context cap, with whether the turn may resume after the compaction.
     /// The run loop reads (and clears) it on channel close to drive the
     /// force-compact, instead of the soft `agent_settled` path.
     context_pressure: Option<bool>,
-    run: Option<usize>,
-    run_start: Option<Instant>,
-    /// Model label captured when the run started. A mid-run `/model` switch
-    /// updates the footer (the newly set model); the "Working for ..." line
-    /// must keep showing the model the in-flight run is actually using.
-    run_model_label: Option<String>,
-    run_selected_model_label: Option<String>,
+    active_run: Option<ActiveRunState>,
     retry: Option<RetryState>,
     /// True between the submit-time prompt pre-push and the engine's
     /// matching `Prompt` event. Gates the dedup in `apply_event` so replayed
@@ -291,17 +267,10 @@ pub(crate) struct App {
     /// Jobs a resumed transcript opened but never closed. They are gone
     /// with the previous process, so the jobs tab lists them as stale.
     stale_jobs: Vec<OutstandingJob>,
-    model_choices: Vec<lofi_types::ModelChoice>,
-    pending_model_switch: Option<String>,
-    no_models_hint: Option<String>,
     /// Rendering snapshot, updated only through `update_theme`.
     theme: Theme,
     theme_manager: theme::ThemeManager,
     ctrl_c_at: Option<Instant>,
-    /// When the user first asked the current run to stop.
-    cancel_at: Option<Instant>,
-    /// When the current run last delivered an event.
-    run_event_at: Option<Instant>,
     yank_notify: Option<Instant>,
     /// Transient status/error notification from a slash command.
     notify: Option<Notify>,
@@ -357,10 +326,7 @@ impl App {
         self.transcript.clear();
         self.expanded_details.clear();
         self.detail_focus = None;
-        self.cost = 0.0;
-        self.total_in = 0;
-        self.total_out = 0;
-        self.reset_compaction_gauges();
+        self.usage.reset_session();
         replay_indexed_session(self, cursor, index, file_size, contiguous)?;
         // Replay parses the whole transcript and drops most of it again; the
         // freed heap sits in the arena otherwise.

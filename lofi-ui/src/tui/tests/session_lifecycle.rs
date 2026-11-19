@@ -22,8 +22,8 @@ fn agent_notice_prompt_enters_transcript_not_app_notification() {
         prompt: "go".into(),
     });
     a.apply_event(AgentEvent::Text("repeating".into()));
-    a.turn_cost = 1.25;
-    a.turn_has_round_usage = true;
+    a.usage.turn_cost = 1.25;
+    a.usage.turn_has_round_usage = true;
 
     a.apply_event(AgentEvent::Prompt {
         kind: lofi_types::PromptKind::Notice,
@@ -37,8 +37,8 @@ fn agent_notice_prompt_enters_transcript_not_app_notification() {
         "A potential loop was detected"
     );
     assert!(a.notify.is_none());
-    assert_eq!(a.turn_cost, 1.25);
-    assert!(a.turn_has_round_usage);
+    assert_eq!(a.usage.turn_cost, 1.25);
+    assert!(a.usage.turn_has_round_usage);
 }
 
 #[test]
@@ -222,12 +222,14 @@ fn resume_picker_attaches_selected_cursor_to_sink_and_ui() {
     let mut a = app();
     attach_session_sink(&mut a, store, cwd, old);
     a.picker_confirm_inner(PickerState {
-        entries: vec![PickerEntry {
-            file,
-            preview: None,
-            details: None,
-        }],
-        selected: 0,
+        list: PickerList::new(
+            vec![PickerEntry {
+                file,
+                preview: None,
+                details: None,
+            }],
+            0,
+        ),
         generation: 0,
     });
 
@@ -374,9 +376,9 @@ fn resumed_shell_turn_applies_the_accounting_that_follows_it() {
     )
     .unwrap();
 
-    assert!((a.cost - 0.5).abs() < 1e-9);
-    assert_eq!(a.total_in, 7);
-    assert_eq!(a.total_out, 3);
+    assert!((a.usage.cost - 0.5).abs() < 1e-9);
+    assert_eq!(a.usage.total_in, 7);
+    assert_eq!(a.usage.total_out, 3);
 }
 
 #[test]
@@ -445,9 +447,9 @@ fn a_resumed_turn_start_settles_the_spend_before_it() {
     )
     .unwrap();
 
-    assert!((a.cost - 0.6).abs() < 1e-9, "{}", a.cost);
-    assert_eq!(a.total_in, 50);
-    assert_eq!(a.total_out, 3);
+    assert!((a.usage.cost - 0.6).abs() < 1e-9, "{}", a.usage.cost);
+    assert_eq!(a.usage.total_in, 50);
+    assert_eq!(a.usage.total_out, 3);
 }
 
 #[test]
@@ -516,9 +518,9 @@ fn a_resumed_continuation_keeps_the_capped_turn_spend() {
     )
     .unwrap();
 
-    assert!((a.cost - 0.6).abs() < 1e-9, "{}", a.cost);
-    assert_eq!(a.total_in, 50);
-    assert_eq!(a.total_out, 3);
+    assert!((a.usage.cost - 0.6).abs() < 1e-9, "{}", a.usage.cost);
+    assert_eq!(a.usage.total_in, 50);
+    assert_eq!(a.usage.total_out, 3);
 }
 
 #[test]
@@ -584,9 +586,9 @@ fn a_resumed_notice_keeps_one_turn_spend() {
     )
     .unwrap();
 
-    assert!((a.cost - 0.25).abs() < 1e-9, "{}", a.cost);
-    assert_eq!(a.total_in, 50);
-    assert_eq!(a.total_out, 2);
+    assert!((a.usage.cost - 0.25).abs() < 1e-9, "{}", a.usage.cost);
+    assert_eq!(a.usage.total_in, 50);
+    assert_eq!(a.usage.total_out, 2);
 }
 
 #[test]
@@ -644,9 +646,9 @@ fn a_resumed_session_shows_what_a_killed_turn_spent() {
     .unwrap();
 
     // Neither turn settled, so both keep what their checkpoints wrote.
-    assert!((a.cost - 0.35).abs() < 1e-9, "{}", a.cost);
-    assert_eq!(a.total_in, 50);
-    assert_eq!(a.total_out, 3);
+    assert!((a.usage.cost - 0.35).abs() < 1e-9, "{}", a.usage.cost);
+    assert_eq!(a.usage.total_in, 50);
+    assert_eq!(a.usage.total_out, 3);
 }
 
 #[test]
@@ -703,9 +705,9 @@ fn a_resumed_settled_turn_counts_its_marker_once() {
     )
     .unwrap();
 
-    assert!((a.cost - 0.25).abs() < 1e-9, "{}", a.cost);
-    assert_eq!(a.total_in, 40);
-    assert_eq!(a.total_out, 2);
+    assert!((a.usage.cost - 0.25).abs() < 1e-9, "{}", a.usage.cost);
+    assert_eq!(a.usage.total_in, 40);
+    assert_eq!(a.usage.total_out, 2);
 }
 
 #[test]
@@ -1103,7 +1105,7 @@ fn subagent_usage_folds_totals_without_touching_the_gauge() {
             cache_write_tokens: 0,
         },
     });
-    let gauge_before = a.status_usage;
+    let gauge_before = a.usage.status_usage;
     a.apply_event(AgentEvent::SubagentUsage {
         cost: 0.02,
         usage: Usage {
@@ -1115,11 +1117,11 @@ fn subagent_usage_folds_totals_without_touching_the_gauge() {
     });
     // Child spend counts toward the session totals but never toward the
     // context gauge or the parent turn fold.
-    assert_eq!(a.total_in, 111);
-    assert_eq!(a.total_out, 57);
-    assert_eq!(a.cost, 0.02);
-    assert_eq!(a.turn_cost, 0.01);
-    assert_eq!(a.status_usage, gauge_before);
+    assert_eq!(a.usage.total_in, 111);
+    assert_eq!(a.usage.total_out, 57);
+    assert_eq!(a.usage.cost, 0.02);
+    assert_eq!(a.usage.turn_cost, 0.01);
+    assert_eq!(a.usage.status_usage, gauge_before);
 }
 
 #[test]
@@ -1138,8 +1140,8 @@ fn turn_end_updates_usage() {
         },
         stop_reason: None,
     });
-    assert_eq!(a.total_in, 10);
-    assert_eq!(a.total_out, 20);
+    assert_eq!(a.usage.total_in, 10);
+    assert_eq!(a.usage.total_out, 20);
 }
 
 #[test]
@@ -1160,12 +1162,19 @@ fn an_unterminated_turn_spend_counts_once_after_a_resume() {
         },
     });
 
-    assert_eq!(a.total_in, 40, "the killed turn's tokens stay spent");
-    assert_eq!(a.total_out, 3);
-    assert!((a.cost - 0.25).abs() < 1e-9, "and its cost: {}", a.cost);
-    assert_eq!(a.status_usage.map(|usage| usage.input_tokens), Some(40));
+    assert_eq!(a.usage.total_in, 40, "the killed turn's tokens stay spent");
+    assert_eq!(a.usage.total_out, 3);
     assert!(
-        !a.turn_has_round_usage,
+        (a.usage.cost - 0.25).abs() < 1e-9,
+        "and its cost: {}",
+        a.usage.cost
+    );
+    assert_eq!(
+        a.usage.status_usage.map(|usage| usage.input_tokens),
+        Some(40)
+    );
+    assert!(
+        !a.usage.turn_has_round_usage,
         "the snapshot settles the fold: no later turn_end pending here"
     );
 }
@@ -1186,11 +1195,11 @@ fn round_usage_updates_totals_per_round() {
             cache_write_tokens: 0,
         },
     });
-    assert_eq!(a.total_in, 100);
-    assert_eq!(a.total_out, 50);
-    assert_eq!(a.turn_cost, 0.01);
-    assert!(a.turn_has_round_usage);
-    assert!((a.cost + a.turn_cost - 0.01).abs() < 1e-9);
+    assert_eq!(a.usage.total_in, 100);
+    assert_eq!(a.usage.total_out, 50);
+    assert_eq!(a.usage.turn_cost, 0.01);
+    assert!(a.usage.turn_has_round_usage);
+    assert!((a.usage.cost + a.usage.turn_cost - 0.01).abs() < 1e-9);
 
     a.apply_event(AgentEvent::RoundUsage {
         cost: 0.03,
@@ -1201,10 +1210,10 @@ fn round_usage_updates_totals_per_round() {
             cache_write_tokens: 0,
         },
     });
-    assert_eq!(a.total_in, 300);
-    assert_eq!(a.total_out, 130);
-    assert!((a.turn_cost - 0.03).abs() < 1e-9);
-    assert!((a.cost + a.turn_cost - 0.03).abs() < 1e-9);
+    assert_eq!(a.usage.total_in, 300);
+    assert_eq!(a.usage.total_out, 130);
+    assert!((a.usage.turn_cost - 0.03).abs() < 1e-9);
+    assert!((a.usage.cost + a.usage.turn_cost - 0.03).abs() < 1e-9);
 
     a.apply_event(AgentEvent::TurnEnd {
         model: "m".into(),
@@ -1218,11 +1227,11 @@ fn round_usage_updates_totals_per_round() {
         },
         stop_reason: None,
     });
-    assert!((a.cost - 0.03).abs() < 1e-9);
-    assert_eq!(a.turn_cost, 0.0);
-    assert!(!a.turn_has_round_usage);
-    assert_eq!(a.total_in, 300);
-    assert_eq!(a.total_out, 130);
+    assert!((a.usage.cost - 0.03).abs() < 1e-9);
+    assert_eq!(a.usage.turn_cost, 0.0);
+    assert!(!a.usage.turn_has_round_usage);
+    assert_eq!(a.usage.total_in, 300);
+    assert_eq!(a.usage.total_out, 130);
 }
 
 #[test]
@@ -1244,11 +1253,11 @@ fn turn_end_folds_bundled_totals_on_resume_path() {
         },
         stop_reason: None,
     });
-    assert!((a.cost - 0.05).abs() < 1e-9);
-    assert_eq!(a.total_in, 10);
-    assert_eq!(a.total_out, 20);
-    assert_eq!(a.turn_cost, 0.0);
-    assert!(!a.turn_has_round_usage);
+    assert!((a.usage.cost - 0.05).abs() < 1e-9);
+    assert_eq!(a.usage.total_in, 10);
+    assert_eq!(a.usage.total_out, 20);
+    assert_eq!(a.usage.turn_cost, 0.0);
+    assert!(!a.usage.turn_has_round_usage);
 }
 
 // Serializes tests that touch the process-global LOFI_STATE_HOME: the
@@ -1374,7 +1383,7 @@ fn a_stored_mailbox_wake_is_dropped_when_no_wake_is_unclaimed() {
 fn a_busy_turn_keeps_the_mailbox_wake_for_later() {
     let mut a = app();
     a.mailbox_wake = Some("pointer".to_string());
-    a.run = Some(0);
+    a.begin_active_run();
     assert!(a.ready_mailbox_turn().is_none());
     assert!(
         a.mailbox_wake.is_some(),
@@ -1382,7 +1391,7 @@ fn a_busy_turn_keeps_the_mailbox_wake_for_later() {
     );
 
     // A queued prompt goes first.
-    a.run = None;
+    a.active_run = None;
     a.prompt_queue.push(crate::tui::QueuedPrompt {
         text: "typed".to_string(),
         kind: lofi_types::PromptKind::User,

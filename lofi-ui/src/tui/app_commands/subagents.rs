@@ -19,9 +19,7 @@ impl App {
         }
         // Match the SubagentUsage event fold: session totals only, child
         // tokens never occupy the parent context window.
-        self.cost += cost;
-        self.total_in += usage.input_tokens;
-        self.total_out += usage.output_tokens;
+        self.usage.fold_subagent(cost, usage);
     }
 
     /// Reset the registry for a session switch. Spend that settles between
@@ -269,53 +267,14 @@ impl App {
         };
         let (mut events, parsed_len) =
             load().map_err(|e| format!("failed to load transcript: {e}"))?;
-        // Mirror the frozen main-transcript reduction: a collapsed exec
-        // keeps no result body, only the marker that one exists. Bodies
-        // would otherwise be retained and re-wrapped on every frame.
-        let mut exec_ids = std::collections::HashSet::new();
-        let mut available_exec_results = std::collections::HashSet::new();
-        for event in &mut events {
-            let lofi_types::SessionEventKind::Message(message) = &mut event.kind else {
-                continue;
-            };
-            if message.role == lofi_types::Role::Assistant {
-                exec_ids.extend(message.blocks.iter().filter_map(|block| match block {
-                    lofi_types::ContentBlock::ToolUse { id, name, .. } if name == "exec" => {
-                        Some(id.clone())
-                    }
-                    _ => None,
-                }));
-            }
-            for block in &mut message.blocks {
-                if let lofi_types::ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error: false,
-                    ..
-                } = block
-                {
-                    if exec_ids.contains(tool_use_id) {
-                        if !content.is_empty() {
-                            available_exec_results.insert(tool_use_id.clone());
-                        }
-                        content.clear();
-                        content.shrink_to_fit();
-                    }
-                }
-            }
-        }
+        let available_exec_results =
+            crate::tui::transcript::strip_collapsed_exec_results(&mut events);
         let mut turns = crate::tui::replay::turns_from_selected_session_events(&events);
         for (i, turn) in turns.iter_mut().enumerate() {
             // Detail ids from a range no live turn reaches: a main-transcript
             // expansion key must never match a block in this view.
             assign_detail_ids(turn, u32::MAX as usize - i);
-            for block in &mut turn.blocks {
-                if let Block::Tool(tool) = block {
-                    if available_exec_results.contains(&tool.id) {
-                        tool.result_availability = ResultAvailability::Available;
-                    }
-                }
-            }
+            crate::tui::transcript::restore_result_availability(turn, &available_exec_results);
             // The view never expands tools, so keep only the collapsed
             // preview and drop the retained native result body.
             view::blocks::compact_native_previews(turn);
@@ -356,14 +315,127 @@ fn apply_subagent_reload(
     view.reloaded = true;
 }
 
-/// Cheap change detection for a turn between reloads. The block tree has
-/// no `PartialEq`; the serialized form covers every field that feeds the
-/// layout, so an unchanged signature keeps the measured height.
+/// Zero-allocation content signature for change detection across subagent reloads.
+/// Skips transient `Instant` and `detail_id` fields so a freshly parsed turn
+/// keeps the measured height of an identical prior turn.
 fn turn_signature(turn: &Turn) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(turn)
-        .unwrap_or_default()
-        .hash(&mut hasher);
-    hasher.finish()
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    turn.prompt.hash(&mut h);
+    (turn.kind as u8).hash(&mut h);
+    turn.blocks.len().hash(&mut h);
+    for block in &turn.blocks {
+        hash_block(block, &mut h);
+    }
+    h.finish()
+}
+
+fn hash_block(block: &Block, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match block {
+        Block::Text(text) => {
+            0u8.hash(h);
+            text.hash(h);
+        }
+        Block::Thinking(tb) => {
+            1u8.hash(h);
+            tb.text.hash(h);
+            tb.elapsed.hash(h);
+        }
+        Block::Tool(tool) => {
+            2u8.hash(h);
+            hash_tool_block(tool, h);
+        }
+        Block::UserShell {
+            command,
+            output,
+            exit_code,
+            signal,
+            duration,
+            truncated,
+            cancelled,
+            running,
+            exclude_from_context,
+            ..
+        } => {
+            3u8.hash(h);
+            command.hash(h);
+            output.hash(h);
+            exit_code.hash(h);
+            signal.hash(h);
+            duration.hash(h);
+            truncated.hash(h);
+            cancelled.hash(h);
+            running.hash(h);
+            exclude_from_context.hash(h);
+        }
+        Block::Error(msg) => {
+            4u8.hash(h);
+            msg.hash(h);
+        }
+        Block::TurnEnd { label, elapsed } => {
+            5u8.hash(h);
+            label.hash(h);
+            elapsed.hash(h);
+        }
+        Block::TurnFailed {
+            label,
+            elapsed,
+            error,
+        } => {
+            6u8.hash(h);
+            label.hash(h);
+            elapsed.hash(h);
+            error.hash(h);
+        }
+        Block::TurnCancelled { label, elapsed } => {
+            7u8.hash(h);
+            label.hash(h);
+            elapsed.hash(h);
+        }
+        Block::Compaction {
+            summarized,
+            kept,
+            summary,
+        } => {
+            8u8.hash(h);
+            summarized.hash(h);
+            kept.hash(h);
+            summary.hash(h);
+        }
+    }
+}
+
+fn hash_tool_block(tool: &ToolCall, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    tool.id.hash(h);
+    tool.name.hash(h);
+    tool.input.hash(h);
+    tool.label.hash(h);
+    tool.result.hash(h);
+    tool.result_availability.hash(h);
+    tool.result_committed.hash(h);
+    tool.is_error.hash(h);
+    tool.done.hash(h);
+    tool.elapsed.hash(h);
+    tool.native.len().hash(h);
+    for nt in &tool.native {
+        nt.id.hash(h);
+        nt.name.hash(h);
+        nt.args.hash(h);
+        nt.result.hash(h);
+        nt.is_error.hash(h);
+        nt.done.hash(h);
+        nt.preview.is_some().hash(h);
+        if let Some(p) = &nt.preview {
+            p.header_suffix.hash(h);
+            p.lines.hash(h);
+            p.total_lines.hash(h);
+            p.preview_start.hash(h);
+            p.numbered.hash(h);
+            p.start_line.hash(h);
+            p.is_diff.hash(h);
+            p.notice.hash(h);
+        }
+    }
 }

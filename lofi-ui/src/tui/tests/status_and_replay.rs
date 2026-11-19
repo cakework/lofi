@@ -241,10 +241,10 @@ fn footer_shows_ctx_after_usage() {
 #[test]
 fn external_display_model_stays_separate_from_response_and_selection() {
     let mut a = app();
-    a.model_label = "claude/sonnet".into();
-    a.selected_model_label = Some(a.model_label.clone());
-    a.thinking_label = None;
-    a.run_model_label = Some(a.model_label.clone());
+    a.model.label = "claude/sonnet".into();
+    a.model.selected_label = Some(a.model.label.clone());
+    a.model.thinking_label = None;
+    a.begin_active_run();
     for id in ["claude-sonnet-test", "claude-opus-test"] {
         a.apply_event(AgentEvent::ModelReported {
             id: id.into(),
@@ -259,15 +259,15 @@ fn external_display_model_stays_separate_from_response_and_selection() {
         assert!(header.contains("claude/claude-sonnet-test[1m]"));
         assert_eq!(a.run_label(), format!("claude/{id}"));
     }
-    assert_eq!(a.selected_model_label.as_deref(), Some("claude/sonnet"));
+    assert_eq!(a.model.selected_label.as_deref(), Some("claude/sonnet"));
 }
 
 #[test]
 fn model_report_keeps_the_run_effort_and_service_tier() {
     let mut a = app();
-    a.thinking_label = Some(":high".into());
-    a.service_label = Some("@flex".into());
-    a.run_model_label = Some(a.session_model());
+    a.model.thinking_label = Some(":high".into());
+    a.model.service_label = Some("@flex".into());
+    a.begin_active_run();
     a.apply_event(AgentEvent::ModelReported {
         id: "gpt-4o-2024".into(),
         display: "gpt-4o-2024".into(),
@@ -278,18 +278,17 @@ fn model_report_keeps_the_run_effort_and_service_tier() {
 #[test]
 fn external_reports_do_not_replace_a_mid_run_model_selection() {
     let mut a = app();
-    a.model_label = "claude/sonnet".into();
-    a.selected_model_label = Some(a.model_label.clone());
-    a.run_selected_model_label = Some(a.model_label.clone());
-    a.run_model_label = Some(a.model_label.clone());
+    a.model.label = "claude/sonnet".into();
+    a.model.selected_label = Some(a.model.label.clone());
+    a.begin_active_run();
     for selected in ["claude/opus", "openai/gpt-4o"] {
-        a.model_label = selected.into();
-        a.selected_model_label = selected.starts_with("claude/").then(|| selected.into());
+        a.model.label = selected.into();
+        a.model.selected_label = selected.starts_with("claude/").then(|| selected.into());
         a.apply_event(AgentEvent::ModelReported {
             id: "claude-sonnet-test".into(),
             display: "claude-sonnet-test[1m]".into(),
         });
-        assert_eq!(a.model_label, selected);
+        assert_eq!(a.model.label, selected);
         assert_eq!(a.run_label(), "claude/claude-sonnet-test:medium");
     }
 }
@@ -314,7 +313,7 @@ fn external_context_is_separate_from_turn_token_totals() {
         }),
     });
     assert!(footer(&a).contains("context 53k/128k"));
-    assert_eq!(a.total_in, 0);
+    assert_eq!(a.usage.total_in, 0);
     a.apply_event(AgentEvent::TurnEnd {
         model: "m".into(),
         elapsed_ms: 0,
@@ -327,9 +326,9 @@ fn external_context_is_separate_from_turn_token_totals() {
         stop_reason: None,
     });
     assert!(footer(&a).contains("context 53k/128k"));
-    assert_eq!(a.total_in, 100_000);
+    assert_eq!(a.usage.total_in, 100_000);
     // A context report carries no spend; spend stays on the turn markers.
-    assert_eq!(a.cost, 0.04);
+    assert_eq!(a.usage.cost, 0.04);
     a.apply_event(AgentEvent::ContextReported {
         context: Some(lofi_types::ContextUsage {
             used: 1000,
@@ -337,7 +336,7 @@ fn external_context_is_separate_from_turn_token_totals() {
         }),
     });
     assert!(footer(&a).contains("context 1k/64k"));
-    assert_eq!(a.cost, 0.04);
+    assert_eq!(a.usage.cost, 0.04);
     a.apply_event(AgentEvent::ContextReported {
         context: Some(lofi_types::ContextUsage {
             used: 1000,
@@ -555,8 +554,7 @@ fn queued_prompts_and_notices_render_below_working_indicator() {
         kind: lofi_types::PromptKind::User,
         prompt: "active prompt".to_string(),
     });
-    a.run = Some(0);
-    a.run_start = Some(Instant::now());
+    a.begin_active_run();
     a.prompt_queue.push(QueuedPrompt {
         text: "queued user message".to_string(),
         kind: lofi_types::PromptKind::User,
@@ -592,11 +590,10 @@ fn queued_prompts_and_notices_render_below_working_indicator() {
 #[test]
 fn working_line_reports_an_unanswered_cancel() {
     let mut a = app();
-    a.run = Some(0);
-    a.run_start = Some(Instant::now());
     let stalled = Instant::now().checked_sub(CANCEL_STALL * 2).unwrap();
-    a.cancel_at = Some(stalled);
-    a.run_event_at = Some(stalled);
+    let active = a.begin_active_run();
+    active.cancel_at = Some(stalled);
+    active.event_at = stalled;
     let rendered = view::blocks::render_turns(&a, 80);
     let rows: Vec<String> = rendered
         .lines
@@ -613,10 +610,9 @@ fn working_line_reports_an_unanswered_cancel() {
 #[test]
 fn working_line_marks_a_pending_cancel_without_the_quit_hint() {
     let mut a = app();
-    a.run = Some(0);
-    a.run_start = Some(Instant::now());
-    a.cancel_at = Some(Instant::now());
-    a.run_event_at = Some(Instant::now());
+    let active = a.begin_active_run();
+    active.cancel_at = Some(Instant::now());
+    active.event_at = Instant::now();
     let rendered = view::blocks::render_turns(&a, 80);
     let rows: Vec<String> = rendered
         .lines
@@ -802,7 +798,7 @@ fn alt_up_skips_notices_when_restoring_queue() {
 #[test]
 fn a_retry_names_the_attempt_in_the_working_report() {
     let mut a = app();
-    a.run = Some(0);
+    a.begin_active_run();
     a.retry = Some(RetryState {
         attempt: 2,
         max_attempts: 5,
@@ -816,7 +812,7 @@ fn a_retry_names_the_attempt_in_the_working_report() {
 #[test]
 fn a_waiting_confirmation_outranks_the_running_turn() {
     let mut a = app();
-    a.run = Some(0);
+    a.begin_active_run();
     let (request, _response) = confirm_request("touch status-ran");
     a.confirms.pending.push(request);
     a.confirms.waiting = Some((
@@ -834,7 +830,7 @@ fn a_waiting_confirmation_outranks_the_running_turn() {
 fn a_fresh_policy_prompt_keeps_the_report_working() {
     // An approval the user answers at once needs no blocked record in a tab.
     let mut a = app();
-    a.run = Some(0);
+    a.begin_active_run();
     let (request, _response) = confirm_request("touch status-ran");
     a.confirms.pending.push(request);
     a.confirms.waiting = Some((1, Instant::now()));
@@ -848,7 +844,7 @@ fn a_fresh_policy_prompt_keeps_the_report_working() {
 fn an_auto_evaluation_keeps_the_report_working() {
     // The evaluator decides on its own, so nothing waits on the user yet.
     let mut a = app();
-    a.run = Some(0);
+    a.begin_active_run();
     let (mut request, _response) = confirm_request("touch status-ran");
     request.reason = Arc::new(std::sync::Mutex::new(
         lofi_core::ConfirmReason::AutoEvaluating {
@@ -868,7 +864,7 @@ fn an_auto_evaluation_keeps_the_report_working() {
 #[test]
 fn an_auto_decision_is_the_users_prompt_at_once() {
     let mut a = app();
-    a.run = Some(0);
+    a.begin_active_run();
     let (mut request, _response) = confirm_request("touch status-ran");
     request.reason = Arc::new(std::sync::Mutex::new(lofi_core::ConfirmReason::AutoAsk {
         reason: "needs a look".to_string(),
@@ -883,7 +879,7 @@ fn an_auto_decision_is_the_users_prompt_at_once() {
 #[test]
 fn a_launch_without_a_model_reports_the_reason() {
     let mut a = app();
-    a.no_models_hint = Some("set OPENAI_API_KEY".to_string());
+    a.model.no_models_hint = Some("set OPENAI_API_KEY".to_string());
     let settled = program_status::Settled::default();
     let report = program_status::report(&a, &settled);
     assert_eq!(report.phase, program_status::Phase::Error);
@@ -893,7 +889,7 @@ fn a_launch_without_a_model_reports_the_reason() {
 #[test]
 fn no_model_submit_surfaces_hint_without_running() {
     let mut a = app();
-    a.no_models_hint = Some("set OPENAI_API_KEY".to_string());
+    a.model.no_models_hint = Some("set OPENAI_API_KEY".to_string());
     a.prompt.text = "hello".to_string();
     let ev = Event::Key(crossterm::event::KeyEvent::new_with_kind(
         KeyCode::Enter,
@@ -903,7 +899,7 @@ fn no_model_submit_surfaces_hint_without_running() {
     let mut run = None;
     handle_event(&ev, &mut a, None, &mut run);
     assert!(run.is_none(), "no run should be started without a model");
-    assert!(a.run.is_none());
+    assert!(!a.run_active());
     let last = a.transcript.turns.last().unwrap();
     assert_eq!(last.prompt, "hello");
     assert!(

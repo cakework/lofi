@@ -95,7 +95,7 @@ fn resumed_compaction_restores_summarized_message_count() {
     restore_compaction_from_index(&mut a, &resumed, &index);
 
     assert_eq!(a.lifecycle.history_stats().messages, 3);
-    assert_eq!(a.status_usage.unwrap().input_tokens, 113_000);
+    assert_eq!(a.usage.status_usage.unwrap().input_tokens, 113_000);
     a.apply_event(AgentEvent::RoundUsage {
         cost: 0.0,
         usage: Usage {
@@ -105,7 +105,7 @@ fn resumed_compaction_restores_summarized_message_count() {
     });
     a.maybe_auto_compact();
     assert!(
-        a.compacted,
+        a.usage.compacted,
         "resume must evaluate the next settled state and soft compaction must not reuse the hard cooldown"
     );
 
@@ -294,19 +294,17 @@ fn resume_does_not_restore_usage_measured_before_latest_compaction() {
     let mut a = app();
     restore_compaction_from_index(&mut a, &resumed, &index);
 
-    assert_eq!(a.status_usage, None);
-    assert!(!a.settled_usage_fresh);
-    assert!(a.compacted);
+    assert_eq!(a.usage.status_usage, None);
+    assert!(!a.usage.settled_usage_fresh);
+    assert!(a.usage.compacted);
 }
 
 #[test]
 fn working_status_keeps_the_run_model_across_a_mid_run_switch() {
-    let mut a = app(); // model_label = "openai/gpt-4o"
-    a.run = Some(0);
-    a.run_start = Some(Instant::now());
-    a.run_model_label = Some(a.session_model());
+    let mut a = app(); // model.label = "openai/gpt-4o"
+    a.begin_active_run();
 
-    a.model_label = "anthropic/claude".into();
+    a.model.label = "anthropic/claude".into();
     assert_eq!(a.run_label(), "openai/gpt-4o:medium");
     assert_eq!(a.session_model(), "anthropic/claude:medium");
 
@@ -342,8 +340,7 @@ fn working_status_is_replaced_in_place_by_done_status() {
             .collect::<Vec<_>>()
             .join("\n"),
     ));
-    a.run = Some(0);
-    a.run_start = Some(Instant::now());
+    a.begin_active_run();
     a.apply_event(AgentEvent::TurnEnd {
         model: "openai/gpt-4o".into(),
         elapsed_ms: 1_500,

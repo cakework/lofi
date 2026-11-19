@@ -139,14 +139,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     }
     match app.modal.as_ref() {
         None => {}
-        Some(ActiveModal::Resume(_)) => render_picker(f, area, app),
-        Some(ActiveModal::Tree { .. }) => render_tree_picker(f, area, app),
-        Some(ActiveModal::Model(_)) => render_model_picker(f, area, app),
-        Some(ActiveModal::Thinking(_)) => render_thinking_picker(f, area, app),
-        Some(ActiveModal::Policy(_)) => render_policy_picker(f, area, app),
-        Some(ActiveModal::Paths(_)) => render_paths_picker(f, area, app),
-        Some(ActiveModal::Service(_)) => render_service_picker(f, area, app),
-        Some(ActiveModal::Theme(_)) => render_theme_picker(f, area, app),
+        Some(ActiveModal::Resume(picker)) => render_picker(f, area, app, picker),
+        Some(ActiveModal::Tree { picker, .. }) => render_tree_picker(f, area, app, picker),
+        Some(ActiveModal::Model(picker)) => render_model_picker(f, area, app, picker),
+        Some(ActiveModal::Thinking(picker)) => render_thinking_picker(f, area, app, picker),
+        Some(ActiveModal::Policy(picker)) => render_policy_picker(f, area, app, picker),
+        Some(ActiveModal::Paths(picker)) => render_paths_picker(f, area, app, picker),
+        Some(ActiveModal::Service(picker)) => render_service_picker(f, area, app, picker),
+        Some(ActiveModal::Theme(picker)) => render_theme_picker(f, area, app, picker),
         Some(ActiveModal::Background(_)) => render_background_modal(f, area, app),
         Some(ActiveModal::Info(_)) => render_info_modal(f, area, app),
     }

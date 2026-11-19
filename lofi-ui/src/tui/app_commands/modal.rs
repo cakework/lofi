@@ -30,127 +30,9 @@ impl App {
                 picker, snapshot, ..
             }) => {
                 self.picker_generation.fetch_add(1, Ordering::Relaxed);
-                self.release_tree_resources(picker.entries, snapshot);
+                self.release_tree_resources(picker.list.items, snapshot);
             }
             _ => {}
-        }
-    }
-
-    pub(in crate::tui) fn picker(&self) -> Option<&PickerState> {
-        match &self.modal {
-            Some(ActiveModal::Resume(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn picker_mut(&mut self) -> Option<&mut PickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Resume(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn tree_picker(&self) -> Option<&TreePickerState> {
-        match &self.modal {
-            Some(ActiveModal::Tree { picker, .. }) => Some(picker),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn tree_picker_mut(&mut self) -> Option<&mut TreePickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Tree { picker, .. }) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn model_picker(&self) -> Option<&ModelPickerState> {
-        match &self.modal {
-            Some(ActiveModal::Model(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn model_picker_mut(&mut self) -> Option<&mut ModelPickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Model(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn thinking_picker(&self) -> Option<&ThinkingPickerState> {
-        match &self.modal {
-            Some(ActiveModal::Thinking(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn thinking_picker_mut(&mut self) -> Option<&mut ThinkingPickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Thinking(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn policy_picker(&self) -> Option<&PolicyPickerState> {
-        match &self.modal {
-            Some(ActiveModal::Policy(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn policy_picker_mut(&mut self) -> Option<&mut PolicyPickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Policy(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn paths_picker(&self) -> Option<&PathsPickerState> {
-        match &self.modal {
-            Some(ActiveModal::Paths(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn paths_picker_mut(&mut self) -> Option<&mut PathsPickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Paths(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn service_picker(&self) -> Option<&ServicePickerState> {
-        match &self.modal {
-            Some(ActiveModal::Service(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn service_picker_mut(&mut self) -> Option<&mut ServicePickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Service(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    pub(in crate::tui) fn theme_picker(&self) -> Option<&ThemePickerState> {
-        match &self.modal {
-            Some(ActiveModal::Theme(picker)) => Some(picker),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn theme_picker_mut(&mut self) -> Option<&mut ThemePickerState> {
-        match &mut self.modal {
-            Some(ActiveModal::Theme(picker)) => Some(picker),
-            _ => None,
         }
     }
 
@@ -541,7 +423,6 @@ impl App {
     }
 
     /// Unified key dispatch for modal overlays.
-    #[allow(clippy::too_many_lines)]
     pub(in crate::tui) fn handle_modal_key(&mut self, k: &KeyEvent) -> bool {
         match self.modal.as_ref() {
             None => return false,
@@ -558,7 +439,7 @@ impl App {
                 | ActiveModal::Theme(_),
             ) => {}
         }
-        let len = self.active_modal_mut().map_or(0, |m| m.len());
+        let len = self.active_list_nav_mut().map_or(0, |m| m.len());
         // A progressive picker draws before it has rows. Escape still closes
         // it, but Enter cannot confirm an absent selection.
         if len == 0 && matches!(k.code, KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab) {
@@ -581,33 +462,8 @@ impl App {
             }
             _ => {}
         }
-        let Some(m) = self.active_modal_mut() else {
-            return true;
-        };
-        if len == 0 {
-            return true;
-        }
-        let s = m.selected();
-        match k.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                m.set_selected(if s > 0 { s - 1 } else { 0 });
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                m.set_selected(if s + 1 < len { s + 1 } else { s });
-            }
-            KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                m.set_selected(if s + 1 < len { s + 1 } else { s });
-            }
-            KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                m.set_selected(if s > 0 { s - 1 } else { 0 });
-            }
-            KeyCode::Tab => {
-                m.set_selected((s + 1) % len);
-            }
-            KeyCode::BackTab => {
-                m.set_selected(if s == 0 { len - 1 } else { s - 1 });
-            }
-            _ => {}
+        if let Some(nav) = self.active_list_nav_mut() {
+            nav.handle_nav_key(k, true);
         }
         if matches!(self.modal, Some(ActiveModal::Tree { .. })) {
             self.request_tree_viewport();
@@ -615,10 +471,10 @@ impl App {
         true
     }
 
-    pub(in crate::tui) fn active_modal_mut(&mut self) -> Option<&mut dyn Modal> {
+    fn active_list_nav_mut(&mut self) -> Option<&mut dyn ListNav> {
         match self.modal.as_mut()? {
-            ActiveModal::Resume(p) => Some(p),
-            ActiveModal::Tree { picker, .. } => Some(picker),
+            ActiveModal::Resume(p) => Some(&mut p.list),
+            ActiveModal::Tree { picker, .. } => Some(&mut picker.list),
             ActiveModal::Model(m) => Some(m),
             ActiveModal::Thinking(t) => Some(t),
             ActiveModal::Policy(p) => Some(p),
@@ -630,14 +486,9 @@ impl App {
     }
 
     pub(in crate::tui) fn handle_popover_key(&mut self, k: &KeyEvent) -> bool {
-        if self.prompt.slash_complete.is_none() {
+        let Some(len) = self.prompt.slash_complete.as_ref().map(PickerList::len) else {
             return false;
-        }
-        let len = self
-            .prompt
-            .slash_complete
-            .as_ref()
-            .map_or(0, super::Popover::len);
+        };
         match k.code {
             KeyCode::Enter => {
                 self.slash_complete_accept();
@@ -655,39 +506,9 @@ impl App {
             }
             _ => {}
         }
-        let Some(popover) = self
-            .prompt
+        self.prompt
             .slash_complete
             .as_mut()
-            .map(|p| p as &mut dyn Popover)
-        else {
-            return false;
-        };
-        if len == 0 {
-            return false;
-        }
-        let s = popover.selected();
-        match k.code {
-            KeyCode::Up => {
-                popover.set_selected(if s > 0 { s - 1 } else { 0 });
-            }
-            KeyCode::Down => {
-                popover.set_selected(if s + 1 < len { s + 1 } else { s });
-            }
-            KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                popover.set_selected(if s + 1 < len { s + 1 } else { s });
-            }
-            KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                popover.set_selected(if s > 0 { s - 1 } else { 0 });
-            }
-            KeyCode::Tab => {
-                popover.set_selected((s + 1) % len);
-            }
-            KeyCode::BackTab => {
-                popover.set_selected(if s == 0 { len - 1 } else { s - 1 });
-            }
-            _ => return false,
-        }
-        true
+            .is_some_and(|popover| popover.handle_nav_key(k, false))
     }
 }

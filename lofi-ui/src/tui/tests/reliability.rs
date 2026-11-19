@@ -51,19 +51,19 @@ fn panicking_agent(root: &Path) -> lofi_core::Agent {
 async fn run_agent_task_panic_tui_e2e_child() {
     let root = tempfile::tempdir().unwrap();
     let agent = panicking_agent(root.path());
-    run(
-        Some(std::sync::Arc::new(agent)),
-        "test/panic".into(),
-        ThinkingLevel::Off,
-        ServiceTier::Auto,
-        lofi_types::ThemeMode::Dark,
-        SessionConfig::ephemeral(root.path().to_path_buf()),
-        None,
-        100_000,
-        lofi_types::CompactionConfig::default(),
-        None,
-        String::new(),
-    )
+    run(TuiLaunch {
+        agent: Some(std::sync::Arc::new(agent)),
+        model_label: "test/panic".into(),
+        thinking: ThinkingLevel::Off,
+        service_tier: ServiceTier::Auto,
+        ui_theme: lofi_types::ThemeMode::Dark,
+        session: SessionConfig::ephemeral(root.path().to_path_buf()),
+        no_models_hint: None,
+        ctx_limit: 100_000,
+        compaction: lofi_types::CompactionConfig::default(),
+        switcher: None,
+        system_prompt: String::new(),
+    })
     .await
     .unwrap();
 }
@@ -268,7 +268,7 @@ async fn agent_task_panic_is_visible_and_task_settles() {
                 Block::Error(message)
                     if message == "agent task panicked: provider settlement panic"
             )));
-            assert!(a.run.is_none());
+            assert!(!a.run_active());
         })
         .await;
 }

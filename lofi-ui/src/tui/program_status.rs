@@ -143,7 +143,7 @@ pub(crate) fn report<'a>(app: &'a App, settled: &'a Settled) -> Report<'a> {
     // and waits on the picker; the terminal shows that reason instead of
     // claiming the session is simply idle.
     if settled.phase == Phase::Idle {
-        if let Some(hint) = &app.no_models_hint {
+        if let Some(hint) = &app.model.no_models_hint {
             return Report {
                 phase: Phase::Error,
                 kind: None,

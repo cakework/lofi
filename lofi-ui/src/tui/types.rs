@@ -87,7 +87,7 @@ pub(crate) struct NativeTool {
     pub(crate) done: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ResultAvailability {
     #[default]
     None,
@@ -124,6 +124,209 @@ pub(crate) struct ThinkingBlock {
 pub(crate) struct RetryState {
     pub(crate) attempt: u32,
     pub(crate) max_attempts: u32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct UsageState {
+    pub(crate) status_usage: Option<Usage>,
+    /// The context state the engine reported after its last step.
+    pub(crate) reported_context: Option<lofi_types::ContextUsage>,
+    pub(crate) total_in: u64,
+    pub(crate) total_out: u64,
+    pub(crate) cost: f64,
+    pub(crate) turn_cost: f64,
+    pub(crate) turn_has_round_usage: bool,
+    /// True when a settled round supplied usage that core policy has not
+    /// evaluated yet.
+    pub(crate) settled_usage_fresh: bool,
+    pub(crate) compacted: bool,
+}
+
+impl UsageState {
+    pub(crate) fn reset_session(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn reset_turn(&mut self) {
+        self.turn_cost = 0.0;
+        self.turn_has_round_usage = false;
+        self.settled_usage_fresh = false;
+    }
+
+    pub(crate) fn reset_compaction_gauges(&mut self) {
+        self.status_usage = None;
+        // A rewritten history invalidates the fill the engine last reported;
+        // the next round or turn reports the new one.
+        self.reported_context = None;
+        self.settled_usage_fresh = false;
+        self.compacted = false;
+    }
+
+    pub(crate) fn mark_compacted(&mut self) {
+        self.reset_compaction_gauges();
+        self.compacted = true;
+    }
+
+    pub(crate) fn fold_subagent(&mut self, cost: f64, usage: Usage) {
+        self.cost += cost;
+        self.total_in += usage.input_tokens;
+        self.total_out += usage.output_tokens;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModelSelectionState {
+    pub(crate) label: String,
+    /// The `provider/model` the user picked, kept while a turn reports the id
+    /// it actually ran so the header can show both.
+    pub(crate) selected_label: Option<String>,
+    pub(crate) thinking_label: Option<String>,
+    pub(crate) thinking: ThinkingLevel,
+    pub(crate) service_label: Option<String>,
+    pub(crate) service_tier: ServiceTier,
+    pub(crate) ctx_limit: u64,
+    pub(crate) choices: Vec<lofi_types::ModelChoice>,
+    pub(crate) pending_switch: Option<String>,
+    pub(crate) no_models_hint: Option<String>,
+}
+
+impl ModelSelectionState {
+    pub(crate) fn new(
+        label: String,
+        thinking: ThinkingLevel,
+        service_tier: ServiceTier,
+        ctx_limit: u64,
+    ) -> Self {
+        let thinking_label =
+            (thinking != ThinkingLevel::Off).then(|| format!(":{}", thinking.as_str()));
+        let service_label =
+            (service_tier != ServiceTier::Auto).then(|| format!("@{}", service_tier.as_str()));
+        Self {
+            label,
+            selected_label: None,
+            thinking_label,
+            thinking,
+            service_label,
+            service_tier,
+            ctx_limit: if ctx_limit > 0 {
+                ctx_limit
+            } else {
+                DEFAULT_CTX_LIMIT
+            },
+            choices: Vec::new(),
+            pending_switch: None,
+            no_models_hint: None,
+        }
+    }
+
+    /// The label a model switch or capability lookup must carry: the selected
+    /// entry when a backend reported a resolved display name over it.
+    pub(crate) fn switch_label(&self) -> &str {
+        self.selected_label.as_deref().unwrap_or(&self.label)
+    }
+
+    pub(crate) fn suffix(&self) -> String {
+        format!(
+            "{}{}",
+            self.thinking_label.as_deref().unwrap_or(""),
+            self.service_label.as_deref().unwrap_or("")
+        )
+    }
+
+    pub(crate) fn session_label(&self) -> String {
+        format!("{}{}", self.label, self.suffix())
+    }
+
+    /// Build a `provider/model:effort[@tier]` switch query. Explicit `@auto` is
+    /// emitted only when leaving a non-`auto` tier so switching back overrides
+    /// any configured provider/model default without polluting ordinary `auto`
+    /// queries.
+    pub(crate) fn format_switch_query(
+        &self,
+        base_label: &str,
+        thinking: &ThinkingLevel,
+        tier: &ServiceTier,
+    ) -> String {
+        let tier_suffix = if *tier != ServiceTier::Auto {
+            format!("@{}", tier.as_str())
+        } else if self.service_tier != ServiceTier::Auto {
+            "@auto".to_string()
+        } else {
+            String::new()
+        };
+        format!("{}:{}{}", base_label, thinking.as_str(), tier_suffix)
+    }
+
+    /// Switch query needed to align the live selection with a resumed turn's
+    /// recorded [`RunModel`], or `None` when model, effort, and tier already
+    /// match.
+    pub(crate) fn restore_switch_query(&self, model: &RunModel) -> Option<String> {
+        let target_base = format!("{}/{}", model.provider, model.selected_or_id());
+        if target_base == self.switch_label()
+            && model.thinking == self.thinking
+            && model.service_tier == self.service_tier
+        {
+            return None;
+        }
+        Some(self.format_switch_query(&target_base, &model.thinking, &model.service_tier))
+    }
+
+    pub(crate) fn run_model(&self) -> RunModel {
+        let (provider, id) = match self.label.split_once('/') {
+            Some((p, r)) => (p, r),
+            None => ("", self.label.as_str()),
+        };
+        let selected = self
+            .selected_label
+            .as_deref()
+            .and_then(|label| label.split_once('/'))
+            .filter(|(label_provider, _)| *label_provider == provider)
+            .map_or(id, |(_, selected)| selected);
+        RunModel {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            selected: selected.to_string(),
+            display: (selected != id).then(|| id.to_string()),
+            thinking: self.thinking.clone(),
+            service_tier: self.service_tier.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveRunState {
+    pub(crate) spinner: usize,
+    pub(crate) started_at: Instant,
+    /// When the current run last delivered an event.
+    pub(crate) event_at: Instant,
+    /// When the user first asked the current run to stop.
+    pub(crate) cancel_at: Option<Instant>,
+    /// Model label captured when the run started. A mid-run `/model` switch
+    /// updates the footer; the "Working for ..." line keeps showing the model
+    /// the in-flight run is actually using.
+    pub(crate) model_label: Option<String>,
+    pub(crate) selected_model_label: Option<String>,
+}
+
+impl ActiveRunState {
+    pub(crate) fn start(model: &ModelSelectionState) -> Self {
+        let now = Instant::now();
+        Self {
+            spinner: 0,
+            started_at: now,
+            event_at: now,
+            cancel_at: None,
+            model_label: Some(model.session_label()),
+            selected_model_label: Some(model.switch_label().to_string()),
+        }
+    }
+
+    pub(crate) fn cancel_unacknowledged(&self) -> bool {
+        let Some(requested) = self.cancel_at else {
+            return false;
+        };
+        self.event_at.max(requested).elapsed() >= CANCEL_STALL
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

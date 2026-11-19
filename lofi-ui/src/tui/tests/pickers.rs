@@ -9,8 +9,8 @@ fn insert_str_normalizes_line_endings() {
 
 #[test]
 fn model_picker_open_preselects_current() {
-    let mut a = app(); // model_label = "openai/gpt-4o"
-    a.model_choices = vec![
+    let mut a = app(); // model.label = "openai/gpt-4o"
+    a.model.choices = vec![
         lofi_types::ModelChoice {
             provider: "anthropic".into(),
             id: "claude".into(),
@@ -31,8 +31,10 @@ fn model_picker_open_preselects_current() {
         },
     ];
     a.open_model_picker();
-    let picker = a.model_picker().unwrap();
-    assert_eq!(picker.choices.len(), 2);
+    let Some(ActiveModal::Model(picker)) = &a.modal else {
+        panic!("expected model picker");
+    };
+    assert_eq!(picker.len(), 2);
     assert_eq!(picker.selected, 1);
     assert!(a.modal_open());
 }
@@ -40,16 +42,16 @@ fn model_picker_open_preselects_current() {
 #[test]
 fn model_picker_open_empty_notifies() {
     let mut a = app();
-    a.model_choices = Vec::new();
+    a.model.choices = Vec::new();
     a.open_model_picker();
-    assert!(a.model_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Model(_))));
     assert!(a.notify.is_some());
 }
 
 #[test]
 fn model_picker_confirm_sets_pending_switch() {
     let mut a = app();
-    a.model_choices = vec![
+    a.model.choices = vec![
         lofi_types::ModelChoice {
             provider: "anthropic".into(),
             id: "claude".into(),
@@ -70,16 +72,19 @@ fn model_picker_confirm_sets_pending_switch() {
         },
     ];
     a.open_model_picker();
-    a.model_picker_mut().unwrap().selected = 0;
+    let Some(ActiveModal::Model(picker)) = &mut a.modal else {
+        panic!("expected model picker");
+    };
+    picker.selected = 0;
     a.model_picker_confirm();
-    assert_eq!(a.pending_model_switch.as_deref(), Some("anthropic/claude"));
-    assert!(a.model_picker().is_none());
+    assert_eq!(a.model.pending_switch.as_deref(), Some("anthropic/claude"));
+    assert!(!matches!(a.modal, Some(ActiveModal::Model(_))));
 }
 
 #[test]
 fn apply_model_switch_updates_label_and_ctx_limit() {
     let mut a = app();
-    a.ctx_limit = 0; // falls back to DEFAULT_CTX_LIMIT until a model reports one
+    a.model.ctx_limit = 0; // falls back to DEFAULT_CTX_LIMIT until a model reports one
     let model = lofi_types::Model {
         id: "claude".into(),
         name: "Claude".into(),
@@ -104,16 +109,16 @@ fn apply_model_switch_updates_label_and_ctx_limit() {
         ServiceTier::Auto,
         model.context_window,
     );
-    assert_eq!(a.model_label, "anthropic/claude");
-    assert_eq!(a.thinking_label.as_deref(), Some(":xhigh"));
-    assert_eq!(a.ctx_limit, 200_000);
-    assert_eq!(a.thinking, ThinkingLevel::XHigh);
+    assert_eq!(a.model.label, "anthropic/claude");
+    assert_eq!(a.model.thinking_label.as_deref(), Some(":xhigh"));
+    assert_eq!(a.model.ctx_limit, 200_000);
+    assert_eq!(a.model.thinking, ThinkingLevel::XHigh);
 }
 
 #[test]
 fn apply_model_switch_with_no_context_window_uses_default() {
     let mut a = app();
-    a.ctx_limit = 100_000;
+    a.model.ctx_limit = 100_000;
     let model = lofi_types::Model {
         id: "local".into(),
         name: "Local".into(),
@@ -138,13 +143,13 @@ fn apply_model_switch_with_no_context_window_uses_default() {
         ServiceTier::Auto,
         model.context_window,
     );
-    assert_eq!(a.ctx_limit, DEFAULT_CTX_LIMIT);
+    assert_eq!(a.model.ctx_limit, DEFAULT_CTX_LIMIT);
 }
 
 #[test]
 fn thinking_picker_open_preselects_current() {
-    let mut a = app(); // model_label = "openai/gpt-4o", thinking = Medium
-    a.model_choices = vec![lofi_types::ModelChoice {
+    let mut a = app(); // model.label = "openai/gpt-4o", thinking = Medium
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -154,9 +159,11 @@ fn thinking_picker_open_preselects_current() {
         context_window: None,
     }];
     a.open_thinking_picker();
-    let picker = a.thinking_picker().unwrap();
+    let Some(ActiveModal::Thinking(picker)) = &a.modal else {
+        panic!("expected thinking picker");
+    };
     assert_eq!(
-        picker.levels,
+        picker.items,
         vec![
             ThinkingLevel::Off,
             ThinkingLevel::Medium,
@@ -170,7 +177,7 @@ fn thinking_picker_open_preselects_current() {
 #[test]
 fn thinking_picker_open_no_levels_notifies() {
     let mut a = app();
-    a.model_choices = vec![lofi_types::ModelChoice {
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -180,14 +187,14 @@ fn thinking_picker_open_no_levels_notifies() {
         context_window: None,
     }];
     a.open_thinking_picker();
-    assert!(a.thinking_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Thinking(_))));
     assert!(a.notify.is_some());
 }
 
 #[test]
 fn thinking_picker_confirm_sets_pending_switch() {
-    let mut a = app(); // model_label = "openai/gpt-4o"
-    a.model_choices = vec![lofi_types::ModelChoice {
+    let mut a = app(); // model.label = "openai/gpt-4o"
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -197,13 +204,47 @@ fn thinking_picker_confirm_sets_pending_switch() {
         context_window: None,
     }];
     a.open_thinking_picker();
-    a.thinking_picker_mut().unwrap().selected = 2;
+    let Some(ActiveModal::Thinking(picker)) = &mut a.modal else {
+        panic!("expected thinking picker");
+    };
+    picker.selected = 2;
     a.thinking_picker_confirm();
     assert_eq!(
-        a.pending_model_switch.as_deref(),
+        a.model.pending_switch.as_deref(),
         Some("openai/gpt-4o:high")
     );
-    assert!(a.thinking_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Thinking(_))));
+}
+
+#[test]
+fn thinking_picker_confirm_preserves_active_service_tier() {
+    let mut a = App::new(
+        "openai/gpt-4o".to_string(),
+        ThinkingLevel::Medium,
+        ServiceTier::Flex,
+        0,
+        lofi_types::CompactionConfig::default(),
+        String::new(),
+    );
+    a.model.choices = vec![lofi_types::ModelChoice {
+        provider: "openai".into(),
+        id: "gpt-4o".into(),
+        name: String::new(),
+        thinking_levels: vec![ThinkingLevel::Medium, ThinkingLevel::High],
+        service_tiers: vec![ServiceTier::Auto, ServiceTier::Flex],
+        supports_image: false,
+        context_window: None,
+    }];
+    a.open_thinking_picker();
+    let Some(ActiveModal::Thinking(picker)) = &mut a.modal else {
+        panic!("expected thinking picker");
+    };
+    picker.selected = 2;
+    a.thinking_picker_confirm();
+    assert_eq!(
+        a.model.pending_switch.as_deref(),
+        Some("openai/gpt-4o:high@flex")
+    );
 }
 
 #[test]
@@ -211,9 +252,11 @@ fn policy_picker_defaults_to_ask_manual_without_auto_mode() {
     let mut a = app();
     a.executor = Some(lofi_core::agent::ToolExecutor::in_memory("/ws"));
     a.open_policy_picker();
-    let picker = a.policy_picker().unwrap();
+    let Some(ActiveModal::Policy(picker)) = &a.modal else {
+        panic!("expected policy picker");
+    };
     assert_eq!(
-        picker.modes,
+        picker.items,
         vec![
             lofi_types::BashApprovalMode::AllowAll,
             lofi_types::BashApprovalMode::AskManual,
@@ -233,9 +276,11 @@ fn policy_picker_includes_and_defaults_to_ask_auto_when_configured() {
         ))),
     );
     a.open_policy_picker();
-    let picker = a.policy_picker().unwrap();
+    let Some(ActiveModal::Policy(picker)) = &a.modal else {
+        panic!("expected policy picker");
+    };
     assert_eq!(
-        picker.modes,
+        picker.items,
         vec![
             lofi_types::BashApprovalMode::AllowAll,
             lofi_types::BashApprovalMode::AskManual,
@@ -255,9 +300,12 @@ fn policy_picker_confirm_writes_the_shared_override() {
             .with_policy_override(override_handle.clone()),
     );
     a.open_policy_picker();
-    a.policy_picker_mut().unwrap().selected = 2; // deny all
+    let Some(ActiveModal::Policy(picker)) = &mut a.modal else {
+        panic!("expected policy picker");
+    };
+    picker.selected = 2; // deny all
     a.policy_picker_confirm();
-    assert!(a.policy_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Policy(_))));
     assert_eq!(
         override_handle.current(),
         Some(lofi_types::BashApprovalMode::DenyAll)
@@ -280,7 +328,10 @@ fn policy_badge_shows_a_non_default_pick() {
     let mut a = app();
     a.executor = Some(lofi_core::agent::ToolExecutor::in_memory("/ws"));
     a.open_policy_picker();
-    a.policy_picker_mut().unwrap().selected = 2; // deny all
+    let Some(ActiveModal::Policy(picker)) = &mut a.modal else {
+        panic!("expected policy picker");
+    };
+    picker.selected = 2; // deny all
     a.policy_picker_confirm();
     assert_eq!(a.policy_badge().as_deref(), Some("deny all"));
 }
@@ -289,7 +340,7 @@ fn policy_badge_shows_a_non_default_pick() {
 fn policy_picker_requires_an_agent() {
     let mut a = app();
     assert!(a.slash_command("/policy"));
-    assert!(a.policy_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Policy(_))));
     let (msg, kind) = a.notify_badge().expect("no-agent /policy notified");
     assert_eq!(kind, NotifyKind::Error);
     assert!(msg.contains("/policy"));
@@ -297,8 +348,8 @@ fn policy_picker_requires_an_agent() {
 
 #[test]
 fn service_picker_open_lists_auto_plus_declared() {
-    let mut a = app(); // model_label = "openai/gpt-4o", thinking = Medium
-    a.model_choices = vec![lofi_types::ModelChoice {
+    let mut a = app(); // model.label = "openai/gpt-4o", thinking = Medium
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -312,9 +363,11 @@ fn service_picker_open_lists_auto_plus_declared() {
         context_window: None,
     }];
     a.open_service_picker();
-    let picker = a.service_picker().unwrap();
+    let Some(ActiveModal::Service(picker)) = &a.modal else {
+        panic!("expected service picker");
+    };
     assert_eq!(
-        picker.tiers,
+        picker.items,
         vec![ServiceTier::Auto, ServiceTier::Flex, ServiceTier::Priority]
     );
     assert_eq!(picker.selected, 0);
@@ -322,9 +375,33 @@ fn service_picker_open_lists_auto_plus_declared() {
 }
 
 #[test]
+fn service_picker_uses_selected_model_when_display_label_differs() {
+    let mut a = app();
+    a.model.selected_label = Some("openai/gpt-4o".into());
+    a.model.label = "openai/gpt-4o-2024-11-20".into();
+    a.model.choices = vec![lofi_types::ModelChoice {
+        provider: "openai".into(),
+        id: "gpt-4o".into(),
+        name: String::new(),
+        thinking_levels: vec![],
+        service_tiers: vec![ServiceTier::Flex, ServiceTier::Priority],
+        supports_image: false,
+        context_window: None,
+    }];
+    a.open_service_picker();
+    let Some(ActiveModal::Service(picker)) = &a.modal else {
+        panic!("expected service picker on routed display model");
+    };
+    assert_eq!(
+        picker.items,
+        vec![ServiceTier::Auto, ServiceTier::Flex, ServiceTier::Priority]
+    );
+}
+
+#[test]
 fn service_picker_open_no_tiers_notifies() {
     let mut a = app();
-    a.model_choices = vec![lofi_types::ModelChoice {
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -334,14 +411,14 @@ fn service_picker_open_no_tiers_notifies() {
         context_window: None,
     }];
     a.open_service_picker();
-    assert!(a.service_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Service(_))));
     assert!(a.notify.is_some());
 }
 
 #[test]
 fn service_picker_confirm_sets_pending_switch() {
-    let mut a = app(); // model_label = "openai/gpt-4o", thinking = Medium
-    a.model_choices = vec![lofi_types::ModelChoice {
+    let mut a = app(); // model.label = "openai/gpt-4o", thinking = Medium
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -351,17 +428,20 @@ fn service_picker_confirm_sets_pending_switch() {
         context_window: None,
     }];
     a.open_service_picker();
-    a.service_picker_mut().unwrap().selected = 2;
+    let Some(ActiveModal::Service(picker)) = &mut a.modal else {
+        panic!("expected service picker");
+    };
+    picker.selected = 2;
     a.service_picker_confirm();
     assert_eq!(
-        a.pending_model_switch.as_deref(),
+        a.model.pending_switch.as_deref(),
         Some("openai/gpt-4o:medium@priority")
     );
-    assert!(a.service_picker().is_none());
+    assert!(!matches!(a.modal, Some(ActiveModal::Service(_))));
 
-    // Selecting "auto" drops the @tier suffix entirely.
+    // Selecting "auto" while already on auto omits the @tier suffix.
     let mut a2 = app();
-    a2.model_choices = vec![lofi_types::ModelChoice {
+    a2.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -371,11 +451,45 @@ fn service_picker_confirm_sets_pending_switch() {
         context_window: None,
     }];
     a2.open_service_picker();
-    a2.service_picker_mut().unwrap().selected = 0;
+    let Some(ActiveModal::Service(picker2)) = &mut a2.modal else {
+        panic!("expected service picker");
+    };
+    picker2.selected = 0;
     a2.service_picker_confirm();
     assert_eq!(
-        a2.pending_model_switch.as_deref(),
+        a2.model.pending_switch.as_deref(),
         Some("openai/gpt-4o:medium")
+    );
+}
+
+#[test]
+fn service_picker_confirm_switching_back_to_auto_emits_explicit_auto() {
+    let mut a = App::new(
+        "openai/gpt-4o".to_string(),
+        ThinkingLevel::Medium,
+        ServiceTier::Flex,
+        0,
+        lofi_types::CompactionConfig::default(),
+        String::new(),
+    );
+    a.model.choices = vec![lofi_types::ModelChoice {
+        provider: "openai".into(),
+        id: "gpt-4o".into(),
+        name: String::new(),
+        thinking_levels: vec![],
+        service_tiers: vec![ServiceTier::Auto, ServiceTier::Flex],
+        supports_image: false,
+        context_window: None,
+    }];
+    a.open_service_picker();
+    let Some(ActiveModal::Service(picker)) = &mut a.modal else {
+        panic!("expected service picker");
+    };
+    picker.selected = 0; // auto
+    a.service_picker_confirm();
+    assert_eq!(
+        a.model.pending_switch.as_deref(),
+        Some("openai/gpt-4o:medium@auto")
     );
 }
 
@@ -417,8 +531,8 @@ fn footer_shows_service_tier_when_not_auto() {
 
 #[test]
 fn resume_model_switch_when_model_differs() {
-    let mut a = app(); // model_label = "openai/gpt-4o", thinking = Medium
-    a.model_choices = vec![lofi_types::ModelChoice {
+    let mut a = app(); // model.label = "openai/gpt-4o", thinking = Medium
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "anthropic".into(),
         id: "claude".into(),
         name: String::new(),
@@ -445,9 +559,56 @@ fn resume_model_switch_when_model_differs() {
 }
 
 #[test]
+fn resume_model_switch_preserves_service_tier() {
+    let mut a = app();
+    a.model.choices = vec![lofi_types::ModelChoice {
+        provider: "openai".into(),
+        id: "gpt-4o".into(),
+        name: String::new(),
+        thinking_levels: vec![ThinkingLevel::Medium],
+        service_tiers: vec![ServiceTier::Auto, ServiceTier::Flex],
+        supports_image: false,
+        context_window: None,
+    }];
+    let flex_events = vec![SessionEvent {
+        id: "1".into(),
+        parent_id: None,
+        kind: SessionEventKind::TurnEnd {
+            model: "openai/gpt-4o:medium@flex".into(),
+            elapsed_ms: 0,
+            cost: 0.0,
+            usage: Usage::default(),
+            stop_reason: None,
+        },
+    }];
+    assert_eq!(
+        a.resume_model_switch(&flex_events).as_deref(),
+        Some("openai/gpt-4o:medium@flex")
+    );
+
+    // Resuming an auto-tier session from a flex-tier app emits explicit @auto.
+    a.model.service_tier = ServiceTier::Flex;
+    let auto_events = vec![SessionEvent {
+        id: "2".into(),
+        parent_id: None,
+        kind: SessionEventKind::TurnEnd {
+            model: "openai/gpt-4o:medium".into(),
+            elapsed_ms: 0,
+            cost: 0.0,
+            usage: Usage::default(),
+            stop_reason: None,
+        },
+    }];
+    assert_eq!(
+        a.resume_model_switch(&auto_events).as_deref(),
+        Some("openai/gpt-4o:medium@auto")
+    );
+}
+
+#[test]
 fn resume_model_switch_none_when_same_model() {
     let mut a = app();
-    a.model_choices = vec![lofi_types::ModelChoice {
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "openai".into(),
         id: "gpt-4o".into(),
         name: String::new(),
@@ -473,7 +634,7 @@ fn resume_model_switch_none_when_same_model() {
 #[test]
 fn resume_model_switch_none_when_no_choices_or_no_turn() {
     let mut a = app();
-    a.model_choices = Vec::new();
+    a.model.choices = Vec::new();
     let events = vec![SessionEvent {
         id: "1".into(),
         parent_id: None,
@@ -486,7 +647,7 @@ fn resume_model_switch_none_when_no_choices_or_no_turn() {
         },
     }];
     assert!(a.resume_model_switch(&events).is_none());
-    a.model_choices = vec![lofi_types::ModelChoice {
+    a.model.choices = vec![lofi_types::ModelChoice {
         provider: "x".into(),
         id: "y".into(),
         name: String::new(),
