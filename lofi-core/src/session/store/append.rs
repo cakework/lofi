@@ -1,43 +1,100 @@
-use std::io::Write;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use lofi_error::{Error, Result};
 #[cfg(test)]
 use lofi_types::SessionEventKind;
-use lofi_types::{Message, SessionEvent};
+use lofi_types::{Message, Role, SessionEvent};
 use serde::Serialize;
 
 #[cfg(test)]
 use super::parse_event;
-use super::short_id;
+use super::{short_id, EventIndex, IndexId, IndexKind};
 
-pub(super) struct RecordWriter(std::fs::File);
+struct CountingWriter<W> {
+    inner: W,
+    pos: u64,
+}
 
-impl RecordWriter {
-    pub(super) fn record(&mut self, record: &impl Serialize) -> Result<()> {
-        serde_json::to_writer(&mut self.0, record)
-            .map_err(|error| Error::State(format!("json: {error}")))?;
-        self.0.write_all(b"\n")?;
-        Ok(())
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
-// Callers keep the transcript lock while selecting parents and writing records.
-pub(super) fn append_records(
-    path: &Path,
-    write: impl FnOnce(&mut RecordWriter) -> Result<()>,
-) -> Result<(u64, u64)> {
-    let byte_start = std::fs::metadata(path).map_or(0, |m| m.len());
-    let file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
-    let mut writer = RecordWriter(file);
-    if let Err(error) = write(&mut writer).and_then(|()| Ok(writer.0.sync_data()?)) {
-        let _ = writer.0.set_len(byte_start);
-        return Err(error);
+pub(super) struct RecordWriter<'a> {
+    writer: CountingWriter<BufWriter<&'a std::fs::File>>,
+    spans: Vec<(u64, u64)>,
+}
+
+impl RecordWriter<'_> {
+    pub(super) fn record(&mut self, record: &impl Serialize) -> Result<(u64, u64)> {
+        let start = self.writer.pos;
+        serde_json::to_writer(&mut self.writer, record)
+            .map_err(|error| Error::State(format!("json: {error}")))?;
+        self.writer.write_all(b"\n")?;
+        let end = self.writer.pos;
+        self.spans.push((start, end));
+        Ok((start, end))
     }
-    Ok((byte_start, writer.0.metadata()?.len()))
+}
+
+pub(super) fn open_locked_transcript(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
+pub(super) struct AppendCommit {
+    pub(super) start: u64,
+    pub(super) end: u64,
+    pub(super) spans: Vec<(u64, u64)>,
+}
+
+// Callers hold the locked transcript file across parent resolution and record writes.
+pub(super) fn append_records_locked(
+    file: &mut std::fs::File,
+    write: impl FnOnce(&mut RecordWriter<'_>) -> Result<()>,
+) -> Result<AppendCommit> {
+    let byte_start = file.seek(SeekFrom::End(0))?;
+    let written = (|| -> Result<(u64, Vec<(u64, u64)>)> {
+        let mut writer = RecordWriter {
+            writer: CountingWriter {
+                inner: BufWriter::new(&*file),
+                pos: byte_start,
+            },
+            spans: Vec::new(),
+        };
+        write(&mut writer)?;
+        writer.writer.flush()?;
+        Ok((writer.writer.pos, writer.spans))
+    })();
+    match written.and_then(|(byte_end, spans)| {
+        file.sync_data()?;
+        Ok(AppendCommit {
+            start: byte_start,
+            end: byte_end,
+            spans,
+        })
+    }) {
+        Ok(committed) => Ok(committed),
+        Err(error) => {
+            let _ = file.set_len(byte_start);
+            let _ = file.seek(SeekFrom::Start(byte_start));
+            Err(error)
+        }
+    }
 }
 
 pub(super) enum AppendParent<'a> {
@@ -48,11 +105,11 @@ pub(super) enum AppendParent<'a> {
 
 impl AppendParent<'_> {
     #[cfg_attr(not(test), allow(unused_variables, clippy::unnecessary_wraps))]
-    fn resolve(self, path: &Path) -> Result<Option<String>> {
+    fn resolve(self, file: &mut std::fs::File) -> Result<Option<String>> {
         match self {
             Self::Explicit(parent) => Ok(parent.map(str::to_string)),
             #[cfg(test)]
-            Self::PhysicalEof => last_event_id(path),
+            Self::PhysicalEof => last_event_id(file),
         }
     }
 }
@@ -90,14 +147,8 @@ fn append_events_from(
         let len = std::fs::metadata(path).map_or(0, |m| m.len());
         return Ok((len, len));
     }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    lock.lock()?;
-    let mut parent = parent.resolve(path)?;
+    let mut lock = open_locked_transcript(path)?;
+    let mut parent = parent.resolve(&mut lock)?;
     // Assign a fresh id to each event. `parent_id` is auto-filled only when
     // the event did not set one explicitly, preserving callers that construct
     // a branch inside one append batch.
@@ -108,7 +159,8 @@ fn append_events_from(
         }
         parent = Some(ev.id.clone());
     }
-    append_prepared_events(path, events)
+    let committed = append_prepared_events_locked(&mut lock, events)?;
+    Ok((committed.start, committed.end))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,14 +187,15 @@ pub(crate) fn append_compaction(
     let parent = parent_hint.map_or(AppendParent::PhysicalEof, |id| {
         AppendParent::Explicit(Some(id))
     });
-    append_compaction_from(
+    let (start, end, marker_id, _) = append_compaction_from(
         path,
         kept_messages,
         parent,
         summary,
         summarized_range,
         counts,
-    )
+    )?;
+    Ok((start, end, marker_id))
 }
 
 pub(super) fn append_compaction_from(
@@ -152,7 +205,7 @@ pub(super) fn append_compaction_from(
     summary: &str,
     summarized_range: &[String; 2],
     counts: CompactionCounts,
-) -> Result<(u64, u64, String)> {
+) -> Result<(u64, u64, String, Vec<EventIndex>)> {
     #[derive(Serialize)]
     struct MessageCheckpoint<'a> {
         id: &'a str,
@@ -160,7 +213,7 @@ pub(super) fn append_compaction_from(
         parent_id: Option<&'a str>,
         #[serde(rename = "type")]
         kind: &'static str,
-        role: lofi_types::Role,
+        role: Role,
         blocks: &'a [lofi_types::ContentBlock],
     }
     #[derive(Serialize)]
@@ -179,16 +232,10 @@ pub(super) fn append_compaction_from(
         kept: usize,
     }
 
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    lock.lock()?;
-    let parent = parent.resolve(path)?;
+    let mut lock = open_locked_transcript(path)?;
+    let parent = parent.resolve(&mut lock)?;
     let ids: Vec<String> = (0..=kept_messages.len()).map(|_| short_id()).collect();
-    let (byte_start, byte_end) = append_records(path, |writer| {
+    let committed = append_records_locked(&mut lock, |writer| {
         for (index, message) in kept_messages.iter().enumerate() {
             let event = MessageCheckpoint {
                 id: &ids[index],
@@ -226,11 +273,64 @@ pub(super) fn append_compaction_from(
         writer.record(&marker)?;
         Ok(())
     })?;
-    Ok((byte_start, byte_end, ids[kept_messages.len()].clone()))
+    let suffix = compaction_suffix_index(kept_messages, parent.as_deref(), &ids, &committed.spans);
+    Ok((
+        committed.start,
+        committed.end,
+        ids[kept_messages.len()].clone(),
+        suffix,
+    ))
 }
 
-pub(super) fn append_prepared_events(path: &Path, events: &[SessionEvent]) -> Result<(u64, u64)> {
-    append_records(path, |writer| {
+fn compaction_suffix_index(
+    kept_messages: &[Message],
+    parent: Option<&str>,
+    ids: &[String],
+    spans: &[(u64, u64)],
+) -> Vec<EventIndex> {
+    let mut suffix = Vec::with_capacity(spans.len());
+    for (index, message) in kept_messages.iter().enumerate() {
+        let (offset, end_offset) = spans[index];
+        let parent_id = if index == 0 {
+            parent.map(IndexId::borrow)
+        } else {
+            Some(IndexId::borrow(&ids[index - 1]))
+        };
+        let kind = match message.role {
+            Role::User => IndexKind::UserPrompt,
+            Role::Assistant => IndexKind::AssistantMessage,
+            Role::Tool => IndexKind::ToolResult,
+            Role::System => IndexKind::SystemMessage,
+        };
+        suffix.push(EventIndex {
+            id: IndexId::borrow(&ids[index]),
+            parent_id,
+            offset,
+            end_offset,
+            kind,
+        });
+    }
+    let marker_index = kept_messages.len();
+    let (offset, end_offset) = spans[marker_index];
+    suffix.push(EventIndex {
+        id: IndexId::borrow(&ids[marker_index]),
+        parent_id: if marker_index == 0 {
+            parent.map(IndexId::borrow)
+        } else {
+            Some(IndexId::borrow(&ids[marker_index - 1]))
+        },
+        offset,
+        end_offset,
+        kind: IndexKind::Compaction,
+    });
+    suffix
+}
+
+pub(super) fn append_prepared_events_locked(
+    file: &mut std::fs::File,
+    events: &[SessionEvent],
+) -> Result<AppendCommit> {
+    append_records_locked(file, |writer| {
         for event in events {
             writer.record(event)?;
         }
@@ -239,18 +339,14 @@ pub(super) fn append_prepared_events(path: &Path, events: &[SessionEvent]) -> Re
 }
 
 /// # Errors
-/// Returns [`Error::Io`] on a read failure other than the file not existing.
+/// Returns [`Error::Io`] on a read failure.
 #[cfg(test)]
-fn last_event_id(path: &Path) -> Result<Option<String>> {
+fn last_event_id(file: &mut std::fs::File) -> Result<Option<String>> {
     use std::io::{BufRead, BufReader};
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::Io(e)),
-    };
+    file.seek(SeekFrom::Start(0))?;
     let mut last: Option<String> = None;
     let mut first = true;
-    for line in BufReader::new(file).lines() {
+    for line in BufReader::new(&*file).lines() {
         let line = line?;
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.is_empty() {

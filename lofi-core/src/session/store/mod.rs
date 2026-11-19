@@ -159,8 +159,8 @@ fn index_for_events(events: &[SessionEvent]) -> Vec<EventIndex> {
     events
         .iter()
         .map(|event| EventIndex {
-            id: IndexId::parse(event.id.clone()),
-            parent_id: event.parent_id.clone().map(IndexId::parse),
+            id: IndexId::borrow(&event.id),
+            parent_id: event.parent_id.as_deref().map(IndexId::borrow),
             offset: 0,
             end_offset: 0,
             kind: index_kind_for_event(&event.kind),

@@ -1,6 +1,6 @@
 //! Used by the `/tree` picker to avoid a full [`super::load`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::index_parser::{read_index_event, read_projected_value, ProjectionBudget};

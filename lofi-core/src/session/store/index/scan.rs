@@ -144,38 +144,50 @@ pub(in crate::session::store) struct LinearSessionIndex {
     pub compaction_suffix: Vec<EventIndex>,
 }
 
-pub(in crate::session::store) struct LinearScan {
-    pub(in crate::session::store) count: usize,
-    pub(in crate::session::store) leaf: Option<IndexId>,
-    pub(in crate::session::store) boundaries: HashSet<IndexId>,
-    pub(in crate::session::store) latest_compaction_start: Option<IndexId>,
-    pub(in crate::session::store) latest_compaction_marker: Option<IndexId>,
-    pub(in crate::session::store) file_size: u64,
+enum TrailingCursor {
+    Absent,
+    DetachedRoot,
+    Leaf(IndexId),
 }
 
-pub(in crate::session::store) fn scan_linear_session(
-    reader: &mut std::io::BufReader<std::fs::File>,
+/// Build the normal resume projection in a single sequential pass without
+/// retaining the transcript graph. Returns `None` when the selected lineage is
+/// not the physical event prefix; callers then use the general graph loader for
+/// branch semantics.
+pub(in crate::session::store) fn load_linear_session_index(
     path: &Path,
-    event_start: u64,
-) -> Result<Option<LinearScan>> {
-    use std::io::Seek;
+) -> Result<Option<LinearSessionIndex>> {
+    use std::io::{BufReader, Seek};
 
-    let mut count = 0usize;
-    let mut previous: Option<IndexId> = None;
-    let mut latest_cursor: Option<Option<IndexId>> = None;
-    let mut boundaries = HashSet::new();
-    let mut latest_compaction_start: Option<IndexId> = None;
-    let mut latest_compaction_marker: Option<IndexId> = None;
-    let mut linear = true;
+    let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    let Some((_start, event_start, header)) = read_jsonl_value::<Header, _>(&mut reader)? else {
+        return Err(Error::State(format!(
+            "session file has no header: {}",
+            path.display()
+        )));
+    };
+    if header.meta.version != SESSION_VERSION {
+        return Err(Error::State(format!(
+            "unsupported session version {} in {}",
+            header.meta.version,
+            path.display()
+        )));
+    }
+
+    let mut entries: Vec<SessionIndexEntry> = Vec::new();
+    let mut ids: Vec<IndexId> = Vec::new();
+    let mut latest_cursor = TrailingCursor::Absent;
+    let mut history_start = 0usize;
     let mut file_size = event_start;
     let mut line = Vec::with_capacity(4 * 1024);
+
     loop {
         let record_start = reader.stream_position()?;
-        let event = read_index_skeleton(reader, &mut line);
-        let Some((_line_start, line_end, skel)) = (match event {
+        let event = read_index_skeleton(&mut reader, &mut line);
+        let Some((line_start, line_end, skel)) = (match event {
             Ok(event) => event,
             Err(error) => {
-                if malformed_record_is_final(reader, record_start)? {
+                if malformed_record_is_final(&mut reader, record_start)? {
                     break;
                 }
                 return Err(Error::State(format!(
@@ -189,98 +201,28 @@ pub(in crate::session::store) fn scan_linear_session(
         file_size = line_end;
         let kind = skel.kind;
         if kind == IndexKind::Cursor {
-            latest_cursor = Some(skel.cursor_leaf);
+            latest_cursor = match skel.cursor_leaf {
+                Some(leaf) => TrailingCursor::Leaf(leaf),
+                None => TrailingCursor::DetachedRoot,
+            };
             continue;
         }
-        latest_cursor = None;
-        let id = skel.id;
-        let parent = skel.parent_id;
-        linear &= match (&parent, &previous) {
+        latest_cursor = TrailingCursor::Absent;
+        let linked = match (&skel.parent_id, ids.last()) {
             (None, None) => true,
             (Some(parent), Some(previous)) => parent == previous,
             _ => false,
         };
-        if !linear {
+        if !linked {
             return Ok(None);
         }
+        let position = entries.len();
         if kind == IndexKind::Compaction {
             let start = if skel.first_kept_entry_id.is_empty() {
-                id.clone()
-            } else {
-                boundaries.insert(skel.first_kept_entry_id.clone());
-                skel.first_kept_entry_id
-            };
-            latest_compaction_start = Some(start);
-            latest_compaction_marker = Some(id.clone());
-        }
-        previous = Some(id);
-        count = count.saturating_add(1);
-    }
-
-    let leaf = match latest_cursor {
-        Some(None) => None,
-        Some(Some(leaf)) if linear && previous.as_ref() == Some(&leaf) => Some(leaf),
-        None if linear => previous,
-        Some(Some(_)) | None => return Ok(None),
-    };
-    Ok(Some(LinearScan {
-        count,
-        leaf,
-        boundaries,
-        latest_compaction_start,
-        latest_compaction_marker,
-        file_size,
-    }))
-}
-
-pub(in crate::session::store) fn project_linear_session(
-    reader: &mut std::io::BufReader<std::fs::File>,
-    event_start: u64,
-    scan: LinearScan,
-) -> Result<(Vec<SessionIndexEntry>, usize, Vec<EventIndex>)> {
-    use std::io::{Seek, SeekFrom};
-
-    reader.seek(SeekFrom::Start(event_start))?;
-    let mut entries = Vec::with_capacity(scan.count);
-    let mut boundary_positions: HashMap<IndexId, usize> = scan
-        .boundaries
-        .into_iter()
-        .map(|id| (id, usize::MAX))
-        .collect();
-    let mut history_start = 0usize;
-    let mut compaction_suffix = Vec::new();
-    let mut retain_compaction_suffix = scan.latest_compaction_start.is_none();
-    let mut line = Vec::with_capacity(4 * 1024);
-    while reader.stream_position()? < scan.file_size {
-        let Some((line_start, line_end, skel)) = read_index_skeleton(reader, &mut line)? else {
-            break;
-        };
-        let kind = skel.kind;
-        if kind == IndexKind::Cursor {
-            continue;
-        }
-        let first_kept_entry_id = skel.first_kept_entry_id;
-        let id = skel.id;
-        let parent_id = skel.parent_id;
-        let position = entries.len();
-        if let Some(found) = boundary_positions.get_mut(&id) {
-            if *found == usize::MAX {
-                *found = position;
-            }
-        }
-        if scan.latest_compaction_start.as_ref() == Some(&id)
-            || scan.latest_compaction_marker.as_ref() == Some(&id)
-        {
-            retain_compaction_suffix = true;
-        }
-        if kind == IndexKind::Compaction {
-            let start = if first_kept_entry_id.is_empty() {
                 position
             } else {
-                boundary_positions
-                    .get(&first_kept_entry_id)
-                    .copied()
-                    .filter(|start| *start != usize::MAX && *start < position)
+                ids.iter()
+                    .position(|id| *id == skel.first_kept_entry_id)
                     .unwrap_or(position)
             };
             history_start = start;
@@ -296,65 +238,74 @@ pub(in crate::session::store) fn project_linear_session(
             kind,
             visible: true,
         });
-        if retain_compaction_suffix {
-            compaction_suffix.push(EventIndex {
-                id,
-                parent_id,
-                offset: line_start,
-                end_offset: line_end,
-                kind,
-            });
-        }
+        ids.push(skel.id);
     }
-    Ok((entries, history_start, compaction_suffix))
+
+    Ok(finish_linear_session_index(
+        header.meta,
+        entries,
+        ids,
+        latest_cursor,
+        history_start,
+        file_size,
+    ))
 }
 
-/// Build the normal resume projection without retaining the transcript graph.
-/// Returns `None` when the selected lineage is not the physical event prefix;
-/// callers then use the general graph loader for branch semantics.
-pub(in crate::session::store) fn load_linear_session_index(
-    path: &Path,
-) -> Result<Option<LinearSessionIndex>> {
-    use std::io::BufReader;
-
-    let mut reader = BufReader::new(std::fs::File::open(path)?);
-    let Some((_start, event_start, header)) = read_jsonl_value::<Header, _>(&mut reader)? else {
-        return Err(Error::State(format!(
-            "session file has no header: {}",
-            path.display()
-        )));
+fn finish_linear_session_index(
+    meta: SessionMeta,
+    entries: Vec<SessionIndexEntry>,
+    ids: Vec<IndexId>,
+    latest_cursor: TrailingCursor,
+    history_start: usize,
+    file_size: u64,
+) -> Option<LinearSessionIndex> {
+    let leaf = match latest_cursor {
+        TrailingCursor::DetachedRoot => {
+            return Some(LinearSessionIndex {
+                meta,
+                entries: Vec::new(),
+                file_size,
+                leaf_id: None,
+                history_start: 0,
+                compaction_suffix: Vec::new(),
+            });
+        }
+        TrailingCursor::Leaf(leaf) if ids.last() == Some(&leaf) => Some(leaf),
+        TrailingCursor::Absent => ids.last().cloned(),
+        TrailingCursor::Leaf(_) => return None,
     };
-    if header.meta.version != SESSION_VERSION {
-        return Err(Error::State(format!(
-            "unsupported session version {} in {}",
-            header.meta.version,
-            path.display()
-        )));
-    }
 
-    let Some(scan) = scan_linear_session(&mut reader, path, event_start)? else {
-        return Ok(None);
-    };
-    let file_size = scan.file_size;
-    let Some(leaf) = scan.leaf.clone() else {
-        return Ok(Some(LinearSessionIndex {
-            meta: header.meta,
+    let Some(leaf) = leaf else {
+        return Some(LinearSessionIndex {
+            meta,
             entries: Vec::new(),
             file_size,
             leaf_id: None,
             history_start: 0,
             compaction_suffix: Vec::new(),
-        }));
+        });
     };
-    let (entries, history_start, compaction_suffix) =
-        project_linear_session(&mut reader, event_start, scan)?;
 
-    Ok(Some(LinearSessionIndex {
-        meta: header.meta,
+    let compaction_suffix: Vec<EventIndex> = (history_start..entries.len())
+        .map(|idx| {
+            let entry = entries[idx];
+            EventIndex {
+                id: ids[idx].clone(),
+                parent_id: idx.checked_sub(1).map(|prev| ids[prev].clone()),
+                offset: entry.offset,
+                end_offset: entry.end_offset,
+                kind: entry.kind,
+            }
+        })
+        .collect();
+    drop(ids);
+
+    Some(LinearSessionIndex {
+        meta,
         entries,
         file_size,
         leaf_id: Some(leaf.to_event_id()),
         history_start,
         compaction_suffix,
-    }))
+    })
 }

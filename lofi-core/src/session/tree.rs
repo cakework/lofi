@@ -2,11 +2,10 @@
 //! index-walking (active path, hidden checkpoints, branch detection) and
 //! event-derived row labels so the TUI only maps rows onto widgets.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lofi_types::{ContentBlock, Role, SessionEventKind};
+use lofi_types::{ContentBlock, Role, SessionEvent, SessionEventKind};
 
 use super::store::{IndexKind, SessionCursor, TreeIndex};
 
@@ -32,8 +31,8 @@ pub struct TreeRow {
 struct TreeCtx<'a> {
     index: &'a TreeIndex,
     cursor: &'a SessionCursor,
-    native_tools: RefCell<HashMap<String, Vec<(String, String)>>>,
-    lazy_native_tools: bool,
+    preloaded_events: HashMap<u64, SessionEvent>,
+    preloaded_natives: HashMap<u64, (String, String, String)>,
     hydrate: bool,
     retain_prefill: bool,
     hydrate_only: Option<&'a HashSet<usize>>,
@@ -95,11 +94,21 @@ pub fn hydrate_tree_rows(
     if requested.is_empty() || cancelled() {
         return;
     }
+    let (preloaded_events, preloaded_natives) = preload_for_positions(
+        index,
+        cursor,
+        requested
+            .iter()
+            .map(|(_, skeleton)| skeleton.source_index as usize),
+    );
+    if cancelled() {
+        return;
+    }
     let ctx = TreeCtx {
         index,
         cursor,
-        native_tools: RefCell::new(HashMap::new()),
-        lazy_native_tools: true,
+        preloaded_events,
+        preloaded_natives,
         hydrate: true,
         retain_prefill: false,
         hydrate_only: None,
@@ -224,10 +233,17 @@ fn build_tree_rows_inner(
     retain_prefill: bool,
     hydrate_only: Option<&HashSet<usize>>,
 ) -> Vec<TreeRow> {
-    let native_tools = if hydrate && hydrate_only.is_none() {
-        build_native_tool_map(index, cursor)
+    let (preloaded_events, preloaded_natives) = if hydrate {
+        preload_for_positions(
+            index,
+            cursor,
+            (0..index.len()).filter(|&pos| {
+                is_tree_node(index.kind(pos))
+                    && hydrate_only.is_none_or(|sources| sources.contains(&pos))
+            }),
+        )
     } else {
-        HashMap::new()
+        (HashMap::new(), HashMap::new())
     };
     let active_path = index.active_path(leaf).unwrap_or_default();
     let mut active_set = PositionSet::with_len(index.len());
@@ -248,8 +264,8 @@ fn build_tree_rows_inner(
     let ctx = TreeCtx {
         index,
         cursor,
-        native_tools: RefCell::new(native_tools),
-        lazy_native_tools: false,
+        preloaded_events,
+        preloaded_natives,
         hydrate,
         retain_prefill,
         hydrate_only,
@@ -298,22 +314,97 @@ fn build_tree_rows_inner(
     out
 }
 
-fn build_native_tool_map(
+type PreloadedTreeData = (
+    HashMap<u64, SessionEvent>,
+    HashMap<u64, (String, String, String)>,
+);
+
+fn preload_for_positions(
     index: &TreeIndex,
     cursor: &SessionCursor,
-) -> HashMap<String, Vec<(String, String)>> {
-    let offsets: Vec<u64> = (0..index.len())
-        .filter(|&position| index.kind(position) == IndexKind::NativeTool)
-        .map(|position| index.offset(position))
-        .collect();
-    let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    let Ok(summaries) = cursor.native_tool_summaries(&offsets) else {
-        return map;
-    };
-    for (parent, name, args) in summaries {
-        map.entry(parent).or_default().push((name, one_line(&args)));
+    positions: impl Iterator<Item = usize>,
+) -> PreloadedTreeData {
+    let mut display_offsets: Vec<u64> = Vec::new();
+    let mut native_offsets: Vec<u64> = Vec::new();
+    let mut visited = HashSet::new();
+    for position in positions {
+        if position >= index.len() {
+            continue;
+        }
+        match index.kind(position) {
+            IndexKind::UserPrompt | IndexKind::TurnFailed | IndexKind::Compaction => {
+                display_offsets.push(index.offset(position));
+            }
+            IndexKind::TurnEnd | IndexKind::TurnCancelled => {
+                visited.clear();
+                let mut current = position;
+                while let Some(parent) = index.parent(current) {
+                    if !visited.insert(current) {
+                        break;
+                    }
+                    match index.kind(parent) {
+                        IndexKind::UserPrompt => break,
+                        IndexKind::AssistantMessage => {
+                            display_offsets.push(index.offset(parent));
+                        }
+                        _ => {}
+                    }
+                    current = parent;
+                }
+            }
+            IndexKind::ToolResult => {
+                display_offsets.push(index.offset(position));
+                let mut current = index.parent(position);
+                for _ in 0..index.len() {
+                    let Some(parent) = current else {
+                        break;
+                    };
+                    match index.kind(parent) {
+                        IndexKind::NativeTool => native_offsets.push(index.offset(parent)),
+                        IndexKind::AssistantMessage => {
+                            display_offsets.push(index.offset(parent));
+                            break;
+                        }
+                        IndexKind::UserPrompt => break,
+                        _ => {}
+                    }
+                    current = index.parent(parent);
+                }
+            }
+            _ => {}
+        }
     }
-    map
+    display_offsets.sort_unstable();
+    display_offsets.dedup();
+    native_offsets.sort_unstable();
+    native_offsets.dedup();
+
+    let mut preloaded_events = HashMap::with_capacity(display_offsets.len());
+    if !display_offsets.is_empty() {
+        let mut slot = 0usize;
+        if cursor
+            .visit_display_events(&display_offsets, |event| {
+                if let Some(&offset) = display_offsets.get(slot) {
+                    preloaded_events.insert(offset, event);
+                }
+                slot += 1;
+                Ok(())
+            })
+            .is_err()
+        {
+            preloaded_events.clear();
+        }
+    }
+
+    let mut preloaded_natives = HashMap::with_capacity(native_offsets.len());
+    if !native_offsets.is_empty() {
+        if let Ok(summaries) = cursor.native_tool_summaries(&native_offsets) {
+            for (&offset, (parent, name, args)) in native_offsets.iter().zip(summaries) {
+                preloaded_natives.insert(offset, (parent, name, one_line(&args)));
+            }
+        }
+    }
+    (preloaded_events, preloaded_natives)
 }
 
 /// Summaries for the nested calls recorded under `tool_use_id`, in the
@@ -482,26 +573,34 @@ fn skeleton_tree_row(index: &TreeIndex, position: usize) -> Option<TreeRowFields
 }
 
 fn tool_result_tree_row(ctx: &TreeCtx, position: usize) -> TreeRowFields {
-    let row = load_tool_row(position, ctx.index, ctx.cursor);
+    let row = load_tool_row_ctx(position, ctx);
     let marker = if row.is_error { "\u{2717} " } else { "" };
     let label = if row.name == "exec" {
-        let mut tools = ctx.native_tools.borrow().get(&row.tool_use_id).cloned();
-        if tools.is_none() && ctx.lazy_native_tools {
-            let loaded = load_native_tool_summaries(ctx.cursor, &row.natives, &row.tool_use_id);
-            ctx.native_tools
-                .borrow_mut()
-                .insert(row.tool_use_id.clone(), loaded.clone());
-            tools = Some(loaded);
-        }
-        if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+        let tools = if row.natives.is_empty() {
+            Vec::new()
+        } else if row
+            .natives
+            .iter()
+            .all(|offset| ctx.preloaded_natives.contains_key(offset))
+        {
+            row.natives
+                .iter()
+                .filter_map(|offset| ctx.preloaded_natives.get(offset))
+                .filter(|(parent, _, _)| parent == &row.tool_use_id)
+                .map(|(_, name, args)| (name.clone(), args.clone()))
+                .collect()
+        } else {
+            load_native_tool_summaries(ctx.cursor, &row.natives, &row.tool_use_id)
+        };
+        if tools.is_empty() {
+            format!("exec: {marker}{}", one_line(&row.content))
+        } else {
             let summary = tools
                 .iter()
                 .map(|(name, args)| format!("{name} {args}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("exec: {marker}{}", one_line(&summary))
-        } else {
-            format!("exec: {marker}{}", one_line(&row.content))
         }
     } else {
         format!("tool: {marker}{}: {}", row.name, one_line(&row.content))
@@ -510,7 +609,20 @@ fn tool_result_tree_row(ctx: &TreeCtx, position: usize) -> TreeRowFields {
 }
 
 fn compaction_tree_row(ctx: &TreeCtx, position: usize) -> TreeRowFields {
-    let (summarized, kept, _, _) = load_compaction_details(ctx.cursor, ctx.index.offset(position));
+    let offset = ctx.index.offset(position);
+    let (summarized, kept) = ctx
+        .preloaded_events
+        .get(&offset)
+        .and_then(|ev| match ev.kind {
+            SessionEventKind::Compaction {
+                summarized, kept, ..
+            } => Some((summarized, kept)),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            let (s, k, _, _) = load_compaction_details(ctx.cursor, offset);
+            (s, k)
+        });
     // The index already resolved which event this checkpoint keeps; looking
     // it up here would rescan the whole tree once per visible marker.
     let checkpoint = ctx
@@ -547,7 +659,7 @@ fn hydrated_tree_row(ctx: &TreeCtx, position: usize) -> Option<TreeRowFields> {
     let index = ctx.index;
     match index.kind(position) {
         IndexKind::UserPrompt => {
-            let prompt = load_prompt_text(ctx.cursor, index.offset(position));
+            let prompt = load_prompt_text_ctx(ctx, index.offset(position));
             let prefill = if ctx.retain_prefill {
                 prompt.clone()
             } else {
@@ -561,7 +673,7 @@ fn hydrated_tree_row(ctx: &TreeCtx, position: usize) -> Option<TreeRowFields> {
         }
         IndexKind::ToolResult => Some(tool_result_tree_row(ctx, position)),
         IndexKind::TurnEnd => {
-            let preview = load_assistant_preview(position, index, ctx.cursor);
+            let preview = load_assistant_preview_ctx(position, ctx);
             let preview = if preview.is_empty() {
                 "(turn end)".to_string()
             } else {
@@ -576,13 +688,13 @@ fn hydrated_tree_row(ctx: &TreeCtx, position: usize) -> Option<TreeRowFields> {
         IndexKind::TurnFailed => Some((
             format!(
                 "agent: {} (failed)",
-                one_line(&load_failed_error(ctx.cursor, index.offset(position)))
+                one_line(&load_failed_error_ctx(ctx, index.offset(position)))
             ),
             String::new(),
             parent_branch_point(index, position),
         )),
         IndexKind::TurnCancelled => {
-            let preview = load_assistant_preview(position, index, ctx.cursor);
+            let preview = load_assistant_preview_ctx(position, ctx);
             let preview = if preview.is_empty() {
                 "(cancelled)".to_string()
             } else {
@@ -669,6 +781,34 @@ pub fn find_turn_outcome(start: usize, index: &TreeIndex) -> Option<usize> {
     }
 }
 
+fn with_ctx_event<R>(ctx: &TreeCtx, offset: u64, f: impl FnOnce(&SessionEvent) -> R) -> Option<R> {
+    if let Some(ev) = ctx.preloaded_events.get(&offset) {
+        return Some(f(ev));
+    }
+    ctx.cursor.display_event_at(offset).ok().as_ref().map(f)
+}
+
+fn load_assistant_preview_ctx(turn_end: usize, ctx: &TreeCtx) -> String {
+    let mut current = turn_end;
+    let mut visited = HashSet::new();
+    while let Some(parent) = ctx.index.parent(current) {
+        if !visited.insert(current) {
+            break;
+        }
+        match ctx.index.kind(parent) {
+            IndexKind::UserPrompt => break,
+            IndexKind::AssistantMessage => {
+                if let Some(text) = load_assistant_text_ctx(ctx, ctx.index.offset(parent)) {
+                    return one_line(&text);
+                }
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    String::new()
+}
+
 #[must_use]
 pub fn load_assistant_preview(
     turn_end: usize,
@@ -695,12 +835,8 @@ pub fn load_assistant_preview(
     String::new()
 }
 
-#[must_use]
-pub fn load_prompt_text(cursor: &SessionCursor, offset: u64) -> String {
-    let Ok(ev) = cursor.display_event_at(offset) else {
-        return String::new();
-    };
-    if let SessionEventKind::Message(message) = ev.kind {
+fn prompt_text_from_event(ev: &SessionEvent) -> String {
+    if let SessionEventKind::Message(message) = &ev.kind {
         if message.role == Role::User {
             return message
                 .blocks
@@ -715,6 +851,20 @@ pub fn load_prompt_text(cursor: &SessionCursor, offset: u64) -> String {
     String::new()
 }
 
+fn load_prompt_text_ctx(ctx: &TreeCtx, offset: u64) -> String {
+    with_ctx_event(ctx, offset, prompt_text_from_event).unwrap_or_default()
+}
+
+#[must_use]
+pub fn load_prompt_text(cursor: &SessionCursor, offset: u64) -> String {
+    cursor
+        .display_event_at(offset)
+        .ok()
+        .as_ref()
+        .map(prompt_text_from_event)
+        .unwrap_or_default()
+}
+
 struct ToolRow {
     /// Name of the call that issued the result, or `?` when the nearest
     /// assistant message in the same turn has no matching `tool_use` block.
@@ -727,7 +877,7 @@ struct ToolRow {
     natives: Vec<u64>,
 }
 
-fn load_tool_row(position: usize, index: &TreeIndex, cursor: &SessionCursor) -> ToolRow {
+fn load_tool_row_ctx(position: usize, ctx: &TreeCtx) -> ToolRow {
     let mut row = ToolRow {
         name: String::new(),
         tool_use_id: String::new(),
@@ -735,26 +885,26 @@ fn load_tool_row(position: usize, index: &TreeIndex, cursor: &SessionCursor) -> 
         is_error: false,
         natives: Vec::new(),
     };
-    let Ok(event) = cursor.display_event_at(index.offset(position)) else {
-        return row;
-    };
-    let SessionEventKind::Message(message) = event.kind else {
-        return row;
-    };
     let Some((tool_use_id, content, is_error)) =
-        message.blocks.iter().find_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-                ..
-            } => Some((tool_use_id.clone(), content.clone(), *is_error)),
-            _ => None,
+        with_ctx_event(ctx, ctx.index.offset(position), |event| {
+            let SessionEventKind::Message(message) = &event.kind else {
+                return None;
+            };
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.clone(), content.clone(), *is_error)),
+                _ => None,
+            })
         })
+        .flatten()
     else {
         return row;
     };
-    let issuing = issuing_call(position, index, cursor, &tool_use_id);
+    let issuing = issuing_call_ctx(position, ctx, &tool_use_id);
     row.name = issuing.name.unwrap_or_else(|| "?".to_string());
     row.tool_use_id = tool_use_id;
     row.content = content;
@@ -773,12 +923,8 @@ struct IssuingCall {
 /// assistant message that issued the call. Walk to the nearest assistant
 /// message, which the recorder writes directly above them, and stop at the
 /// turn start so a result never borrows a name from an earlier turn.
-fn issuing_call(
-    position: usize,
-    index: &TreeIndex,
-    cursor: &SessionCursor,
-    tool_use_id: &str,
-) -> IssuingCall {
+fn issuing_call_ctx(position: usize, ctx: &TreeCtx, tool_use_id: &str) -> IssuingCall {
+    let index = ctx.index;
     let mut natives = Vec::new();
     let mut name = None;
     let mut current = index.parent(position);
@@ -789,7 +935,18 @@ fn issuing_call(
         match index.kind(parent) {
             IndexKind::NativeTool => natives.push(index.offset(parent)),
             IndexKind::AssistantMessage => {
-                name = tool_use_name(cursor, index.offset(parent), tool_use_id);
+                name = with_ctx_event(ctx, index.offset(parent), |event| {
+                    let SessionEventKind::Message(message) = &event.kind else {
+                        return None;
+                    };
+                    message.blocks.iter().find_map(|block| match block {
+                        ContentBlock::ToolUse { id, name, .. } if id == tool_use_id => {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten();
                 break;
             }
             IndexKind::UserPrompt => break,
@@ -801,21 +958,8 @@ fn issuing_call(
     IssuingCall { name, natives }
 }
 
-fn tool_use_name(cursor: &SessionCursor, offset: u64, tool_use_id: &str) -> Option<String> {
-    let event = cursor.display_event_at(offset).ok()?;
-    let SessionEventKind::Message(message) = event.kind else {
-        return None;
-    };
-    message.blocks.iter().find_map(|block| match block {
-        ContentBlock::ToolUse { id, name, .. } if id == tool_use_id => Some(name.clone()),
-        _ => None,
-    })
-}
-
-#[must_use]
-pub fn load_assistant_text(cursor: &SessionCursor, offset: u64) -> Option<String> {
-    let ev = cursor.display_event_at(offset).ok()?;
-    let SessionEventKind::Message(message) = ev.kind else {
+fn assistant_text_from_event(ev: &SessionEvent) -> Option<String> {
+    let SessionEventKind::Message(message) = &ev.kind else {
         return None;
     };
     if message.role != Role::Assistant {
@@ -827,16 +971,39 @@ pub fn load_assistant_text(cursor: &SessionCursor, offset: u64) -> Option<String
     })
 }
 
+fn load_assistant_text_ctx(ctx: &TreeCtx, offset: u64) -> Option<String> {
+    with_ctx_event(ctx, offset, assistant_text_from_event).flatten()
+}
+
 #[must_use]
-pub fn load_failed_error(cursor: &SessionCursor, offset: u64) -> String {
-    let Ok(ev) = cursor.display_event_at(offset) else {
-        return String::new();
-    };
-    if let SessionEventKind::TurnFailed { error, .. } = ev.kind {
-        error
+pub fn load_assistant_text(cursor: &SessionCursor, offset: u64) -> Option<String> {
+    cursor
+        .display_event_at(offset)
+        .ok()
+        .as_ref()
+        .and_then(assistant_text_from_event)
+}
+
+fn failed_error_from_event(ev: &SessionEvent) -> String {
+    if let SessionEventKind::TurnFailed { error, .. } = &ev.kind {
+        error.clone()
     } else {
         String::new()
     }
+}
+
+fn load_failed_error_ctx(ctx: &TreeCtx, offset: u64) -> String {
+    with_ctx_event(ctx, offset, failed_error_from_event).unwrap_or_default()
+}
+
+#[must_use]
+pub fn load_failed_error(cursor: &SessionCursor, offset: u64) -> String {
+    cursor
+        .display_event_at(offset)
+        .ok()
+        .as_ref()
+        .map(failed_error_from_event)
+        .unwrap_or_default()
 }
 
 fn load_compaction_details(cursor: &SessionCursor, offset: u64) -> (usize, usize, bool, String) {
@@ -846,12 +1013,29 @@ fn load_compaction_details(cursor: &SessionCursor, offset: u64) -> (usize, usize
 #[must_use]
 pub fn one_line(s: &str) -> String {
     const MAX: usize = 60;
-    let collapsed = s.replace('\n', " \u{23ce} ");
-    if collapsed.chars().count() <= MAX {
-        collapsed
-    } else {
-        let mut out: String = collapsed.chars().take(MAX).collect();
-        out.push('\u{2026}');
-        out
+    if s.len() <= MAX && !s.contains('\n') {
+        return s.to_string();
     }
+    let mut out = String::with_capacity(MAX + 8);
+    let mut count = 0usize;
+    for ch in s.chars() {
+        if ch == '\n' {
+            for rep in [' ', '\u{23ce}', ' '] {
+                if count == MAX {
+                    out.push('\u{2026}');
+                    return out;
+                }
+                out.push(rep);
+                count += 1;
+            }
+        } else {
+            if count == MAX {
+                out.push('\u{2026}');
+                return out;
+            }
+            out.push(ch);
+            count += 1;
+        }
+    }
+    out
 }

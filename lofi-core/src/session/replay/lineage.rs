@@ -215,9 +215,17 @@ pub(crate) fn job_lifecycle_ids_at(
     cursor: &SessionCursor,
     index: &[SessionIndexEntry],
 ) -> lofi_error::Result<JobLifecycleIds> {
+    let offsets: Vec<u64> = index
+        .iter()
+        .filter(|e| e.kind == IndexKind::JobLifecycle)
+        .map(|e| e.offset)
+        .collect();
     let mut lifecycle = Lifecycle::default();
-    for entry in index.iter().filter(|e| e.kind == IndexKind::JobLifecycle) {
-        lifecycle.track(&cursor.event_at(entry.offset)?.kind);
+    if !offsets.is_empty() {
+        cursor.visit_events(&offsets, |event| {
+            lifecycle.track(&event.kind);
+            Ok(())
+        })?;
     }
     let (started, outstanding) = lifecycle.into_parts();
     Ok(JobLifecycleIds {

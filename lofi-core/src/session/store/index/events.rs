@@ -140,30 +140,6 @@ pub(in crate::session::store) fn load_display_event_range(
     load_display_events_at(path, &offsets)
 }
 
-pub(in crate::session::store) fn compaction_index_suffix(
-    path: &Path,
-    lineage: &[EventIndex],
-) -> Result<Vec<EventIndex>> {
-    let Some(marker_pos) = lineage
-        .iter()
-        .rposition(|event| event.kind == IndexKind::Compaction)
-    else {
-        return Ok(lineage.to_vec());
-    };
-    let marker = load_event_at(path, lineage[marker_pos].offset)?;
-    let start = match marker.kind {
-        SessionEventKind::Compaction {
-            first_kept_entry_id,
-            ..
-        } if !first_kept_entry_id.is_empty() => lineage[..marker_pos]
-            .iter()
-            .position(|event| event.id.matches(&first_kept_entry_id))
-            .unwrap_or(marker_pos),
-        _ => marker_pos,
-    };
-    Ok(lineage[start..].to_vec())
-}
-
 /// Materialize only the lineage suffix needed by compaction. Once a
 /// compaction marker exists, everything before its checkpointed kept tail is
 /// represented by the marker summary and must not be deserialized again.
@@ -213,35 +189,22 @@ pub(in crate::session::store) fn lineage_indices(
     index: &[EventIndex],
     leaf_id: Option<&str>,
 ) -> Result<Vec<usize>> {
-    use std::collections::HashMap;
-
-    if index.is_empty() {
-        return Ok(Vec::new());
-    }
     let by_id: HashMap<&IndexId, usize> = index
         .iter()
         .enumerate()
         .filter(|(_, event)| event.kind != IndexKind::Cursor)
         .map(|(i, event)| (&event.id, i))
         .collect();
-    let leaf = leaf_id.map(|id| IndexId::parse(id.to_string()));
-    let mut current = leaf.as_ref().and_then(|id| by_id.get(id).copied());
-    let mut lineage = Vec::new();
-    while let Some(i) = current {
-        lineage.push(i);
-        if lineage.len() > index.len() {
-            return Err(Error::State("cycle in session event lineage".to_string()));
-        }
-        current = index[i]
-            .parent_id
-            .as_ref()
-            .and_then(|id| by_id.get(id).copied());
+    let selected = leaf_id.map_or_else(Vec::new, |id| {
+        crate::session::store::lineage_path(index, &by_id, id)
+    });
+    if selected.len() > index.len() {
+        return Err(Error::State("cycle in session event lineage".to_string()));
     }
-    if leaf_id.is_some() && lineage.is_empty() {
+    if leaf_id.is_some() && selected.is_empty() {
         return Err(Error::State("session branch leaf not found".to_string()));
     }
-    lineage.reverse();
-    Ok(lineage)
+    Ok(selected)
 }
 
 /// # Errors

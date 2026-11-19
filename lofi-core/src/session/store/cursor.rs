@@ -7,17 +7,18 @@ use lofi_types::{Message, PromptKind, SessionEvent, SessionEventKind};
 use serde::Deserialize;
 
 use super::append::{
-    append_compaction_from, append_prepared_events, append_records, AppendParent, CompactionCounts,
+    append_compaction_from, append_prepared_events_locked, append_records_locked,
+    open_locked_transcript, AppendParent, CompactionCounts,
 };
 use super::index::{
-    compaction_index_suffix, load_compaction_path, load_display_event_range,
-    load_display_events_at, load_event_at, load_event_range, load_event_values, load_events_at,
-    load_index, load_index_range, load_indexed_path, load_linear_session_index, load_tree_index,
+    lineage_indices, load_compaction_path, load_display_event_range, load_display_events_at,
+    load_event_at, load_event_range, load_event_values, load_events_at, load_index,
+    load_index_with_compactions, load_indexed_path, load_linear_session_index, load_tree_index,
     session_index_from_lineage, visit_display_events, visit_events,
 };
 use super::{
-    short_id, EventIndex, IndexId, IndexKind, RecoveryMessage, SessionIndexEntry, SessionMeta,
-    TreeIndex,
+    index_kind_for_event, short_id, EventIndex, IndexId, IndexKind, RecoveryMessage,
+    SessionIndexEntry, SessionMeta, TreeIndex,
 };
 
 #[derive(Debug)]
@@ -120,7 +121,7 @@ impl SessionCursor {
             ));
         }
 
-        let (meta, index, file_size) = load_index(&path)?;
+        let (meta, index, compactions, file_size) = load_index_with_compactions(&path)?;
         let cursor_record = index
             .iter()
             .rev()
@@ -134,9 +135,9 @@ impl SessionCursor {
                 .map(|event| event.id.to_event_id()),
         };
         let selected = indexed_lineage(index, leaf.as_deref())?;
-        let (resume_index, history_start) = session_index_from_lineage(&path, &selected)?;
+        let (resume_index, history_start) = session_index_from_lineage(&selected, &compactions);
         let cursor = Self::new(path, leaf);
-        *cursor.lock_compaction_index() = Some(compaction_index_suffix(&cursor.path, &selected)?);
+        *cursor.lock_compaction_index() = Some(selected[history_start..].to_vec());
         drop(selected);
         lofi_types::memory::release_freed_memory();
         Ok((
@@ -229,13 +230,13 @@ impl SessionCursor {
     /// head is absent/cyclic.
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
         let leaf = self.lock_leaf();
-        let (meta, index, file_size) = load_index(&self.path)?;
+        let (meta, index, compactions, file_size) = load_index_with_compactions(&self.path)?;
         let contiguous = leaf
             .as_deref()
             .is_some_and(|leaf| linear_lineage_end(&index, leaf).is_some());
         let lineage = indexed_lineage(index, leaf.as_deref())?;
-        let (index, history_start) = session_index_from_lineage(&self.path, &lineage)?;
-        *self.lock_compaction_index() = Some(compaction_index_suffix(&self.path, &lineage)?);
+        let (index, history_start) = session_index_from_lineage(&lineage, &compactions);
+        *self.lock_compaction_index() = Some(lineage[history_start..].to_vec());
         drop(lineage);
         lofi_types::memory::release_freed_memory();
         Ok(SessionSnapshot {
@@ -505,13 +506,15 @@ impl SessionCursor {
             .map(|entry| entry.offset)
             .collect();
         let mut finished = std::collections::HashSet::new();
-        for offset in offsets {
-            let event = load_event_at(&self.path, offset)?;
-            if let SessionEventKind::JobFinished { job_id } = event.kind {
-                if job_ids.contains(&job_id) {
-                    finished.insert(job_id);
+        if !offsets.is_empty() {
+            visit_events(&self.path, &offsets, |event| {
+                if let SessionEventKind::JobFinished { job_id } = event.kind {
+                    if job_ids.contains(&job_id) {
+                        finished.insert(job_id);
+                    }
                 }
-            }
+                Ok(())
+            })?;
         }
         Ok(finished)
     }
@@ -547,9 +550,10 @@ impl SessionCursor {
         if let Some(index) = self.lock_compaction_index().as_ref() {
             return count_in(index);
         }
-        let (_meta, index, _size) = load_index(&self.path)?;
+        let (_meta, index, compactions, _size) = load_index_with_compactions(&self.path)?;
         let index = indexed_lineage(index, leaf.as_deref())?;
-        let suffix = compaction_index_suffix(&self.path, &index)?;
+        let (_, history_start) = session_index_from_lineage(&index, &compactions);
+        let suffix = index[history_start..].to_vec();
         let count = count_in(&suffix)?;
         *self.lock_compaction_index() = Some(suffix);
         Ok(count)
@@ -562,9 +566,10 @@ impl SessionCursor {
         if let Some(index) = self.lock_compaction_index().as_ref() {
             return load_compaction_path(&self.path, index, leaf.as_deref());
         }
-        let (_meta, index, _size) = load_index(&self.path)?;
+        let (_meta, index, compactions, _size) = load_index_with_compactions(&self.path)?;
         let index = indexed_lineage(index, leaf.as_deref())?;
-        let suffix = compaction_index_suffix(&self.path, &index)?;
+        let (_, history_start) = session_index_from_lineage(&index, &compactions);
+        let suffix = index[history_start..].to_vec();
         let events = load_compaction_path(&self.path, &suffix, leaf.as_deref())?;
         *self.lock_compaction_index() = Some(suffix);
         Ok(events)
@@ -603,14 +608,11 @@ impl SessionCursor {
         events: &mut [SessionEvent],
         leaf: &mut Option<String>,
     ) -> Result<(u64, u64)> {
-        let (start, end, next) = append_cursor_events(&self.path, events, leaf.as_deref())?;
-        let appended = load_index_range(&self.path, start, end).ok();
+        let (start, end, next, appended) =
+            append_cursor_events(&self.path, events, leaf.as_deref())?;
         *leaf = next;
-        let mut index = self.lock_compaction_index();
-        match (index.as_mut(), appended) {
-            (Some(index), Some(appended)) => index.extend(appended),
-            (_, None) => *index = None,
-            (None, Some(_)) => {}
+        if let Some(index) = self.lock_compaction_index().as_mut() {
+            index.extend(appended);
         }
         Ok((start, end))
     }
@@ -710,7 +712,7 @@ impl SessionCursor {
         counts: CompactionCounts,
     ) -> Result<(u64, u64)> {
         let mut leaf = self.lock_leaf();
-        let (start, end, marker_id) = append_compaction_from(
+        let (start, end, marker_id, suffix) = append_compaction_from(
             &self.path,
             kept_messages,
             AppendParent::Explicit(leaf.as_deref()),
@@ -718,9 +720,8 @@ impl SessionCursor {
             summarized_range,
             counts,
         )?;
-        let suffix = load_index_range(&self.path, start, end).ok();
         *leaf = Some(marker_id);
-        *self.lock_compaction_index() = suffix;
+        *self.lock_compaction_index() = Some(suffix);
         Ok((start, end))
     }
 
@@ -751,7 +752,7 @@ pub fn lineage_path(
     by_id: &std::collections::HashMap<&IndexId, usize>,
     leaf_id: &str,
 ) -> Vec<usize> {
-    let leaf = IndexId::parse(leaf_id.to_string());
+    let leaf = IndexId::borrow(leaf_id);
     let mut current = by_id.get(&leaf).copied();
     let mut selected = Vec::new();
     // A cyclic index would otherwise loop forever; cap the walk at the number
@@ -768,24 +769,6 @@ pub fn lineage_path(
     }
     selected.reverse();
     selected
-}
-
-pub(super) fn lineage_indices(index: &[EventIndex], leaf_id: Option<&str>) -> Result<Vec<usize>> {
-    use std::collections::HashMap;
-    let by_id: HashMap<&IndexId, usize> = index
-        .iter()
-        .enumerate()
-        .filter(|(_, event)| event.kind != IndexKind::Cursor)
-        .map(|(i, event)| (&event.id, i))
-        .collect();
-    let selected = leaf_id.map_or_else(Vec::new, |id| lineage_path(index, &by_id, id));
-    if selected.len() > index.len() {
-        return Err(Error::State("cycle in session event lineage".to_string()));
-    }
-    if leaf_id.is_some() && selected.is_empty() {
-        return Err(Error::State("session branch leaf not found".to_string()));
-    }
-    Ok(selected)
 }
 
 fn indexed_lineage(mut index: Vec<EventIndex>, leaf_id: Option<&str>) -> Result<Vec<EventIndex>> {
@@ -854,13 +837,7 @@ fn cursor_event(leaf_id: Option<&str>) -> SessionEvent {
 }
 
 fn persist_cursor(path: &Path, leaf_id: Option<&str>, validate: bool) -> Result<()> {
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    lock.lock()?;
+    let mut lock = open_locked_transcript(path)?;
     if validate
         && leaf_id.is_some_and(|id| {
             load_index(path).map_or(true, |(_, index, _)| {
@@ -872,7 +849,7 @@ fn persist_cursor(path: &Path, leaf_id: Option<&str>, validate: bool) -> Result<
     {
         return Err(Error::State("session branch leaf not found".to_string()));
     }
-    append_prepared_events(path, &[cursor_event(leaf_id)])?;
+    append_prepared_events_locked(&mut lock, &[cursor_event(leaf_id)])?;
     Ok(())
 }
 
@@ -880,18 +857,12 @@ fn append_cursor_events(
     path: &Path,
     events: &mut [SessionEvent],
     parent: Option<&str>,
-) -> Result<(u64, u64, Option<String>)> {
+) -> Result<(u64, u64, Option<String>, Vec<EventIndex>)> {
     if events.is_empty() {
         let len = std::fs::metadata(path).map_or(0, |m| m.len());
-        return Ok((len, len, parent.map(str::to_string)));
+        return Ok((len, len, parent.map(str::to_string), Vec::new()));
     }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    lock.lock()?;
+    let mut lock = open_locked_transcript(path)?;
     let mut next = parent.map(str::to_string);
     for event in events.iter_mut() {
         event.id = short_id();
@@ -900,8 +871,21 @@ fn append_cursor_events(
         }
         next = Some(event.id.clone());
     }
-    let (byte_start, end) = append_prepared_events(path, events)?;
-    Ok((byte_start, end, next))
+    let committed = append_prepared_events_locked(&mut lock, events)?;
+    let mut appended = Vec::with_capacity(committed.spans.len());
+    for (event, &(offset, end_offset)) in events.iter().zip(&committed.spans) {
+        if matches!(event.kind, SessionEventKind::Cursor { .. }) {
+            continue;
+        }
+        appended.push(EventIndex {
+            id: IndexId::borrow(&event.id),
+            parent_id: event.parent_id.as_deref().map(IndexId::borrow),
+            offset,
+            end_offset,
+            kind: index_kind_for_event(&event.kind),
+        });
+    }
+    Ok((committed.start, committed.end, next, appended))
 }
 
 /// Append `events` as a side branch of `parent`, leaving the selected head
@@ -918,13 +902,7 @@ fn append_side_branch(
     if events.is_empty() {
         return Ok(());
     }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    lock.lock()?;
+    let mut lock = open_locked_transcript(path)?;
     let mut next = Some(parent.to_owned());
     for event in events.iter_mut() {
         event.id = short_id();
@@ -932,11 +910,12 @@ fn append_side_branch(
         next = Some(event.id.clone());
     }
     let cursor = cursor_event(leaf);
-    append_records(path, |writer| {
+    append_records_locked(&mut lock, |writer| {
         for event in events.iter() {
             writer.record(event)?;
         }
-        writer.record(&cursor)
+        writer.record(&cursor)?;
+        Ok(())
     })?;
     Ok(())
 }

@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used)]
-
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -529,7 +527,9 @@ fn search_entries(entries: &[RecallEntry], messages: &[&Message], query: &str) -
     }
 
     if looks_like_regex(raw_query) {
-        let re = safe_regex(raw_query);
+        let Some(re) = safe_regex(raw_query) else {
+            return Vec::new();
+        };
         let mut hits: Vec<SearchHit> = Vec::new();
         for (index, message) in messages.iter().enumerate() {
             if message_matches(message, |text| re.is_match(text)) {
@@ -554,8 +554,11 @@ fn search_entries(entries: &[RecallEntry], messages: &[&Message], query: &str) -
     }
     let patterns: Vec<regex::Regex> = terms
         .iter()
-        .map(|term| regex::Regex::new(&regex::escape(term)).unwrap())
+        .filter_map(|term| regex::Regex::new(&regex::escape(term)).ok())
         .collect();
+    if patterns.is_empty() {
+        return Vec::new();
+    }
 
     let n = messages.len();
     let lengths: Vec<usize> = messages
@@ -563,7 +566,7 @@ fn search_entries(entries: &[RecallEntry], messages: &[&Message], query: &str) -
         .map(|message| message_word_count(message))
         .collect();
     let avg_dl = lengths.iter().sum::<usize>() as f64 / n.max(1) as f64;
-    let mut df: Vec<usize> = vec![0; terms.len()];
+    let mut df: Vec<usize> = vec![0; patterns.len()];
     for message in messages {
         for (index, pattern) in patterns.iter().enumerate() {
             if message_matches(message, |text| pattern.is_match(text)) {
@@ -572,8 +575,8 @@ fn search_entries(entries: &[RecallEntry], messages: &[&Message], query: &str) -
         }
     }
 
-    let min_match = if terms.len() >= 3 { 2 } else { 1 };
-    let mut scored: Vec<(f64, SearchHit)> = Vec::new();
+    let min_match = if patterns.len() >= 3 { 2 } else { 1 };
+    let mut scored: Vec<(f64, usize, usize)> = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         let mut match_count = 0;
         let mut score = 0.0;
@@ -592,33 +595,17 @@ fn search_entries(entries: &[RecallEntry], messages: &[&Message], query: &str) -
                 (tf as f64 * (k + 1.0)) / (tf as f64 + k * (1.0 - b + b * dl / avg_dl.max(1.0)));
             score += idf * tfn;
         }
-        if match_count < min_match {
-            continue;
+        if match_count >= min_match {
+            scored.push((score, index, match_count));
         }
-        let snippet_re = regex::Regex::new(
-            &patterns
-                .iter()
-                .map(regex::Regex::as_str)
-                .collect::<Vec<_>>()
-                .join("|"),
-        )
-        .unwrap();
-        scored.push((
-            score,
-            SearchHit {
-                entry: entries[index].clone(),
-                snippet: message_snippet(message, &snippet_re),
-                match_count,
-            },
-        ));
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    if scored.len() > 1 && terms.len() >= 2 {
+    if scored.len() > 1 && patterns.len() >= 2 {
         let top = scored[0].0;
         if top > 0.0 {
             let threshold = top * 0.1;
-            if let Some(cut) = scored.iter().position(|(score, _)| *score < threshold) {
+            if let Some(cut) = scored.iter().position(|(score, _, _)| *score < threshold) {
                 scored.truncate(cut);
             }
         }
@@ -626,7 +613,24 @@ fn search_entries(entries: &[RecallEntry], messages: &[&Message], query: &str) -
     if scored.len() > MAX_SEARCH_RESULTS {
         scored.truncate(MAX_SEARCH_RESULTS);
     }
-    scored.into_iter().map(|(_, hit)| hit).collect()
+    let snippet_re = regex::Regex::new(
+        &patterns
+            .iter()
+            .map(regex::Regex::as_str)
+            .collect::<Vec<_>>()
+            .join("|"),
+    )
+    .ok();
+    scored
+        .into_iter()
+        .map(|(_, index, match_count)| SearchHit {
+            entry: entries[index].clone(),
+            snippet: snippet_re
+                .as_ref()
+                .and_then(|re| message_snippet(messages[index], re)),
+            match_count,
+        })
+        .collect()
 }
 
 fn for_each_search_text(message: &Message, mut visit: impl FnMut(&str)) {
@@ -685,13 +689,14 @@ fn looks_like_regex(s: &str) -> bool {
     "|*+?{}()[]\\^$.".chars().any(|c| s.contains(c))
 }
 
-fn safe_regex(pattern: &str) -> regex::Regex {
+fn safe_regex(pattern: &str) -> Option<regex::Regex> {
     if pattern.len() > 256 {
         let head: String = pattern.chars().take(64).collect();
-        return regex::Regex::new(&regex::escape(&head)).unwrap();
+        return regex::Regex::new(&regex::escape(&head)).ok();
     }
     regex::Regex::new(pattern)
-        .unwrap_or_else(|_| regex::Regex::new(&regex::escape(pattern)).unwrap())
+        .or_else(|_| regex::Regex::new(&regex::escape(pattern)))
+        .ok()
 }
 
 fn line_snippet(text: &str, re: &regex::Regex) -> Option<String> {

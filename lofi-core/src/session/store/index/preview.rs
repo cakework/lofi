@@ -188,7 +188,7 @@ pub(in crate::session::store) fn scan_entry_summary<T: serde::de::DeserializeOwn
                 .find(|e| e.kind != IndexKind::Cursor)
                 .map(|e| e.id.to_event_id())
         });
-    let lineage = crate::session::store::cursor::lineage_indices(&index, leaf.as_deref())?;
+    let lineage = lineage_indices(&index, leaf.as_deref())?;
     let mut branched = SummaryAccumulator::new();
     for i in lineage {
         branched.push(index[i].offset, index[i].kind);

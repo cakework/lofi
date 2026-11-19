@@ -1,12 +1,21 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+pub(in crate::session::store) type CompactionSkelMap = HashMap<u64, (bool, IndexId)>;
+
 pub(in crate::session::store) fn load_index(
     path: &Path,
 ) -> Result<(SessionMeta, Vec<EventIndex>, u64)> {
+    let (meta, indices, _compactions, pos) = load_index_with_compactions(path)?;
+    Ok((meta, indices, pos))
+}
+
+pub(in crate::session::store) fn load_index_with_compactions(
+    path: &Path,
+) -> Result<(SessionMeta, Vec<EventIndex>, CompactionSkelMap, u64)> {
     use std::io::{BufReader, Seek};
 
-    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
     let Some((_header_start, _header_end, header)) = read_jsonl_value::<Header, _>(&mut reader)?
     else {
         return Err(Error::State(format!(
@@ -29,6 +38,7 @@ pub(in crate::session::store) fn load_index(
     let event_capacity = count_newlines(&mut reader)?;
     reader.seek(std::io::SeekFrom::Start(event_start))?;
     let mut indices = Vec::with_capacity(event_capacity);
+    let mut compactions = CompactionSkelMap::new();
     // Cursor records are append-only head metadata. Only the latest one can
     // affect a read; retaining one per committed batch would make index memory
     // grow with writes rather than conversation events.
@@ -56,6 +66,12 @@ pub(in crate::session::store) fn load_index(
         };
         let parent_id = skel.parent_id;
         let kind = skel.kind;
+        if kind == IndexKind::Compaction {
+            compactions.insert(
+                line_start,
+                (skel.checkpointed_tail, skel.first_kept_entry_id),
+            );
+        }
         // Cursor records have no event id of their own; carry the selected
         // leaf in `id` so downstream readers find it alongside the record.
         let id = if kind == IndexKind::Cursor {
@@ -81,16 +97,13 @@ pub(in crate::session::store) fn load_index(
         indices.push(cursor);
     }
     let pos = indices.last().map_or(0, |event| event.end_offset);
-    Ok((header.meta, indices, pos))
+    Ok((header.meta, indices, compactions, pos))
 }
 
-/// Index only a known append range. Active cursors use this after each durable
-/// write, so compaction can retain a small suffix index instead of rebuilding
-/// an index for the complete append-only transcript.
 pub(in crate::session::store) fn session_index_from_lineage(
-    path: &Path,
     lineage: &[EventIndex],
-) -> Result<(Vec<SessionIndexEntry>, usize)> {
+    compactions: &CompactionSkelMap,
+) -> (Vec<SessionIndexEntry>, usize) {
     let mut entries: Vec<SessionIndexEntry> = lineage
         .iter()
         .map(|entry| SessionIndexEntry {
@@ -105,13 +118,7 @@ pub(in crate::session::store) fn session_index_from_lineage(
         if event.kind != IndexKind::Compaction {
             continue;
         }
-        let marker = load_event_at(path, event.offset)?;
-        let SessionEventKind::Compaction {
-            checkpointed_tail,
-            first_kept_entry_id,
-            ..
-        } = marker.kind
-        else {
+        let Some((checkpointed_tail, first_kept_entry_id)) = compactions.get(&event.offset) else {
             continue;
         };
         let start = if first_kept_entry_id.is_empty() {
@@ -119,17 +126,17 @@ pub(in crate::session::store) fn session_index_from_lineage(
         } else {
             lineage[..position]
                 .iter()
-                .position(|entry| entry.id.matches(&first_kept_entry_id))
+                .position(|entry| entry.id == *first_kept_entry_id)
                 .unwrap_or(position)
         };
         history_start = start;
-        if checkpointed_tail && start < position {
+        if *checkpointed_tail && start < position {
             entries[start..position]
                 .iter_mut()
                 .for_each(|entry| entry.visible = false);
         }
     }
-    Ok((entries, history_start))
+    (entries, history_start)
 }
 
 pub(in crate::session::store) fn load_index_range(
