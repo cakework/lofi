@@ -16,6 +16,10 @@ fn span_loc(cm: &SourceMap, span: Span) -> String {
     format!("{line}:{col}")
 }
 
+thread_local! {
+    static SWC_GLOBALS: Globals = Globals::new();
+}
+
 /// # Errors
 /// Returns a sandbox error when TypeScript parsing or transformation fails.
 pub fn compile_ts(src: &str) -> Result<String> {
@@ -26,30 +30,32 @@ pub fn compile_ts(src: &str) -> Result<String> {
     let cm: Lrc<SourceMap> = Lrc::new(SourceMap::new(FilePathMapping::empty()));
     let fm = cm.new_source_file(FileName::Custom("lofi.ts".into()).into(), wrapped);
 
-    let code = GLOBALS.set(&Globals::new(), || -> Result<String> {
-        let mut parser = Parser::new(
-            Syntax::Typescript(TsSyntax::default()),
-            StringInput::from(&*fm),
-            None,
-        );
-        let module: Module = parser.parse_module().map_err(|e| {
-            Error::Sandbox(format!(
-                "parse error: {} at {}",
-                e.kind().msg(),
-                span_loc(&cm, e.span())
-            ))
-        })?;
-        if let Some(e) = parser.take_errors().into_iter().next() {
-            return Err(Error::Sandbox(format!(
-                "parse error: {} at {}",
-                e.kind().msg(),
-                span_loc(&cm, e.span())
-            )));
-        }
-        let mut program = Program::Module(module);
-        strip(Mark::new(), Mark::new()).process(&mut program);
-        let js = to_code_default(cm, None, &program);
-        Ok(js)
+    let code = SWC_GLOBALS.with(|globals| {
+        GLOBALS.set(globals, || -> Result<String> {
+            let mut parser = Parser::new(
+                Syntax::Typescript(TsSyntax::default()),
+                StringInput::from(&*fm),
+                None,
+            );
+            let module: Module = parser.parse_module().map_err(|e| {
+                Error::Sandbox(format!(
+                    "parse error: {} at {}",
+                    e.kind().msg(),
+                    span_loc(&cm, e.span())
+                ))
+            })?;
+            if let Some(e) = parser.take_errors().into_iter().next() {
+                return Err(Error::Sandbox(format!(
+                    "parse error: {} at {}",
+                    e.kind().msg(),
+                    span_loc(&cm, e.span())
+                )));
+            }
+            let mut program = Program::Module(module);
+            strip(Mark::new(), Mark::new()).process(&mut program);
+            let js = to_code_default(cm, None, &program);
+            Ok(js)
+        })
     })?;
 
     Ok(code)

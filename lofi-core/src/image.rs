@@ -53,14 +53,17 @@ where
         .decode()
         .map_err(|e| Error::Tool(format!("failed to decode {format:?} image: {e}")))?;
 
-    let mut img = fit_within(&img, cfg.max_width, cfg.max_height);
+    let mut img = fit_within(img, cfg.max_width, cfg.max_height);
 
     // Sweep JPEG quality down; if the floor still overflows, halve the frame
     // and sweep again.
     for round in 0..2 {
+        // JPEG has no alpha channel; convert onto RGB8 once per resolution
+        // rather than repeating the conversion at every quality step.
+        let rgb = img.to_rgb8();
         let mut quality = QUALITY_START;
         loop {
-            let encoded = encode_jpeg(&img, quality)?;
+            let encoded = encode_jpeg(&rgb, quality)?;
             if encoded.len() <= cfg.max_bytes {
                 return Ok((encoded, OUTPUT_MEDIA_TYPE.to_string()));
             }
@@ -82,10 +85,10 @@ where
 
 /// Downscale `img` to fit within `max_w`×`max_h` preserving aspect ratio.
 /// Returns the original image unchanged when it already fits.
-fn fit_within(img: &DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
+fn fit_within(img: DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
     let (w, h) = img.dimensions();
     if w <= max_w && h <= max_h {
-        return img.clone();
+        return img;
     }
     // `resize` preserves aspect ratio within the bounding box.
     img.resize(max_w, max_h, image::imageops::FilterType::Lanczos3)
@@ -98,14 +101,12 @@ fn halve(img: &DynamicImage) -> DynamicImage {
     img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
 }
 
-fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
+fn encode_jpeg(rgb: &image::RgbImage, quality: u8) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut out);
-    // JPEG has no alpha channel; flatten onto RGB8 first.
-    let rgb = img.to_rgb8();
     let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
     encoder
-        .encode_image(&rgb)
+        .encode_image(rgb)
         .map_err(|e| Error::Tool(format!("failed to encode image as JPEG: {e}")))?;
     Ok(out)
 }

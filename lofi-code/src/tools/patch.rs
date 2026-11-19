@@ -1,4 +1,7 @@
-use super::{atomic_write, reject_non_regular, reject_symlink_leaf, require_str, BuiltinTools};
+use super::{
+    atomic_write, reject_non_regular, reject_symlink_leaf, require_str, BuiltinTools,
+    MAX_EDIT_BYTES,
+};
 use lofi_error::{Error, Result};
 use serde_json::{json, Value};
 
@@ -25,33 +28,39 @@ impl BuiltinTools {
         reject_symlink_leaf(&self.session.root, &path, &format!("patch {path}"))?;
         let resolved = self.resolve_mutate(&path).await?;
         reject_non_regular(&format!("patch {path}"), &resolved)?;
-        let label = path.clone();
         let hunks = parse_unified_patch(&diff_text)
-            .map_err(|e| Error::Tool(format!("patch {label}: {e}")))?;
+            .map_err(|e| Error::Tool(format!("patch {path}: {e}")))?;
         if hunks.is_empty() {
-            return Err(Error::Tool(format!("patch {label}: no hunks in patch")));
+            return Err(Error::Tool(format!("patch {path}: no hunks in patch")));
         }
-        let read_label = label.clone();
-        let content = tokio::task::spawn_blocking(move || -> Result<String> {
-            let buf = std::fs::read(&resolved)
-                .map_err(|e| Error::Tool(format!("patch {read_label}: {e}")))?;
-            String::from_utf8(buf).map_err(|e| Error::Tool(format!("patch {read_label}: {e}")))
-        })
-        .await
-        .map_err(|e| Error::Tool(format!("patch {label}: {e}")))??;
-        let updated = apply_hunks(&content, &hunks)
-            .map_err(|e| Error::Tool(format!("patch {label}: {e}")))?;
-        let resolved2 = self.resolve_mutate(&path).await?;
-        tokio::task::spawn_blocking(move || {
-            atomic_write(&resolved2, updated.as_bytes())
+        let hunk_count = hunks.len();
+        let label = path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use std::io::Read as _;
+            let file = std::fs::File::open(&resolved)
+                .map_err(|e| Error::Tool(format!("patch {label}: {e}")))?;
+            let mut buf = Vec::new();
+            file.take(MAX_EDIT_BYTES as u64 + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| Error::Tool(format!("patch {label}: {e}")))?;
+            if buf.len() > MAX_EDIT_BYTES {
+                return Err(Error::Tool(format!(
+                    "patch {label}: file exceeds {MAX_EDIT_BYTES} bytes"
+                )));
+            }
+            let content =
+                String::from_utf8(buf).map_err(|e| Error::Tool(format!("patch {label}: {e}")))?;
+            let updated = apply_hunks(&content, &hunks)
+                .map_err(|e| Error::Tool(format!("patch {label}: {e}")))?;
+            atomic_write(&resolved, updated.as_bytes())
                 .map_err(|e| Error::Tool(format!("patch: {e}")))
         })
         .await
-        .map_err(|e| Error::Tool(format!("patch {label}: {e}")))??;
+        .map_err(|e| Error::Tool(format!("patch {path}: {e}")))??;
         Ok(json!({
             "ok": true,
-            "path": label,
-            "hunks": hunks.len(),
+            "path": path,
+            "hunks": hunk_count,
         }))
     }
 }

@@ -766,17 +766,9 @@ fn bind_docs_tools<'js>(
                         .as_deref()
                         .map_or_else(String::new, |n| cap_first_line(n, 120));
                     let id = emit_start(&t, "docs", label);
-                    let val = match tokio::task::spawn_blocking(move || match name.0 {
+                    let val = match name.0 {
                         Some(n) => crate::docs::docs_entry(&n),
                         None => crate::docs::docs_index(),
-                    })
-                    .await
-                    {
-                        Ok(val) => val,
-                        Err(e) => {
-                            emit_end_err(&t, id, &e.to_string());
-                            return Err(rquickjs::Error::Unknown);
-                        }
                     };
                     emit_end(&t, id, &val);
                     Ok::<JsonV, rquickjs::Error>(JsonV(val))
@@ -794,16 +786,7 @@ fn bind_docs_tools<'js>(
                 let t = t.clone();
                 async move {
                     let id = emit_start(&t, "docsSearch", cap_first_line(&query, 120));
-                    let val =
-                        match tokio::task::spawn_blocking(move || crate::docs::docs_search(&query))
-                            .await
-                        {
-                            Ok(val) => val,
-                            Err(e) => {
-                                emit_end_err(&t, id, &e.to_string());
-                                return Err(rquickjs::Error::Unknown);
-                            }
-                        };
+                    let val = crate::docs::docs_search(&query);
                     emit_end(&t, id, &val);
                     Ok::<JsonV, rquickjs::Error>(JsonV(val))
                 }
@@ -865,6 +848,45 @@ fn cap_first_line(s: &str, cap: usize) -> String {
     out
 }
 
+fn format_json_head(v: &serde_json::Value, max_bytes: usize) -> String {
+    struct CappedBuf {
+        buf: Vec<u8>,
+        max: usize,
+    }
+    impl std::io::Write for CappedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let room = self.max.saturating_sub(self.buf.len());
+            if room == 0 {
+                return Err(std::io::Error::other("capped"));
+            }
+            let take = data.len().min(room);
+            self.buf.extend_from_slice(&data[..take]);
+            if take < data.len() {
+                Err(std::io::Error::other("capped"))
+            } else {
+                Ok(take)
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = CappedBuf {
+        buf: Vec::with_capacity(max_bytes.min(256)),
+        max: max_bytes,
+    };
+    let _ = serde_json::to_writer(&mut out, v);
+    match String::from_utf8(out.buf) {
+        Ok(s) => s,
+        Err(e) => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    }
+}
+
 /// The header label for a job op: the command for `jobSpawn`, the job id
 /// for every id-addressed op. Without a `cmd` field the bash label falls
 /// back to the whole JSON body.
@@ -878,7 +900,7 @@ fn job_args_label(name: &str, v: &serde_json::Value) -> String {
             .or_else(|| id.as_u64().map(|n| n.to_string()))
     });
     id.map_or_else(
-        || cap_first_line(&v.to_string(), 120),
+        || cap_first_line(&format_json_head(v, 512), 120),
         |id| format!("job {id}"),
     )
 }
@@ -896,7 +918,7 @@ fn native_args_label(name: &str, v: &serde_json::Value) -> String {
     };
     let s = raw.unwrap_or_else(|| match v {
         serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => format_json_head(other, 512),
     });
     cap_first_line(&s, 120)
 }

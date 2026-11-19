@@ -315,35 +315,36 @@ fn match_entry(cmd: &ExtractedCommand, entry: &CommandEntry) -> bool {
     match entry.mode {
         MatchMode::Exact => cmd.full_text.trim().eq_ignore_ascii_case(&entry.match_str),
         MatchMode::Prefix => {
-            let lower = cmd.full_text.trim_start().to_ascii_lowercase();
-            let m = entry.match_str.to_ascii_lowercase();
-            lower == m || lower.starts_with(&format!("{m} "))
+            let text = cmd.full_text.trim_start();
+            let m = entry.match_str.as_str();
+            text.eq_ignore_ascii_case(m)
+                || (text.len() > m.len()
+                    && text.as_bytes()[m.len()] == b' '
+                    && text.is_char_boundary(m.len())
+                    && text[..m.len()].eq_ignore_ascii_case(m))
         }
         MatchMode::Substring => {
             let match_tokens: Vec<&str> = entry.match_str.split_whitespace().collect();
             if match_tokens.is_empty() || match_tokens.len() > cmd.words.len() {
                 return false;
             }
-            let cmd_lower: Vec<String> = cmd.words.iter().map(|w| w.to_ascii_lowercase()).collect();
-            let match_lower: Vec<String> = match_tokens
-                .iter()
-                .map(|t| t.to_ascii_lowercase())
-                .collect();
-            (0..=cmd_lower.len().saturating_sub(match_lower.len())).any(|i| {
-                cmd_lower[i..i + match_lower.len()]
+            cmd.words.windows(match_tokens.len()).any(|window| {
+                window
                     .iter()
-                    .zip(&match_lower)
-                    .all(|(a, b)| a == b)
+                    .zip(&match_tokens)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
             })
         }
         MatchMode::Args => {
-            let (prefix, required) = parse_args_pattern(&entry.match_str);
+            let (prefix, required) = match entry.match_str.split_once(':') {
+                Some((p, r)) => (p, Some(r)),
+                None => (entry.match_str.as_str(), None),
+            };
+            let text = cmd.full_text.trim_start();
             if prefix != "*"
-                && !cmd
-                    .full_text
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with(&prefix.to_ascii_lowercase())
+                && !(text.len() >= prefix.len()
+                    && text.is_char_boundary(prefix.len())
+                    && text[..prefix.len()].eq_ignore_ascii_case(prefix))
             {
                 return false;
             }
@@ -352,25 +353,13 @@ fn match_entry(cmd: &ExtractedCommand, entry: &CommandEntry) -> bool {
             } else {
                 prefix.split_whitespace().count()
             };
-            let cmd_args: Vec<String> = cmd.words[prefix_words..]
-                .iter()
-                .map(|w| w.to_ascii_lowercase())
-                .collect();
-            required.iter().all(|r| cmd_args.iter().any(|a| a == r))
-        }
-    }
-}
-
-fn parse_args_pattern(pattern: &str) -> (String, Vec<String>) {
-    match pattern.find(':') {
-        None => (pattern.to_string(), Vec::new()),
-        Some(idx) => {
-            let prefix = pattern[..idx].to_string();
-            let required: Vec<String> = pattern[idx + 1..]
-                .split_whitespace()
-                .map(str::to_ascii_lowercase)
-                .collect();
-            (prefix, required)
+            let Some(cmd_args) = cmd.words.get(prefix_words..) else {
+                return false;
+            };
+            required
+                .into_iter()
+                .flat_map(str::split_whitespace)
+                .all(|r| cmd_args.iter().any(|a| a.eq_ignore_ascii_case(r)))
         }
     }
 }

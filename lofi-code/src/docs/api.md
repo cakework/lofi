@@ -47,9 +47,9 @@ while (true) {
 
 **Returns (image):** for a path with an image extension (`.png`, `.jpg`,
 `.jpeg`, `.gif`, `.webp`, `.bmp`), returns `{ ok, type: "image", media_type,
-data_b64 }` instead. The host decodes `data_b64` and attaches the image to the
-conversation as vision input, so reading an image file is how you look at it.
-The image path ignores `offset`/`limit`.
+bytes }` instead. Returning that object from `exec` attaches the image to the
+conversation as vision input, so `return await lofi.read(path)` is how you look
+at it. The image path ignores `offset`/`limit`.
 
 ## lofi.ls(dir?)
 

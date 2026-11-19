@@ -9,11 +9,9 @@ impl BuiltinTools {
     pub async fn write(&self, args: Value) -> Result<Value> {
         let path = require_str("write", &args, "path")?;
         let text = require_str("write", &args, "text")?;
-        let content = text.clone();
         reject_symlink_leaf(&self.session.root, &path, &format!("write {path}"))?;
         let resolved = self.resolve_mutate(&path).await?;
         reject_non_regular(&format!("write {path}"), &resolved)?;
-        let label = path.clone();
         // A host-owned target carries the modes its first write applies, so
         // it is created private and only here; a workspace path keeps the
         // modes the workspace gives it.
@@ -23,7 +21,7 @@ impl BuiltinTools {
             .as_ref()
             .filter(|file| file.path == resolved)
             .map(|file| (file.dir_mode, file.file_mode));
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let content = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
             if let Some(parent) = resolved.parent() {
                 match host_file {
                     Some((dir_mode, _)) => create_dir_with_mode(parent, dir_mode)?,
@@ -34,11 +32,11 @@ impl BuiltinTools {
             if let Some((_, file_mode)) = host_file {
                 set_file_mode(&resolved, file_mode)?;
             }
-            Ok(())
+            Ok(text)
         })
         .await
-        .map_err(|e| Error::Tool(format!("write {label}: {e}")))?
-        .map_err(|e| Error::Tool(format!("write {label}: {e}")))?;
+        .map_err(|e| Error::Tool(format!("write {path}: {e}")))?
+        .map_err(|e| Error::Tool(format!("write {path}: {e}")))?;
         Ok(json!({ "ok": true, "content": content }))
     }
 }

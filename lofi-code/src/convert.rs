@@ -31,7 +31,7 @@ impl<'js> Conversion<'js> {
     fn new(value: &Value<'js>, max_bytes: usize, truncate: bool) -> Self {
         let string_limiter = truncate.then(|| {
             value.ctx().eval::<Function, _>(
-                "(value, max) => { const cut = value.length > max; return [cut ? value.slice(0, max) : value, cut]; }",
+                "(value, max) => { if (value.length <= max) return value; let end = max + 1; const c = value.charCodeAt(end - 1); if (c >= 0xd800 && c <= 0xdbff) end += 1; return value.slice(0, end); }",
             )
         });
         let overflow = string_limiter
@@ -57,24 +57,13 @@ impl<'js> Conversion<'js> {
         string: rquickjs::String<'js>,
         allow_prefix: bool,
     ) -> Option<std::string::String> {
-        let mut guest_truncated = false;
         let string = if let Some(limiter) = &self.string_limiter {
-            let limit = u32::try_from(self.remaining()).unwrap_or(u32::MAX);
-            let bounded: rquickjs::Result<Array> = limiter.call((string, limit));
-            let Ok(bounded) = bounded else {
+            let limit = u32::try_from(self.remaining()).unwrap_or(u32::MAX.saturating_sub(1));
+            let Ok(bounded) = limiter.call::<_, rquickjs::String<'js>>((string, limit)) else {
                 self.overflow = true;
                 return None;
             };
-            guest_truncated = bounded.get(1).unwrap_or(true);
-            if guest_truncated && !allow_prefix {
-                self.truncated = true;
-                return None;
-            }
-            let Ok(string) = bounded.get(0) else {
-                self.overflow = true;
-                return None;
-            };
-            string
+            bounded
         } else {
             string
         };
@@ -85,7 +74,6 @@ impl<'js> Conversion<'js> {
         let remaining = self.remaining();
         if text.len() <= remaining {
             self.bytes += text.len();
-            self.truncated |= guest_truncated;
             return Some(text.as_str().to_string());
         }
         if self.truncate {

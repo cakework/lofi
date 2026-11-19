@@ -3,40 +3,16 @@ use std::path::PathBuf;
 
 use lofi_types::{clip, CompactBlock, CompactionHook, NativeToolRecord, SummarySection};
 
-use crate::docs;
+use crate::docs::{self, DocFileEffect};
 use crate::tools::memory::MEMORY_LIMIT;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileEffect {
-    Create,
-    Modify,
-    Read,
-}
-
-fn file_effect(tool_name: &str) -> Option<FileEffect> {
-    let entries = docs::entries();
-    let entry = entries
-        .iter()
-        .find(|(name, _, _)| name == tool_name || name.ends_with(&format!(".{tool_name}")))?;
-    let lower = entry.2.to_ascii_lowercase();
-    if lower.contains("write") || lower.contains("create") {
-        Some(FileEffect::Create)
-    } else if lower.contains("edit") || lower.contains("replace") {
-        Some(FileEffect::Modify)
-    } else if lower.contains("read") || lower.contains("list") || lower.contains("search") {
-        Some(FileEffect::Read)
-    } else {
-        None
-    }
+fn file_effect(tool_name: &str) -> Option<DocFileEffect> {
+    docs::find_tool_entry(tool_name).and_then(|entry| entry.effect)
 }
 
 fn tool_description(name: &str, args: &str) -> String {
-    let entries = docs::entries();
-    if let Some((_, header, summary)) = entries
-        .iter()
-        .find(|(n, _, _)| n == name || n.ends_with(&format!(".{name}")))
-    {
-        format!("{header} — {summary}")
+    if let Some(entry) = docs::find_tool_entry(name) {
+        format!("{} — {}", entry.header, entry.summary)
     } else {
         format!("lofi.{name}({args})")
     }
@@ -177,13 +153,13 @@ impl CompactionHook for CodeCompactionHook {
                 continue;
             }
             match file_effect(&rec.name) {
-                Some(FileEffect::Modify) => {
+                Some(DocFileEffect::Modify) => {
                     modified.insert(rec.args.clone());
                 }
-                Some(FileEffect::Create) => {
+                Some(DocFileEffect::Create) => {
                     created.insert(rec.args.clone());
                 }
-                Some(FileEffect::Read) => {
+                Some(DocFileEffect::Read) => {
                     read.insert(rec.args.clone());
                 }
                 None => {}
@@ -296,8 +272,9 @@ fn extract_commit_message(cmd: &str) -> Option<String> {
 }
 
 fn first_hash(text: &str) -> Option<String> {
-    let re = regex::Regex::new(r"\b[0-9a-f]{7,12}\b").ok()?;
-    re.find(text).map(|m| m.as_str().to_string())
+    static HASH_RE: std::sync::LazyLock<Option<regex::Regex>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\b[0-9a-f]{7,12}\b").ok());
+    HASH_RE.as_ref()?.find(text).map(|m| m.as_str().to_string())
 }
 
 fn compress_json_result(text: &str, max: usize) -> Option<String> {

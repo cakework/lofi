@@ -74,29 +74,43 @@ impl BuiltinTools {
                 )));
             }
             let bytes = std::fs::read(&resolved)?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
+            Ok(String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
         })
         .await
         .map_err(|e| Error::Tool(format!("read {label}: {e}")))??;
 
-        let all_lines: Vec<&str> = text.split('\n').collect();
-        let total_file_lines = all_lines.len();
         let start = (offset as usize).saturating_sub(1);
-        if start >= all_lines.len() {
+        let want_end = limit.map(|lim| start.saturating_add(lim as usize));
+        let mut newline_count = 0usize;
+        let mut byte_start = 0usize;
+        let mut byte_end = text.len();
+        for (idx, (pos, _)) in text.match_indices('\n').enumerate() {
+            newline_count = idx + 1;
+            if start > 0 && idx == start - 1 {
+                byte_start = pos + 1;
+            }
+            if let Some(end) = want_end {
+                if end > start && idx == end - 1 {
+                    byte_end = pos;
+                }
+            }
+        }
+        let total_file_lines = 1 + newline_count;
+        if start >= total_file_lines {
             return Err(Error::Tool(format!(
                 "read {label}: offset {offset} is beyond end of file ({total_file_lines} lines total)"
             )));
         }
-        let selected = if let Some(lim) = limit {
-            let end = (start + lim as usize).min(all_lines.len());
-            all_lines[start..end].join("\n")
+        let selected = if want_end == Some(start) {
+            ""
         } else {
-            all_lines[start..].join("\n")
+            &text[byte_start..byte_end]
         };
         let start_line = start + 1;
         let cap = self.session.truncate;
-        let t = truncate_head_with(&selected, cap.max_lines, cap.max_bytes);
-        let limit_remaining = limit.is_some() && start + t.output_lines < all_lines.len();
+        let t = truncate_head_with(selected, cap.max_lines, cap.max_bytes);
+        let limit_remaining = limit.is_some() && start + t.output_lines < total_file_lines;
         let truncated = t.truncated || limit_remaining;
         // The cursor must always advance: a single line larger than max_bytes
         // returns no content, so skip it rather than handing back the same
@@ -104,7 +118,7 @@ impl BuiltinTools {
         let candidate = start_line + t.output_lines.max(1);
         // A mid-line cut on the final line yields a cursor past EOF; there is
         // no whole line left to page to, so report no cursor.
-        let next_offset = if truncated && candidate <= all_lines.len() {
+        let next_offset = if truncated && candidate <= total_file_lines {
             json!(candidate)
         } else {
             Value::Null

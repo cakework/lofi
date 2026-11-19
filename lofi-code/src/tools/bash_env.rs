@@ -32,7 +32,9 @@ impl BashEnv {
 
     pub(super) fn redact(&self, s: &mut String) {
         for v in &self.redact {
-            *s = s.replace(v, REDACTED);
+            if !v.is_empty() && s.contains(v.as_str()) {
+                *s = s.replace(v, REDACTED);
+            }
         }
     }
 }

@@ -236,13 +236,67 @@ fn validate_skill_name(name: &str) -> Result<()> {
 }
 
 fn read_description(path: &Path) -> Option<String> {
-    let content = read_bounded(path, MAX_SKILL_FILE_BYTES).ok()?;
+    const HEAD_CAP: usize = 16 * 1024;
+    let content = match read_head_within_limit(path, HEAD_CAP, MAX_SKILL_FILE_BYTES).ok()? {
+        (head, false) => head,
+        (head, true) => {
+            if let Some(desc) = crate::skill_metadata::frontmatter_description(&head) {
+                return Some(desc);
+            }
+            let complete_head = if let Some(rest) = head.strip_prefix("---") {
+                rest.strip_prefix('\n').unwrap_or(rest).contains("\n---")
+            } else {
+                true
+            };
+            if complete_head {
+                if let Some(desc) = crate::skill_metadata::first_prose_line(&head) {
+                    return Some(desc);
+                }
+            }
+            read_bounded(path, MAX_SKILL_FILE_BYTES).ok()?
+        }
+    };
     crate::skill_metadata::description(&content).or_else(|| {
         path.parent()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .map(std::string::ToString::to_string)
     })
+}
+
+fn read_head_within_limit(
+    path: &Path,
+    head_max: usize,
+    file_max: usize,
+) -> std::io::Result<(String, bool)> {
+    let mut file = std::fs::File::open(path)?;
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > file_max as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file exceeds {file_max}-byte limit"),
+            ));
+        }
+    }
+    let mut reader = std::io::Read::take(&mut file, (head_max as u64) + 1);
+    let mut buf = Vec::with_capacity(head_max.min(4096));
+    std::io::Read::read_to_end(&mut reader, &mut buf)?;
+    let truncated = buf.len() > head_max;
+    if truncated {
+        buf.truncate(head_max);
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => Ok((s, truncated)),
+        Err(e) if truncated => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes)
+                .map(|s| (s, true))
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        }
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
 }
 
 /// Read a file up to `max` bytes as a UTF-8 string, returning an error when

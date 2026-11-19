@@ -106,6 +106,12 @@ impl Thresholds {
 /// guessing at: a wrong scope on an unknown CLI reads as a narrow one.
 #[must_use]
 pub fn questions() -> BTreeMap<String, DecisionQuestion> {
+    static QUESTIONS: std::sync::LazyLock<BTreeMap<String, DecisionQuestion>> =
+        std::sync::LazyLock::new(build_questions);
+    QUESTIONS.clone()
+}
+
+fn build_questions() -> BTreeMap<String, DecisionQuestion> {
     let mut questions = BTreeMap::new();
     questions.insert(
         "scope".to_string(),

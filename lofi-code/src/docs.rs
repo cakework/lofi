@@ -1,12 +1,75 @@
-struct DocEntry {
-    name: String,
-    header: String,
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocFileEffect {
+    Create,
+    Modify,
+    Read,
+}
+
+pub(crate) struct DocEntry {
+    pub(crate) name: String,
+    pub(crate) header: String,
     body: String,
-    summary: String,
+    pub(crate) summary: String,
     returns: Option<String>,
+    name_lo: String,
+    header_lo: String,
+    body_lo: String,
+    pub(crate) effect: Option<DocFileEffect>,
+}
+
+struct ParsedDocs {
+    entries: Vec<DocEntry>,
+    by_lower: HashMap<String, usize>,
+    by_short: HashMap<String, usize>,
+    index: serde_json::Value,
 }
 
 pub const DOCS_MD: &str = include_str!("docs/api.md");
+
+static PARSED_DOCS: LazyLock<ParsedDocs> = LazyLock::new(|| {
+    let entries = parse_entries();
+    let mut by_lower = HashMap::with_capacity(entries.len());
+    let mut by_short = HashMap::with_capacity(entries.len());
+    let mut arr = Vec::with_capacity(entries.len());
+    for (idx, e) in entries.iter().enumerate() {
+        by_lower.entry(e.name_lo.clone()).or_insert(idx);
+        by_short.entry(e.name.clone()).or_insert(idx);
+        if let Some((_, suffix)) = e.name.rsplit_once('.') {
+            by_short.entry(suffix.to_string()).or_insert(idx);
+        }
+        let mut entry = serde_json::json!({
+            "name": e.name,
+            "summary": e.summary,
+        });
+        if let Some(returns) = &e.returns {
+            entry["returns"] = serde_json::json!(returns);
+        }
+        arr.push(entry);
+    }
+    let index = serde_json::json!({ "ok": true, "entries": arr });
+    ParsedDocs {
+        entries,
+        by_lower,
+        by_short,
+        index,
+    }
+});
+
+fn classify_effect(summary: &str) -> Option<DocFileEffect> {
+    let lower = summary.to_ascii_lowercase();
+    if lower.contains("write") || lower.contains("create") {
+        Some(DocFileEffect::Create)
+    } else if lower.contains("edit") || lower.contains("replace") {
+        Some(DocFileEffect::Modify)
+    } else if lower.contains("read") || lower.contains("list") || lower.contains("search") {
+        Some(DocFileEffect::Read)
+    } else {
+        None
+    }
+}
 
 fn parse_entries() -> Vec<DocEntry> {
     let mut entries = Vec::new();
@@ -46,12 +109,20 @@ fn finish_entry(name: String, header: String, body: String) -> DocEntry {
         .unwrap_or("")
         .to_string();
     let returns = returns_line(&body);
+    let name_lo = name.to_ascii_lowercase();
+    let header_lo = header.to_ascii_lowercase();
+    let body_lo = body.to_ascii_lowercase();
+    let effect = classify_effect(&summary);
     DocEntry {
         name,
         header,
         body,
         summary,
         returns,
+        name_lo,
+        header_lo,
+        body_lo,
+        effect,
     }
 }
 
@@ -103,49 +174,42 @@ fn extract_name(header: &str) -> String {
     }
 }
 
+pub(crate) fn find_tool_entry(tool_name: &str) -> Option<&'static DocEntry> {
+    let docs = &*PARSED_DOCS;
+    docs.by_short
+        .get(tool_name)
+        .and_then(|&idx| docs.entries.get(idx))
+}
+
 /// Exposed so other modules (e.g. the compaction hook) can use the docs
 /// registry as the single source of truth for tool names and descriptions
 /// instead of maintaining a parallel hard-coded table.
 #[must_use]
 pub fn entries() -> Vec<(String, String, String)> {
-    parse_entries()
-        .into_iter()
-        .map(|e| (e.name, e.header, e.summary))
+    PARSED_DOCS
+        .entries
+        .iter()
+        .map(|e| (e.name.clone(), e.header.clone(), e.summary.clone()))
         .collect()
 }
 
 #[must_use]
 pub fn docs_index() -> serde_json::Value {
-    let entries = parse_entries();
-    let arr: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|e| {
-            let mut entry = serde_json::json!({
-                "name": e.name,
-                "summary": e.summary,
-            });
-            if let Some(returns) = &e.returns {
-                entry["returns"] = serde_json::json!(returns);
-            }
-            entry
-        })
-        .collect();
-    serde_json::json!({ "ok": true, "entries": arr })
+    PARSED_DOCS.index.clone()
 }
 
 #[must_use]
 pub fn docs_entry(name: &str) -> serde_json::Value {
-    let entries = parse_entries();
+    let docs = &*PARSED_DOCS;
     let needle = name.to_ascii_lowercase();
-    for e in &entries {
-        if e.name.to_ascii_lowercase() == needle {
-            let content = format!("## {}\n\n{}", e.header, e.body);
-            return serde_json::json!({
-                "ok": true,
-                "name": e.name,
-                "content": content,
-            });
-        }
+    if let Some(&idx) = docs.by_lower.get(&needle) {
+        let e = &docs.entries[idx];
+        let content = format!("## {}\n\n{}", e.header, e.body);
+        return serde_json::json!({
+            "ok": true,
+            "name": e.name,
+            "content": content,
+        });
     }
     serde_json::json!({
         "ok": false,
@@ -155,7 +219,7 @@ pub fn docs_entry(name: &str) -> serde_json::Value {
 
 #[must_use]
 pub fn docs_search(query: &str) -> serde_json::Value {
-    let entries = parse_entries();
+    let entries = &PARSED_DOCS.entries;
     let terms: Vec<String> = query
         .split_whitespace()
         .map(str::to_ascii_lowercase)
@@ -165,19 +229,16 @@ pub fn docs_search(query: &str) -> serde_json::Value {
     }
 
     let mut scored: Vec<(usize, &DocEntry)> = Vec::new();
-    for e in &entries {
-        let name_lo = e.name.to_ascii_lowercase();
-        let header_lo = e.header.to_ascii_lowercase();
-        let body_lo = e.body.to_ascii_lowercase();
+    for e in entries {
         let mut score = 0usize;
         for term in &terms {
-            if name_lo.contains(term) {
+            if e.name_lo.contains(term) {
                 score += 3;
             }
-            if header_lo.contains(term) {
+            if e.header_lo.contains(term) {
                 score += 2;
             }
-            if body_lo.contains(term) {
+            if e.body_lo.contains(term) {
                 score += 1;
             }
         }

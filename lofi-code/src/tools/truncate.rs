@@ -38,8 +38,7 @@ pub fn truncate_head(content: &str) -> Truncated {
 #[must_use]
 pub fn truncate_head_with(content: &str, max_lines: usize, max_bytes: usize) -> Truncated {
     let total_bytes = content.len();
-    let lines: Vec<&str> = content.split('\n').collect();
-    let total_lines = lines.len();
+    let total_lines = content.split('\n').count();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {
         return Truncated {
@@ -52,26 +51,32 @@ pub fn truncate_head_with(content: &str, max_lines: usize, max_bytes: usize) -> 
         };
     }
 
-    let mut out: Vec<&str> = Vec::with_capacity(max_lines.min(total_lines));
-    let mut out_bytes = 0usize;
-    for (i, line) in lines.iter().enumerate() {
-        if i >= max_lines {
+    let mut kept_lines = 0usize;
+    let mut cut = 0usize;
+    for (i, end) in content
+        .match_indices('\n')
+        .map(|(pos, _)| pos)
+        .chain(std::iter::once(total_bytes))
+        .enumerate()
+    {
+        if i >= max_lines || end > max_bytes {
             break;
         }
-        let line_bytes = line.len() + usize::from(i > 0);
-        if out_bytes + line_bytes > max_bytes {
-            break;
-        }
-        out.push(line);
-        out_bytes += line_bytes;
+        kept_lines = i + 1;
+        cut = end;
     }
-    let content_out = out.join("\n");
+
+    let content_out = if kept_lines == 0 {
+        String::new()
+    } else {
+        content[..cut].to_string()
+    };
     let output_bytes = content_out.len();
     Truncated {
         content: content_out,
         truncated: true,
         total_lines,
-        output_lines: out.len(),
+        output_lines: kept_lines,
         total_bytes,
         output_bytes,
     }
@@ -85,8 +90,7 @@ pub fn truncate_tail(content: &str) -> Truncated {
 #[must_use]
 pub fn truncate_tail_with(content: &str, max_lines: usize, max_bytes: usize) -> Truncated {
     let total_bytes = content.len();
-    let lines: Vec<&str> = content.split('\n').collect();
-    let total_lines = lines.len();
+    let total_lines = content.split('\n').count();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {
         return Truncated {
@@ -99,27 +103,32 @@ pub fn truncate_tail_with(content: &str, max_lines: usize, max_bytes: usize) -> 
         };
     }
 
-    let mut out: Vec<&str> = Vec::with_capacity(max_lines.min(total_lines));
-    let mut out_bytes = 0usize;
-    for line in lines.iter().rev() {
-        if out.len() >= max_lines {
+    let mut kept_lines = 0usize;
+    let mut cut = total_bytes;
+    for (i, start) in content
+        .rmatch_indices('\n')
+        .map(|(nl, _)| nl + 1)
+        .chain(std::iter::once(0))
+        .enumerate()
+    {
+        if i >= max_lines || total_bytes - start > max_bytes {
             break;
         }
-        let line_bytes = line.len() + usize::from(!out.is_empty());
-        if out_bytes + line_bytes > max_bytes {
-            break;
-        }
-        out.push(line);
-        out_bytes += line_bytes;
+        kept_lines = i + 1;
+        cut = start;
     }
-    out.reverse();
-    let content_out = out.join("\n");
+
+    let content_out = if kept_lines == 0 {
+        String::new()
+    } else {
+        content[cut..].to_string()
+    };
     let output_bytes = content_out.len();
     Truncated {
         content: content_out,
         truncated: true,
         total_lines,
-        output_lines: out.len(),
+        output_lines: kept_lines,
         total_bytes,
         output_bytes,
     }
