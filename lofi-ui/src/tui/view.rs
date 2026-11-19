@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragr
 use ratatui::Frame;
 
 use crate::tui::SLASH_COMMANDS;
-use crate::tui::{App, Mode, NOTIFY_CHROME};
+use crate::tui::{ActiveModal, App, Mode, NOTIFY_CHROME};
 
 pub(crate) mod blocks;
 pub(crate) mod component;
@@ -134,40 +134,23 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     if let Some(r) = rects[7] {
         render_debug_bar(f, r, app);
     }
-    if app.slash_complete.is_some() {
+    if app.prompt.slash_complete.is_some() {
         render_slash_complete(f, area, app);
     }
-    if app.picker.is_some() {
-        render_picker(f, area, app);
+    match app.modal.as_ref() {
+        None => {}
+        Some(ActiveModal::Resume(_)) => render_picker(f, area, app),
+        Some(ActiveModal::Tree { .. }) => render_tree_picker(f, area, app),
+        Some(ActiveModal::Model(_)) => render_model_picker(f, area, app),
+        Some(ActiveModal::Thinking(_)) => render_thinking_picker(f, area, app),
+        Some(ActiveModal::Policy(_)) => render_policy_picker(f, area, app),
+        Some(ActiveModal::Paths(_)) => render_paths_picker(f, area, app),
+        Some(ActiveModal::Service(_)) => render_service_picker(f, area, app),
+        Some(ActiveModal::Theme(_)) => render_theme_picker(f, area, app),
+        Some(ActiveModal::Background(_)) => render_background_modal(f, area, app),
+        Some(ActiveModal::Info(_)) => render_info_modal(f, area, app),
     }
-    if app.tree_picker.is_some() {
-        render_tree_picker(f, area, app);
-    }
-    if app.model_picker.is_some() {
-        render_model_picker(f, area, app);
-    }
-    if app.thinking_picker.is_some() {
-        render_thinking_picker(f, area, app);
-    }
-    if app.policy_picker.is_some() {
-        render_policy_picker(f, area, app);
-    }
-    if app.paths_picker.is_some() {
-        render_paths_picker(f, area, app);
-    }
-    if app.service_picker.is_some() {
-        render_service_picker(f, area, app);
-    }
-    if app.theme_picker.is_some() {
-        render_theme_picker(f, area, app);
-    }
-    if app.background_modal.is_some() {
-        render_background_modal(f, area, app);
-    }
-    if app.info.is_some() {
-        render_info_modal(f, area, app);
-    }
-    if !app.pending_confirms.is_empty() {
+    if !app.confirms.pending.is_empty() {
         render_confirm_modal(f, area, app);
     }
 }
@@ -255,7 +238,8 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
     app.render_profile.height = height;
     app.render_profile.turns = app.transcript.turns.len();
     app.render_profile.width_changed = width_changed;
-    let nav_anchor = if width_changed && matches!(app.mode, Mode::Navigate | Mode::Select) {
+    let nav_anchor = if width_changed && matches!(app.viewport.mode, Mode::Navigate | Mode::Select)
+    {
         app.nav_content_anchor()
     } else {
         None
@@ -264,7 +248,7 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
     // an absolute `(line, col)` that drifts across a re-wrap just like the
     // cursor. Both endpoints must be re-seated so the selection survives a
     // resize on the same content characters.
-    let sel_anchor = if width_changed && app.mode == Mode::Select {
+    let sel_anchor = if width_changed && app.viewport.mode == Mode::Select {
         app.sel_content_anchor()
     } else {
         None
@@ -275,8 +259,8 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
     // viewport top and cursor re-wrap to a different count, which would
     // otherwise drift the cursor's row by 1-2 lines on a widen. Pinning the
     // row lets the viewport follow the cursor instead.
-    let nav_row = if width_changed && matches!(app.mode, Mode::Navigate | Mode::Select) {
-        Some(app.nav_cursor.saturating_sub(app.log_off))
+    let nav_row = if width_changed && matches!(app.viewport.mode, Mode::Navigate | Mode::Select) {
+        Some(app.viewport.nav_cursor.saturating_sub(app.viewport.log_off))
     } else {
         None
     };
@@ -339,25 +323,26 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
     // longer holds.
     let est_total: usize = app.layout.frozen_heights.iter().sum::<usize>() + last_h + turn_gaps;
     let est_base = est_total.saturating_sub(height);
-    let est_off = if app.pinned {
+    let est_off = if app.viewport.pinned {
         est_base
     } else {
-        app.top_line.min(est_base)
+        app.viewport.top_line.min(est_base)
     };
     app.measure_visible_turns(est_off, height, w);
 
     let mut total: usize = app.layout.frozen_heights.iter().sum::<usize>() + last_h + turn_gaps;
     let mut base = total.saturating_sub(height);
-    app.last_turn_height = last_h;
-    app.log_rect = content;
+    app.viewport.last_turn_height = last_h;
+    app.viewport.log_rect = content;
     // A re-wrap shifts absolute line indices, so a `top_line` carried over
     // from the previous width may now point past the new bottom — clamping it
     // would snap a scrolled-up view to the bottom and stick there (`pinned`).
     // Re-anchor to the viewport's previous relative position instead. Integer
     // math floors, so it can't round up to `base` and spuriously pin. A
     // pinned (tail-following) view is left at the bottom by design.
-    if width_changed && !app.pinned && app.last_base > 0 {
-        app.top_line = ((app.log_off as u64 * base as u64) / app.last_base as u64) as usize;
+    if width_changed && !app.viewport.pinned && app.viewport.last_base > 0 {
+        app.viewport.top_line =
+            ((app.viewport.log_off as u64 * base as u64) / app.viewport.last_base as u64) as usize;
     }
     // Re-seat the Navigate/Select cursor on its previous *content* character
     // (the frozen cache and last turn were just re-rendered at the new width,
@@ -392,7 +377,7 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
     // doesn't drift when the intervening lines re-wrap. Clamped to `base` so a
     // pinned (tail-following) view stays at the bottom.
     if let Some(row) = nav_row {
-        app.top_line = app.nav_cursor.saturating_sub(row).min(base);
+        app.viewport.top_line = app.viewport.nav_cursor.saturating_sub(row).min(base);
     }
     // Everything below the one-shot re-anchoring is re-derived on every pass:
     // a pass that measured turns changed their heights, so it changed `total`,
@@ -410,27 +395,27 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
         }
         total = app.layout.frozen_heights.iter().sum::<usize>() + last_h + turn_gaps;
         base = total.saturating_sub(height);
-        app.last_base = base;
+        app.viewport.last_base = base;
         off = app.view_off();
-        app.log_off = off;
+        app.viewport.log_off = off;
         // Stash the total / viewport height so the Navigate cursor can be
         // clamped and scrolled between events; clamp the cursor if the log
         // shrank.
-        app.log_total = total;
-        app.log_view_h = height;
+        app.viewport.log_total = total;
+        app.viewport.log_view_h = height;
         // The cursor must stay visible in Navigate/Select every frame, not only
         // on a view change: between renders the estimated frozen heights keep
         // converging on a resumed session, shifting totals and the base, and a
         // tick-time reseat can otherwise leave the cursor above the window.
-        if matches!(app.mode, Mode::Navigate | Mode::Select) {
+        if matches!(app.viewport.mode, Mode::Navigate | Mode::Select) {
             app.nav_scroll_into_view();
             off = app.view_off();
-            app.log_off = off;
+            app.viewport.log_off = off;
         }
-        if app.nav_cursor >= total {
-            app.nav_cursor = total.saturating_sub(1);
-            if app.mode == Mode::Select {
-                app.sel = Some(app.select_sel());
+        if app.viewport.nav_cursor >= total {
+            app.viewport.nav_cursor = total.saturating_sub(1);
+            if app.viewport.mode == Mode::Select {
+                app.viewport.sel = Some(app.select_sel());
             }
         }
         // Measuring can change the heights the pass above just published, so a
@@ -573,11 +558,11 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
             }
         }
     }
-    app.log_vis = visv;
-    app.log_details = details;
+    app.viewport.log_vis = visv;
+    app.viewport.log_details = details;
     app.render_profile.log_total_us = log_started.elapsed().as_micros();
 
-    if let Some(sel) = &app.sel {
+    if let Some(sel) = &app.viewport.sel {
         let (sl, sc) = sel.start;
         let (el, ec) = sel.end;
         let ((sl, sc), (el, ec)) = if (sl, sc) <= (el, ec) {
@@ -592,8 +577,9 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
             let hi = el.min(off + vis_len - 1);
             for li in lo..=hi {
                 let rel = li - off;
-                let s = &app.log_vis[rel].rendered;
+                let s = &app.viewport.log_vis[rel].rendered;
                 let (cstart, cend) = app
+                    .viewport
                     .log_vis
                     .get(rel)
                     .map_or((0, s.chars().count()), |v| v.content);
@@ -612,6 +598,7 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(focus) = app.detail_focus.as_mut() {
         if let Some(target) = app
+            .viewport
             .log_details
             .iter()
             .flatten()
@@ -621,12 +608,12 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
             let last = target.total.saturating_sub(1);
             focus.cursor = focus.cursor.min(last);
             let (key, cursor) = (focus.key.clone(), focus.cursor);
-            if let Some(rel) = app.log_details.iter().position(|target| {
+            if let Some(rel) = app.viewport.log_details.iter().position(|target| {
                 target
                     .as_ref()
                     .is_some_and(|target| target.key == key && target.row == Some(cursor))
             }) {
-                let (cstart, cend) = app.log_vis[rel].content;
+                let (cstart, cend) = app.viewport.log_vis[rel].content;
                 focus.col = if cend > cstart {
                     focus.col.clamp(cstart, cend - 1)
                 } else {
@@ -640,9 +627,9 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(focus) = app.detail_focus.as_ref() {
         if let Some(rel) = app.focused_detail_row_index(focus.cursor) {
-            app.nav_cursor = off.saturating_add(rel);
-            app.nav_col = focus.col;
-            if app.mode == Mode::Navigate {
+            app.viewport.nav_cursor = off.saturating_add(rel);
+            app.viewport.nav_col = focus.col;
+            if app.viewport.mode == Mode::Navigate {
                 prim::apply_line_bg(&mut vis[rel], app.theme.cursor_line);
                 let used: usize = vis[rel]
                     .spans
@@ -673,23 +660,23 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
     // the cursor cell in a distinct color over the selection. Blank spacing
     // lines have no spans to tint, so fill the width — otherwise the cursor
     // vanishes between blocks.
-    if (app.detail_focus.is_none() || app.mode == Mode::Select)
-        && matches!(app.mode, Mode::Navigate | Mode::Select)
+    if (app.detail_focus.is_none() || app.viewport.mode == Mode::Select)
+        && matches!(app.viewport.mode, Mode::Navigate | Mode::Select)
     {
-        let cur = app.nav_cursor;
+        let cur = app.viewport.nav_cursor;
         if cur >= off && cur < off + vis.len() {
             let rel = cur - off;
-            let (cstart, cend) = app.log_vis.get(rel).map_or((0, 0), |v| v.content);
+            let (cstart, cend) = app.viewport.log_vis.get(rel).map_or((0, 0), |v| v.content);
             // Cursor cell column: within the content, or at the content start
             // for empty-content lines (e.g. a numbered exec line whose body
             // is blank) so the cursor sits at the first content position.
             let col = if cend > cstart {
-                app.nav_col.clamp(cstart, cend - 1)
+                app.viewport.nav_col.clamp(cstart, cend - 1)
             } else {
                 cstart
             };
             if vis[rel].spans.is_empty() {
-                if app.mode == Mode::Navigate {
+                if app.viewport.mode == Mode::Navigate {
                     vis[rel] = Line::from(vec![
                         Span::styled("  ", Style::new().bg(app.theme.cursor_line)),
                         Span::styled(" ", Style::new().bg(app.theme.select_cursor)),
@@ -704,7 +691,7 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
                         Span::styled(" ", app.theme.badge_style(app.theme.warn)),
                     ]);
                 }
-            } else if app.mode == Mode::Navigate {
+            } else if app.viewport.mode == Mode::Navigate {
                 prim::apply_line_bg(&mut vis[rel], app.theme.cursor_line);
                 // Pad past the text so the cursor-line bg spans the whole
                 // row, not just the available text length.
@@ -734,8 +721,8 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
 
     let para = Paragraph::new(vis).scroll((0, 0));
     f.render_widget(para, content);
-    prim::apply_hyperlinks(f.buffer_mut(), content, &app.log_vis, &links);
-    let active = matches!(app.mode, Mode::Navigate | Mode::Select)
+    prim::apply_hyperlinks(f.buffer_mut(), content, &app.viewport.log_vis, &links);
+    let active = matches!(app.viewport.mode, Mode::Navigate | Mode::Select)
         && app.detail_focus.is_none()
         && !app.modal_open();
     let (gauge_off, gauge_total) = app.scrollbar_gauge(off, total);
@@ -770,27 +757,27 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     let scroll_area = prim::scroll_area(area);
     let content = scroll_area.content;
     let content_w = content.width as usize;
-    let active = app.mode == Mode::Input && !app.modal_open();
+    let active = app.viewport.mode == Mode::Input && !app.modal_open();
     let text_style = if active {
         t.text_style()
     } else {
         t.muted_style()
     };
 
-    let rows = app.input_select_rows(content_w);
-    let total = rows.len();
+    let layout = app.prompt_layout(content_w);
+    let total = layout.rows.len();
     let vis_h = area.height as usize;
-    let start = app.input_scroll.min(total.saturating_sub(vis_h));
+    let start = app.prompt.scroll.min(total.saturating_sub(vis_h));
     let end = (start + vis_h).min(total);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(start));
-    for seg in &rows[start..end] {
+    for seg in &layout.rows[start..end] {
         lines.push(Line::from(vec![Span::styled(seg.clone(), text_style)]));
     }
     f.render_widget(Paragraph::new(lines).style(t.panel_style()), content);
 
     if active {
-        let (vrow, x_in) = app.input_cursor_pos(content_w);
+        let (vrow, x_in) = (layout.cursor_row, layout.cursor_col);
         if vrow >= start && vrow < end {
             let x = content
                 .x
@@ -817,10 +804,10 @@ fn render_footer_block(f: &mut Frame, area: Rect, app: &mut App) {
     let w = area.width;
     let panel = area;
     f.render_widget(Block::default().style(t.panel_style()), panel);
-    let active = app.mode == Mode::Input && !app.modal_open();
+    let active = app.viewport.mode == Mode::Input && !app.modal_open();
     let bar = if !active {
         t.subtle
-    } else if app.input.starts_with('!') {
+    } else if app.prompt.text.starts_with('!') {
         t.warn
     } else {
         t.user
@@ -844,7 +831,7 @@ fn render_footer_block(f: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(1),
     ])
     .split(inner);
-    app.input_rect = prim::scroll_area(chunks[1]).content;
+    app.prompt.rect = prim::scroll_area(chunks[1]).content;
     render_input(f, chunks[1], app);
     render_info(f, chunks[3], app);
 }

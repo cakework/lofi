@@ -3,8 +3,8 @@ use super::*;
 #[test]
 fn selection_text_is_content_aware() {
     let mut a = app();
-    a.log_off = 0;
-    a.log_vis = vec![
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = vec![
         view::VisLine {
             rendered: "  hello world   ".to_string(),
             content: (2, 13),
@@ -21,7 +21,7 @@ fn selection_text_is_content_aware() {
             raw: None,
         },
     ];
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (0, 0),
         end: (2, 40),
     });
@@ -34,8 +34,8 @@ fn selection_text_is_content_aware() {
 #[test]
 fn yank_line_returns_raw_markdown() {
     let mut a = app();
-    a.log_off = 0;
-    a.log_vis = vec![view::VisLine {
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = vec![view::VisLine {
         rendered: "  bold".to_string(),
         content: (2, 6), // rendered "bold"
         raw: Some(view::RawLine::new(
@@ -44,28 +44,28 @@ fn yank_line_returns_raw_markdown() {
             true,
         )),
     }];
-    a.nav_cursor = 0;
+    a.viewport.nav_cursor = 0;
     assert_eq!(a.current_line_text().as_deref(), Some("**bold**"));
 }
 
 #[test]
 fn yank_line_falls_back_to_rendered_without_raw() {
     let mut a = app();
-    a.log_off = 0;
-    a.log_vis = vec![view::VisLine {
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = vec![view::VisLine {
         rendered: "  hello world   ".to_string(),
         content: (2, 13),
         raw: None,
     }];
-    a.nav_cursor = 0;
+    a.viewport.nav_cursor = 0;
     assert_eq!(a.current_line_text().as_deref(), Some("hello world"));
 }
 
 #[test]
 fn selection_text_raw_partial_includes_markers() {
     let mut a = app();
-    a.log_off = 0;
-    a.log_vis = vec![view::VisLine {
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = vec![view::VisLine {
         rendered: "  bold".to_string(),
         content: (2, 6),
         raw: Some(view::RawLine::new(
@@ -74,7 +74,7 @@ fn selection_text_raw_partial_includes_markers() {
             true,
         )),
     }];
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (0, 2),
         end: (0, 6),
     });
@@ -84,9 +84,9 @@ fn selection_text_raw_partial_includes_markers() {
 #[test]
 fn selection_text_raw_skips_softwrap_newlines() {
     let mut a = app();
-    a.log_off = 0;
+    a.viewport.log_off = 0;
     let first: Arc<str> = Arc::from("hello world");
-    a.log_vis = vec![
+    a.viewport.log_vis = vec![
         view::VisLine {
             rendered: "  hello ".to_string(),
             content: (2, 8),
@@ -103,7 +103,7 @@ fn selection_text_raw_skips_softwrap_newlines() {
             raw: Some(view::RawLine::linear(Arc::from("second line"), 0, 11, true)),
         },
     ];
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (0, 2),
         end: (2, 13),
     });
@@ -116,9 +116,9 @@ fn selection_text_raw_skips_softwrap_newlines() {
 #[test]
 fn selection_text_raw_char_level_on_continuation() {
     let mut a = app();
-    a.log_off = 0;
+    a.viewport.log_off = 0;
     let first: Arc<str> = Arc::from("hello world");
-    a.log_vis = vec![
+    a.viewport.log_vis = vec![
         view::VisLine {
             rendered: "  hello ".to_string(),
             content: (2, 8),
@@ -130,7 +130,7 @@ fn selection_text_raw_char_level_on_continuation() {
             raw: Some(view::RawLine::linear(first.clone(), 6, 5, false)),
         },
     ];
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (1, 2),
         end: (1, 7),
     });
@@ -145,28 +145,28 @@ fn ctrl_k_at_end_of_buffer_does_nothing() {
     a.set_input("hello".to_string());
     a.move_line_end();
     a.kill_line_end(false);
-    assert_eq!(a.input, "hello");
-    assert!(a.kill_ring.is_empty());
+    assert_eq!(a.prompt.text, "hello");
+    assert!(a.prompt.kill_ring.is_empty());
 }
 
 #[test]
 fn ctrl_k_kills_to_end_of_line_not_newline() {
     let mut a = app();
     a.set_input("hello world\nfoo".to_string());
-    a.input_cursor = 0;
+    a.prompt.cursor = 0;
     a.kill_line_end(false);
-    assert_eq!(a.input, "\nfoo");
-    assert_eq!(a.kill_ring, "hello world");
+    assert_eq!(a.prompt.text, "\nfoo");
+    assert_eq!(a.prompt.kill_ring, "hello world");
 }
 
 #[test]
 fn ctrl_k_kills_trailing_newline_on_empty_remainder() {
     let mut a = app();
     a.set_input("foo\nbar".to_string());
-    a.input_cursor = 0;
+    a.prompt.cursor = 0;
     a.move_line_end();
     a.kill_line_end(false);
-    assert_eq!(a.input, "foobar");
+    assert_eq!(a.prompt.text, "foobar");
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn ctrl_c_clears_nonempty_prompt() {
     a.set_input("a draft".to_string());
     let mut run = None;
     handle_event(&ctrl_key(KeyCode::Char('c')), &mut a, None, &mut run);
-    assert_eq!(a.input, "");
+    assert_eq!(a.prompt.text, "");
     assert!(!a.should_quit);
 }
 
@@ -200,81 +200,81 @@ fn ctrl_c_single_press_on_empty_does_not_quit() {
 #[test]
 fn scroll_up_enters_nav_and_clamps_cursor_to_bottom_edge() {
     let mut a = app();
-    a.mode = Mode::Input;
-    a.log_total = 20;
-    a.log_view_h = 5;
-    a.last_base = 15; // base = total - height
-    a.pinned = true; // sitting at the bottom
-    a.nav_cursor = 19; // bottom line
+    a.viewport.mode = Mode::Input;
+    a.viewport.log_total = 20;
+    a.viewport.log_view_h = 5;
+    a.viewport.last_base = 15; // base = total - height
+    a.viewport.pinned = true; // sitting at the bottom
+    a.viewport.nav_cursor = 19; // bottom line
     a.scroll_nav(-3);
-    assert_eq!(a.mode, Mode::Navigate);
+    assert_eq!(a.viewport.mode, Mode::Navigate);
     assert_eq!(a.view_off(), 12);
-    assert_eq!(a.nav_cursor, 16);
+    assert_eq!(a.viewport.nav_cursor, 16);
 }
 
 #[test]
 fn scroll_down_clamps_cursor_to_top_edge() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.log_total = 20;
-    a.log_view_h = 5;
-    a.last_base = 15;
-    a.pinned = false;
-    a.top_line = 10;
-    a.nav_cursor = 10; // top of the viewport
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_total = 20;
+    a.viewport.log_view_h = 5;
+    a.viewport.last_base = 15;
+    a.viewport.pinned = false;
+    a.viewport.top_line = 10;
+    a.viewport.nav_cursor = 10; // top of the viewport
     a.scroll_nav(3);
     assert_eq!(a.view_off(), 13);
-    assert_eq!(a.nav_cursor, 13);
+    assert_eq!(a.viewport.nav_cursor, 13);
 }
 
 #[test]
 fn scroll_keeps_cursor_when_still_visible() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.log_total = 20;
-    a.log_view_h = 5;
-    a.last_base = 15;
-    a.pinned = false;
-    a.top_line = 10;
-    a.nav_cursor = 12; // middle of [10, 14]
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_total = 20;
+    a.viewport.log_view_h = 5;
+    a.viewport.last_base = 15;
+    a.viewport.pinned = false;
+    a.viewport.top_line = 10;
+    a.viewport.nav_cursor = 12; // middle of [10, 14]
     a.scroll_nav(1);
     assert_eq!(a.view_off(), 11);
-    assert_eq!(a.nav_cursor, 12); // still inside [11, 15]
+    assert_eq!(a.viewport.nav_cursor, 12); // still inside [11, 15]
 }
 
 #[test]
 fn navigating_to_latest_line_pins_before_settle_reflows_log() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.log_total = 20;
-    a.log_view_h = 5;
-    a.last_base = 15;
-    a.log_off = 10;
-    a.top_line = 10;
-    a.nav_cursor = 14;
-    a.pinned = false;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_total = 20;
+    a.viewport.log_view_h = 5;
+    a.viewport.last_base = 15;
+    a.viewport.log_off = 10;
+    a.viewport.top_line = 10;
+    a.viewport.nav_cursor = 14;
+    a.viewport.pinned = false;
 
     // Reaching the final line means follow the tail. This must be recorded
     // before the next render because run settlement can change the last
     // turn's height in between.
     a.nav_bottom();
-    assert!(a.pinned);
-    assert_eq!(a.top_line, 15);
+    assert!(a.viewport.pinned);
+    assert_eq!(a.viewport.top_line, 15);
 
-    a.last_base = 18;
+    a.viewport.last_base = 18;
     assert_eq!(a.view_off(), 18);
 }
 
 #[test]
 fn scroll_at_boundary_leaves_mode_untouched() {
     let mut a = app();
-    a.mode = Mode::Input;
-    a.log_total = 20;
-    a.log_view_h = 5;
-    a.last_base = 15;
-    a.pinned = true; // already at the bottom
+    a.viewport.mode = Mode::Input;
+    a.viewport.log_total = 20;
+    a.viewport.log_view_h = 5;
+    a.viewport.last_base = 15;
+    a.viewport.pinned = true; // already at the bottom
     a.scroll_nav(3); // scrolling down does nothing
-    assert_eq!(a.mode, Mode::Input);
+    assert_eq!(a.viewport.mode, Mode::Input);
 }
 
 #[test]
@@ -292,10 +292,10 @@ fn ctrl_c_on_empty_shows_quit_badge() {
 fn ctrl_d_deletes_char_or_quits_on_empty() {
     let mut a = app();
     a.set_input("ab".to_string());
-    a.input_cursor = 0;
+    a.prompt.cursor = 0;
     let mut run = None;
     handle_event(&ctrl_key(KeyCode::Char('d')), &mut a, None, &mut run);
-    assert_eq!(a.input, "b");
+    assert_eq!(a.prompt.text, "b");
     assert!(!a.should_quit);
     let mut b = app();
     handle_event(&ctrl_key(KeyCode::Char('d')), &mut b, None, &mut run);
@@ -353,12 +353,12 @@ fn tab_enters_navigate_and_esc_clears() {
     let mut a = app();
     let mut run = None;
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
-    assert_eq!(a.mode, Mode::Navigate);
+    assert_eq!(a.viewport.mode, Mode::Navigate);
     let mut b = app();
     b.set_input("draft".to_string());
     handle_event(&plain_key(KeyCode::Esc), &mut b, None, &mut run);
-    assert_eq!(b.mode, Mode::Input);
-    assert_eq!(b.input, "");
+    assert_eq!(b.viewport.mode, Mode::Input);
+    assert_eq!(b.prompt.text, "");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -390,7 +390,7 @@ async fn escape_interrupts_run_and_restores_queue_like_pi() {
 
     assert!(cancel.load(Ordering::Relaxed));
     assert!(a.prompt_queue.is_empty());
-    assert_eq!(a.input, "steer first\n\nfollow up\n\ndraft");
+    assert_eq!(a.prompt.text, "steer first\n\nfollow up\n\ndraft");
     run.take().unwrap().handle.abort();
 }
 
@@ -412,7 +412,7 @@ async fn esc_in_nav_returns_to_input_without_interrupting_run() {
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
 
     assert!(!cancel.load(Ordering::Relaxed), "run must survive");
-    assert_eq!(a.mode, Mode::Input);
+    assert_eq!(a.viewport.mode, Mode::Input);
     run.take().unwrap().handle.abort();
 }
 
@@ -435,8 +435,8 @@ async fn esc_in_select_peels_to_nav_without_interrupting_run() {
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
 
     assert!(!cancel.load(Ordering::Relaxed), "run must survive");
-    assert_eq!(a.mode, Mode::Navigate);
-    assert!(a.sel.is_none());
+    assert_eq!(a.viewport.mode, Mode::Navigate);
+    assert!(a.viewport.sel.is_none());
     run.take().unwrap().handle.abort();
 }
 
@@ -445,7 +445,7 @@ async fn escape_dismisses_completion_before_interrupting_run() {
     let mut a = app();
     a.set_input("/".to_string());
     a.refresh_slash_complete();
-    assert!(a.slash_complete.is_some());
+    assert!(a.prompt.slash_complete.is_some());
     let cancel = Arc::new(AtomicBool::new(false));
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut run = Some(RunHandle {
@@ -460,8 +460,8 @@ async fn escape_dismisses_completion_before_interrupting_run() {
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
 
     assert!(!cancel.load(Ordering::Relaxed));
-    assert!(a.slash_complete.is_none());
-    assert_eq!(a.input, "/");
+    assert!(a.prompt.slash_complete.is_none());
+    assert_eq!(a.prompt.text, "/");
     run.take().unwrap().handle.abort();
 }
 
@@ -483,8 +483,8 @@ async fn ctrl_c_in_nav_does_not_interrupt_run() {
     handle_event(&ctrl_key(KeyCode::Char('c')), &mut a, None, &mut run);
 
     assert!(!cancel.load(Ordering::Relaxed), "run must survive");
-    assert_eq!(a.mode, Mode::Input);
-    assert!(a.pinned);
+    assert_eq!(a.viewport.mode, Mode::Input);
+    assert!(a.viewport.pinned);
     run.take().unwrap().handle.abort();
 }
 
@@ -506,7 +506,7 @@ async fn ctrl_c_clears_draft_without_interrupting_run() {
     handle_event(&ctrl_key(KeyCode::Char('c')), &mut a, None, &mut run);
 
     assert!(!cancel.load(Ordering::Relaxed), "run must survive");
-    assert_eq!(a.input, "");
+    assert_eq!(a.prompt.text, "");
     run.take().unwrap().handle.abort();
 }
 
@@ -580,31 +580,31 @@ async fn ctrl_c_quits_when_a_cancel_met_no_answer() {
 #[test]
 fn navigate_jk_moves_cursor_and_clamps() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.log_total = 10;
-    a.log_view_h = 4;
-    a.nav_cursor = 9;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_total = 10;
+    a.viewport.log_view_h = 4;
+    a.viewport.nav_cursor = 9;
     a.nav_move(-3);
-    assert_eq!(a.nav_cursor, 6);
+    assert_eq!(a.viewport.nav_cursor, 6);
     a.nav_move(-100);
-    assert_eq!(a.nav_cursor, 0);
+    assert_eq!(a.viewport.nav_cursor, 0);
     a.nav_move(100);
-    assert_eq!(a.nav_cursor, 9);
+    assert_eq!(a.viewport.nav_cursor, 9);
 }
 
 #[test]
 fn select_sel_is_charwise_inclusive() {
     let mut a = app();
-    a.mode = Mode::Select;
-    a.select_anchor = (2, 3);
-    a.nav_cursor = 5;
-    a.nav_col = 6;
+    a.viewport.mode = Mode::Select;
+    a.viewport.select_anchor = (2, 3);
+    a.viewport.nav_cursor = 5;
+    a.viewport.nav_col = 6;
     let sel = a.select_sel();
     // Max end is exclusive (+1) so the cursor char is included.
     assert_eq!(sel.start, (2, 3));
     assert_eq!(sel.end, (5, 7));
-    a.nav_cursor = 1;
-    a.nav_col = 1;
+    a.viewport.nav_cursor = 1;
+    a.viewport.nav_col = 1;
     let sel = a.select_sel();
     assert_eq!(sel.start, (1, 1));
     assert_eq!(sel.end, (2, 4));
@@ -613,46 +613,46 @@ fn select_sel_is_charwise_inclusive() {
 #[test]
 fn v_enters_select_and_extends_selection() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.log_total = 10;
-    a.log_view_h = 4;
-    a.nav_cursor = 3;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_total = 10;
+    a.viewport.log_view_h = 4;
+    a.viewport.nav_cursor = 3;
     let mut run = None;
     handle_event(&plain_key(KeyCode::Char('v')), &mut a, None, &mut run);
-    assert_eq!(a.mode, Mode::Select);
-    assert_eq!(a.sel.as_ref().unwrap().start, (3, 0));
-    assert_eq!(a.sel.as_ref().unwrap().end, (3, 1));
+    assert_eq!(a.viewport.mode, Mode::Select);
+    assert_eq!(a.viewport.sel.as_ref().unwrap().start, (3, 0));
+    assert_eq!(a.viewport.sel.as_ref().unwrap().end, (3, 1));
     handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 4);
-    assert_eq!(a.sel.as_ref().unwrap().start, (3, 0));
-    assert_eq!(a.sel.as_ref().unwrap().end, (4, 1));
+    assert_eq!(a.viewport.nav_cursor, 4);
+    assert_eq!(a.viewport.sel.as_ref().unwrap().start, (3, 0));
+    assert_eq!(a.viewport.sel.as_ref().unwrap().end, (4, 1));
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
-    assert_eq!(a.mode, Mode::Navigate);
-    assert!(a.sel.is_none());
+    assert_eq!(a.viewport.mode, Mode::Navigate);
+    assert!(a.viewport.sel.is_none());
 }
 
 #[test]
 fn esc_discards_select_back_to_nav() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.log_total = 10;
-    a.log_view_h = 4;
-    a.nav_cursor = 3;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_total = 10;
+    a.viewport.log_view_h = 4;
+    a.viewport.nav_cursor = 3;
     let mut run = None;
     handle_event(&plain_key(KeyCode::Char('v')), &mut a, None, &mut run);
-    assert_eq!(a.mode, Mode::Select);
+    assert_eq!(a.viewport.mode, Mode::Select);
     handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
-    assert!(a.sel.is_some());
+    assert!(a.viewport.sel.is_some());
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
-    assert_eq!(a.mode, Mode::Navigate);
-    assert!(a.sel.is_none());
+    assert_eq!(a.viewport.mode, Mode::Navigate);
+    assert!(a.viewport.sel.is_none());
 }
 
 #[test]
 fn turn_start_line_accounts_for_blanks() {
     let mut a = app();
     a.layout.frozen_heights = vec![3, 2];
-    a.last_turn_height = 4;
+    a.viewport.last_turn_height = 4;
     a.transcript.turns.clear();
     for _ in 0..3 {
         push_turn(&mut a);
@@ -665,39 +665,39 @@ fn turn_start_line_accounts_for_blanks() {
 #[test]
 fn bracket_jumps_between_turns() {
     let mut a = app();
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
     a.layout.frozen_heights = vec![3, 2];
-    a.last_turn_height = 4;
-    a.log_total = 3 + 1 + 2 + 1 + 4;
-    a.log_view_h = 10;
+    a.viewport.last_turn_height = 4;
+    a.viewport.log_total = 3 + 1 + 2 + 1 + 4;
+    a.viewport.log_view_h = 10;
     a.transcript.turns.clear();
     for _ in 0..3 {
         push_turn(&mut a);
     }
     let mut run = None;
-    a.nav_cursor = 1;
+    a.viewport.nav_cursor = 1;
     handle_event(&plain_key(KeyCode::Char(']')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 4);
+    assert_eq!(a.viewport.nav_cursor, 4);
     handle_event(&plain_key(KeyCode::Char(']')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 7);
+    assert_eq!(a.viewport.nav_cursor, 7);
     handle_event(&plain_key(KeyCode::Char(']')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 7);
+    assert_eq!(a.viewport.nav_cursor, 7);
     handle_event(&plain_key(KeyCode::Char('[')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 4);
+    assert_eq!(a.viewport.nav_cursor, 4);
     handle_event(&plain_key(KeyCode::Char('[')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 0);
+    assert_eq!(a.viewport.nav_cursor, 0);
     handle_event(&plain_key(KeyCode::Char('[')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 0);
+    assert_eq!(a.viewport.nav_cursor, 0);
 }
 
 #[test]
 fn bracket_back_from_inside_a_turn_lands_on_its_first_line() {
     let mut a = app();
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
     a.layout.frozen_heights = vec![3, 2];
-    a.last_turn_height = 4;
-    a.log_total = 3 + 1 + 2 + 1 + 4;
-    a.log_view_h = 10;
+    a.viewport.last_turn_height = 4;
+    a.viewport.log_total = 3 + 1 + 2 + 1 + 4;
+    a.viewport.log_view_h = 10;
     a.transcript.turns.clear();
     for _ in 0..3 {
         push_turn(&mut a);
@@ -705,57 +705,57 @@ fn bracket_back_from_inside_a_turn_lands_on_its_first_line() {
     let mut run = None;
     // The live turn is unsettled: the cursor reached it through its answer,
     // not through its first line.
-    a.nav_cursor = 7;
+    a.viewport.nav_cursor = 7;
     handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 8);
+    assert_eq!(a.viewport.nav_cursor, 8);
     handle_event(&plain_key(KeyCode::Char('[')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 7);
+    assert_eq!(a.viewport.nav_cursor, 7);
     handle_event(&plain_key(KeyCode::Char('[')), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 4);
+    assert_eq!(a.viewport.nav_cursor, 4);
 }
 
 #[test]
 fn page_keys_move_cursor_in_nav() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.log_total = 40;
-    a.log_view_h = 10;
-    a.nav_cursor = 20;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_total = 40;
+    a.viewport.log_view_h = 10;
+    a.viewport.nav_cursor = 20;
     let mut run = None;
     handle_event(&plain_key(KeyCode::PageDown), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 30);
+    assert_eq!(a.viewport.nav_cursor, 30);
     handle_event(&plain_key(KeyCode::PageUp), &mut a, None, &mut run);
-    assert_eq!(a.nav_cursor, 20);
+    assert_eq!(a.viewport.nav_cursor, 20);
 }
 
 #[test]
 fn page_down_in_input_pins_at_bottom() {
     let mut a = app();
-    a.mode = Mode::Input;
-    a.log_total = 40;
-    a.log_view_h = 10;
-    a.last_base = 30;
-    a.top_line = 0;
-    a.pinned = false;
+    a.viewport.mode = Mode::Input;
+    a.viewport.log_total = 40;
+    a.viewport.log_view_h = 10;
+    a.viewport.last_base = 30;
+    a.viewport.top_line = 0;
+    a.viewport.pinned = false;
     let mut run = None;
     handle_event(&plain_key(KeyCode::PageDown), &mut a, None, &mut run);
-    assert_eq!(a.top_line, 10);
-    assert!(!a.pinned);
+    assert_eq!(a.viewport.top_line, 10);
+    assert!(!a.viewport.pinned);
     for _ in 0..3 {
         handle_event(&plain_key(KeyCode::PageDown), &mut a, None, &mut run);
     }
-    assert!(a.pinned);
+    assert!(a.viewport.pinned);
     handle_event(&plain_key(KeyCode::PageUp), &mut a, None, &mut run);
-    assert!(!a.pinned);
+    assert!(!a.viewport.pinned);
 }
 
 #[test]
 fn ctrl_c_in_nav_returns_to_input_pinned() {
     let mut a = app();
-    a.mode = Mode::Navigate;
-    a.last_base = 42;
-    a.top_line = 5;
-    a.pinned = false;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.last_base = 42;
+    a.viewport.top_line = 5;
+    a.viewport.pinned = false;
     let mut run = None;
     handle_event(
         &Event::Key(crossterm::event::KeyEvent::new_with_kind(
@@ -767,22 +767,22 @@ fn ctrl_c_in_nav_returns_to_input_pinned() {
         None,
         &mut run,
     );
-    assert_eq!(a.mode, Mode::Input);
-    assert!(a.pinned);
-    assert_eq!(a.top_line, 42);
+    assert_eq!(a.viewport.mode, Mode::Input);
+    assert!(a.viewport.pinned);
+    assert_eq!(a.viewport.top_line, 42);
 }
 
 #[test]
 fn detail_keys_focus_and_scroll_the_expanded_row() {
     let mut a = app();
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
-    a.log_off = 0;
-    a.log_total = 1;
-    a.log_view_h = 1;
-    a.nav_cursor = 0;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_off = 0;
+    a.viewport.log_total = 1;
+    a.viewport.log_view_h = 1;
+    a.viewport.nav_cursor = 0;
     let key = DetailKey::NativeTool { parent: 0, id: 7 };
-    a.log_details = vec![Some(view::DetailTarget {
+    a.viewport.log_details = vec![Some(view::DetailTarget {
         key: key.clone(),
         total: 12,
         tail: false,
@@ -813,7 +813,7 @@ fn detail_keys_focus_and_scroll_the_expanded_row() {
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
     assert!(!a.expanded_details.contains_key(&key));
     assert!(a.detail_focus.is_none());
-    assert_eq!(a.mode, Mode::Navigate);
+    assert_eq!(a.viewport.mode, Mode::Navigate);
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
     assert!(a.expanded_details.contains_key(&key));
     assert!(a.detail_focus.is_some());
@@ -825,13 +825,13 @@ fn detail_keys_focus_and_scroll_the_expanded_row() {
 fn user_shell_detail_enters_and_leaves_scroll_without_closing() {
     let mut a = app();
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
-    a.log_off = 0;
-    a.log_total = 1;
-    a.log_view_h = 1;
-    a.nav_cursor = 0;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_off = 0;
+    a.viewport.log_total = 1;
+    a.viewport.log_view_h = 1;
+    a.viewport.nav_cursor = 0;
     let key = DetailKey::UserShell(0);
-    a.log_details = vec![Some(view::DetailTarget {
+    a.viewport.log_details = vec![Some(view::DetailTarget {
         key: key.clone(),
         total: 12,
         tail: true,
@@ -862,7 +862,7 @@ fn user_shell_detail_enters_and_leaves_scroll_without_closing() {
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
     assert!(a.expanded_details.contains_key(&key));
     assert!(a.detail_focus.is_none());
-    assert_eq!(a.mode, Mode::Navigate);
+    assert_eq!(a.viewport.mode, Mode::Navigate);
 }
 
 #[test]
@@ -900,11 +900,12 @@ fn tail_result_expansion_focuses_its_last_row() {
     term.draw(|frame| crate::tui::view::render(frame, &mut a))
         .unwrap();
     let mut run = None;
-    a.mode = Mode::Input;
+    a.viewport.mode = Mode::Input;
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
     for _ in 0..20 {
-        let rel = a.nav_cursor.saturating_sub(a.log_off);
+        let rel = a.viewport.nav_cursor.saturating_sub(a.viewport.log_off);
         let text = a
+            .viewport
             .log_vis
             .get(rel)
             .map(|v| v.rendered.clone())
@@ -914,9 +915,11 @@ fn tail_result_expansion_focuses_its_last_row() {
         }
         handle_event(&plain_key(KeyCode::Char('k')), &mut a, None, &mut run);
     }
-    assert!(a.log_vis[a.nav_cursor - a.log_off]
-        .rendered
-        .contains("Succeed"));
+    assert!(
+        a.viewport.log_vis[a.viewport.nav_cursor - a.viewport.log_off]
+            .rendered
+            .contains("Succeed")
+    );
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
     term.draw(|frame| crate::tui::view::render(frame, &mut a))
         .unwrap();
@@ -929,6 +932,7 @@ fn tail_result_expansion_focuses_its_last_row() {
         "a tail detail focuses its last row after expansion"
     );
     let rel = a
+        .viewport
         .log_details
         .iter()
         .position(|target| {
@@ -937,21 +941,21 @@ fn tail_result_expansion_focuses_its_last_row() {
             })
         })
         .expect("last result row");
-    assert_eq!(a.nav_cursor, a.log_off + rel);
-    assert!(a.log_vis[rel].rendered.contains("tail-res-19"));
+    assert_eq!(a.viewport.nav_cursor, a.viewport.log_off + rel);
+    assert!(a.viewport.log_vis[rel].rendered.contains("tail-res-19"));
 }
 
 #[test]
 fn tail_detail_expansion_focuses_its_last_row() {
     let mut a = app();
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
-    a.log_off = 0;
-    a.log_total = 1;
-    a.log_view_h = 1;
-    a.nav_cursor = 0;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_off = 0;
+    a.viewport.log_total = 1;
+    a.viewport.log_view_h = 1;
+    a.viewport.nav_cursor = 0;
     let key = DetailKey::ExecResult(0);
-    a.log_details = vec![Some(view::DetailTarget {
+    a.viewport.log_details = vec![Some(view::DetailTarget {
         key: key.clone(),
         total: 12,
         tail: true,
@@ -972,13 +976,13 @@ fn tail_detail_expansion_focuses_its_last_row() {
 fn leaving_for_input_collapses_the_focused_detail() {
     let mut a = app();
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
-    a.log_off = 0;
-    a.log_total = 1;
-    a.log_view_h = 1;
-    a.nav_cursor = 0;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_off = 0;
+    a.viewport.log_total = 1;
+    a.viewport.log_view_h = 1;
+    a.viewport.nav_cursor = 0;
     let key = DetailKey::NativeTool { parent: 0, id: 7 };
-    a.log_details = vec![Some(view::DetailTarget {
+    a.viewport.log_details = vec![Some(view::DetailTarget {
         key: key.clone(),
         total: 12,
         tail: false,
@@ -990,10 +994,10 @@ fn leaving_for_input_collapses_the_focused_detail() {
     assert!(a.expanded_details.contains_key(&key));
     handle_event(&plain_key(KeyCode::Char('v')), &mut a, None, &mut run);
     handle_event(&plain_key(KeyCode::Char('y')), &mut a, None, &mut run);
-    assert_eq!(a.mode, Mode::Input);
+    assert_eq!(a.viewport.mode, Mode::Input);
     assert!(!a.expanded_details.contains_key(&key));
     assert!(a.detail_focus.is_none());
-    assert_eq!(a.nav_cursor, 0);
+    assert_eq!(a.viewport.nav_cursor, 0);
 }
 
 #[test]
@@ -1013,24 +1017,26 @@ fn expanding_in_flight_exec_at_viewport_bottom_keeps_body_visible() {
     let mut term = Terminal::new(TestBackend::new(80, 11)).unwrap();
     term.draw(|frame| crate::tui::view::render(frame, &mut a))
         .unwrap();
-    assert!(a.log_view_h > 0);
+    assert!(a.viewport.log_view_h > 0);
 
     a.enter_nav();
     // The running work lives in the block above the input, not in the
     // transcript, so seat the cursor on the Exec row itself.
     let exec_row = a
+        .viewport
         .log_vis
         .iter()
         .position(|line| line.rendered.contains("Exec"))
         .expect("the Exec row is in the viewport");
-    a.nav_cursor = a.log_off + exec_row;
+    a.viewport.nav_cursor = a.viewport.log_off + exec_row;
     let mut run = None;
     handle_event(&plain_key(KeyCode::Char(' ')), &mut a, None, &mut run);
     term.draw(|frame| crate::tui::view::render(frame, &mut a))
         .unwrap();
 
     assert!(
-        a.log_vis
+        a.viewport
+            .log_vis
             .iter()
             .any(|line| line.rendered.contains("in-flight exec body")),
         "the focused body row must be brought into the viewport"
@@ -1061,6 +1067,7 @@ fn focused_detail_row_shows_a_cursor_cell_in_navigate() {
     term.draw(|frame| crate::tui::view::render(frame, &mut a))
         .unwrap();
     let header = a
+        .viewport
         .log_details
         .iter()
         .position(|target| {
@@ -1069,8 +1076,8 @@ fn focused_detail_row_shows_a_cursor_cell_in_navigate() {
                 .is_some_and(|target| target.key == key && target.row.is_none())
         })
         .expect("exec detail header");
-    a.mode = Mode::Navigate;
-    a.nav_cursor = header;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.nav_cursor = header;
     let mut run = None;
 
     handle_event(&plain_key(KeyCode::Char(' ')), &mut a, None, &mut run);
@@ -1078,6 +1085,7 @@ fn focused_detail_row_shows_a_cursor_cell_in_navigate() {
         .unwrap();
 
     let rel = a
+        .viewport
         .log_details
         .iter()
         .position(|target| {
@@ -1086,7 +1094,7 @@ fn focused_detail_row_shows_a_cursor_cell_in_navigate() {
                 .is_some_and(|target| target.key == key && target.row == Some(0))
         })
         .expect("focused detail row");
-    let y = a.log_rect.y + rel as u16;
+    let y = a.viewport.log_rect.y + rel as u16;
     let buf = term.backend().buffer();
     let bg_at = |x: u16| buf[(x, y)].bg;
     assert!(
@@ -1128,6 +1136,7 @@ copy detail two"
     term.draw(|frame| crate::tui::view::render(frame, &mut a))
         .unwrap();
     let header = a
+        .viewport
         .log_details
         .iter()
         .position(|target| {
@@ -1136,8 +1145,8 @@ copy detail two"
                 .is_some_and(|target| target.key == key && target.row.is_none())
         })
         .expect("exec detail header");
-    a.mode = Mode::Navigate;
-    a.nav_cursor = header;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.nav_cursor = header;
     let mut run = None;
 
     handle_event(&plain_key(KeyCode::Char(' ')), &mut a, None, &mut run);
@@ -1165,21 +1174,21 @@ copy detail two"
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
     assert!(a.detail_focus.is_none());
     assert!(!a.expanded_details.contains_key(&key));
-    assert_eq!(a.nav_cursor, header);
-    assert_eq!(a.mode, Mode::Navigate);
+    assert_eq!(a.viewport.nav_cursor, header);
+    assert_eq!(a.viewport.mode, Mode::Navigate);
 }
 
 #[test]
 fn mouse_wheel_scrolls_the_inline_detail_under_the_pointer() {
     let mut a = app();
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
-    a.log_rect = ratatui::layout::Rect::new(0, 0, 40, 5);
-    a.log_off = 0;
-    a.log_total = 1;
-    a.log_view_h = 5;
+    a.viewport.mode = Mode::Navigate;
+    a.viewport.log_rect = ratatui::layout::Rect::new(0, 0, 40, 5);
+    a.viewport.log_off = 0;
+    a.viewport.log_total = 1;
+    a.viewport.log_view_h = 5;
     let key = DetailKey::NativeTool { parent: 0, id: 8 };
-    a.log_details = vec![Some(view::DetailTarget {
+    a.viewport.log_details = vec![Some(view::DetailTarget {
         key: key.clone(),
         total: 12,
         tail: false,
@@ -1213,11 +1222,11 @@ fn mouse_wheel_scrolls_the_inline_detail_under_the_pointer() {
 async fn submit_during_a_run_pins_a_scrolled_up_view() {
     let mut a = app();
     push_turn(&mut a);
-    a.pinned = false;
-    a.top_line = 0;
-    a.log_off = 0;
-    a.log_total = 50;
-    a.log_view_h = 10;
+    a.viewport.pinned = false;
+    a.viewport.top_line = 0;
+    a.viewport.log_off = 0;
+    a.viewport.log_total = 50;
+    a.viewport.log_view_h = 10;
     a.set_input("queued while running".to_string());
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut run = Some(RunHandle {
@@ -1232,7 +1241,10 @@ async fn submit_during_a_run_pins_a_scrolled_up_view() {
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
 
     assert_eq!(a.prompt_queue.len(), 1);
-    assert!(a.pinned, "a queued submit must land on the newest line");
+    assert!(
+        a.viewport.pinned,
+        "a queued submit must land on the newest line"
+    );
     run.take().unwrap().handle.abort();
 }
 
@@ -1241,16 +1253,19 @@ async fn submit_during_a_run_pins_a_scrolled_up_view() {
 fn submit_without_a_model_pins_a_scrolled_up_view() {
     let mut a = app();
     push_turn(&mut a);
-    a.pinned = false;
-    a.top_line = 0;
-    a.log_off = 0;
-    a.log_total = 50;
-    a.log_view_h = 10;
+    a.viewport.pinned = false;
+    a.viewport.top_line = 0;
+    a.viewport.log_off = 0;
+    a.viewport.log_total = 50;
+    a.viewport.log_view_h = 10;
     a.set_input("no model here".to_string());
     let mut run = None;
 
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
 
     assert_eq!(a.transcript.turns.len(), 2);
-    assert!(a.pinned, "a pushed turn must land on the newest line");
+    assert!(
+        a.viewport.pinned,
+        "a pushed turn must land on the newest line"
+    );
 }

@@ -24,17 +24,22 @@ impl App {
                         .as_str()
             })
             .unwrap_or(0);
-        self.model_picker = Some(ModelPickerState {
+        self.open_modal(ActiveModal::Model(ModelPickerState {
             choices: self.model_choices.clone(),
             selected,
-        });
+        }));
     }
 
+    pub(in crate::tui) fn model_picker_confirm_inner(&mut self, picker: &ModelPickerState) {
+        if let Some(choice) = picker.choices.get(picker.selected) {
+            self.pending_model_switch = Some(format!("{}/{}", choice.provider, choice.id));
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::tui) fn model_picker_confirm(&mut self) {
-        if let Some(picker) = self.model_picker.take() {
-            if let Some(choice) = picker.choices.get(picker.selected) {
-                self.pending_model_switch = Some(format!("{}/{}", choice.provider, choice.id));
-            }
+        if let Some(ActiveModal::Model(picker)) = self.modal.take() {
+            self.model_picker_confirm_inner(&picker);
         }
     }
 
@@ -52,7 +57,10 @@ impl App {
             return;
         }
         let selected = levels.iter().position(|l| l == &self.thinking).unwrap_or(0);
-        self.thinking_picker = Some(ThinkingPickerState { levels, selected });
+        self.open_modal(ActiveModal::Thinking(ThinkingPickerState {
+            levels,
+            selected,
+        }));
     }
 
     fn current_thinking_choices(&self) -> Vec<ThinkingLevel> {
@@ -92,7 +100,7 @@ impl App {
             .iter()
             .position(|t| t == &self.service_tier)
             .unwrap_or(0);
-        self.service_picker = Some(ServicePickerState { tiers, selected });
+        self.open_modal(ActiveModal::Service(ServicePickerState { tiers, selected }));
     }
 
     fn current_service_choices(&self) -> Vec<ServiceTier> {
@@ -111,21 +119,26 @@ impl App {
         out
     }
 
+    pub(in crate::tui) fn service_picker_confirm_inner(&mut self, picker: &ServicePickerState) {
+        if let Some(tier) = picker.tiers.get(picker.selected) {
+            let tier_suffix = if tier == &ServiceTier::Auto {
+                String::new()
+            } else {
+                format!("@{}", tier.as_str())
+            };
+            self.pending_model_switch = Some(format!(
+                "{}:{}{}",
+                self.switch_label(),
+                self.thinking.as_str(),
+                tier_suffix
+            ));
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::tui) fn service_picker_confirm(&mut self) {
-        if let Some(picker) = self.service_picker.take() {
-            if let Some(tier) = picker.tiers.get(picker.selected) {
-                let tier_suffix = if tier == &ServiceTier::Auto {
-                    String::new()
-                } else {
-                    format!("@{}", tier.as_str())
-                };
-                self.pending_model_switch = Some(format!(
-                    "{}:{}{}",
-                    self.switch_label(),
-                    self.thinking.as_str(),
-                    tier_suffix
-                ));
-            }
+        if let Some(ActiveModal::Service(picker)) = self.modal.take() {
+            self.service_picker_confirm_inner(&picker);
         }
     }
 
@@ -137,14 +150,19 @@ impl App {
             .iter()
             .position(|m| *m == self.theme_manager.mode())
             .unwrap_or(0);
-        self.theme_picker = Some(ThemePickerState { modes, selected });
+        self.open_modal(ActiveModal::Theme(ThemePickerState { modes, selected }));
     }
 
+    pub(in crate::tui) fn theme_picker_confirm_inner(&mut self, picker: &ThemePickerState) {
+        if let Some(&mode) = picker.modes.get(picker.selected) {
+            self.update_theme(theme::ThemeEvent::SetMode(mode));
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::tui) fn theme_picker_confirm(&mut self) {
-        if let Some(picker) = self.theme_picker.take() {
-            if let Some(&mode) = picker.modes.get(picker.selected) {
-                self.update_theme(theme::ThemeEvent::SetMode(mode));
-            }
+        if let Some(ActiveModal::Theme(picker)) = self.modal.take() {
+            self.theme_picker_confirm_inner(&picker);
         }
     }
 
@@ -152,14 +170,14 @@ impl App {
     /// the builtin read roots, the config grants, and the remembered state
     /// grants. Only state rows are editable.
     pub(in crate::tui) fn open_paths_picker(&mut self) {
-        let Some(paths) = &self.paths else {
+        let Some(paths) = self.paths() else {
             self.notify(NotifyKind::Error, "no agent: /paths is unavailable");
             return;
         };
-        self.paths_picker = Some(PathsPickerState {
+        self.open_modal(ActiveModal::Paths(PathsPickerState {
             rows: paths.snapshot().rows,
             selected: 0,
-        });
+        }));
     }
 
     /// Applies a `/paths` row edit through the paths handle and refreshes
@@ -168,14 +186,14 @@ impl App {
         &mut self,
         edit: impl FnOnce(&lofi_core::paths::PathsHandle) -> lofi_error::Result<()>,
     ) {
-        let Some(paths) = self.paths.clone() else {
+        let Some(paths) = self.paths() else {
             return;
         };
         if let Err(error) = edit(&paths) {
             self.notify(NotifyKind::Error, format!("paths change failed: {error}"));
         }
         let rows = paths.snapshot().rows;
-        if let Some(picker) = &mut self.paths_picker {
+        if let Some(picker) = self.paths_picker_mut() {
             picker.rows = rows;
             picker.selected = picker.selected.min(picker.rows.len().saturating_sub(1));
         }
@@ -184,13 +202,13 @@ impl App {
     /// Key handling for the `/paths` modal. `space`/`enter` toggles a state
     /// row's access, `d` forgets it; other rows only navigate.
     pub(in crate::tui) fn handle_paths_key(&mut self, k: &KeyEvent) -> bool {
-        let Some(picker) = self.paths_picker.as_mut() else {
+        let Some(picker) = self.paths_picker_mut() else {
             return false;
         };
         let len = picker.rows.len();
         if len == 0 {
             if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
-                self.paths_picker = None;
+                self.close_modal();
             }
             return true;
         }
@@ -198,7 +216,7 @@ impl App {
         let row = picker.rows[selected].clone();
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.paths_picker = None;
+                self.close_modal();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 picker.selected = selected.saturating_sub(1);
@@ -243,39 +261,49 @@ impl App {
     /// `/policy`: open the bash approval mode dialog. The choice is
     /// session-scoped and never written to `policy.toml`.
     pub(in crate::tui) fn open_policy_picker(&mut self) {
-        let Some(override_handle) = &self.policy_override else {
+        let Some(override_handle) = self.policy_override() else {
             self.notify(NotifyKind::Error, "no agent: /policy is unavailable");
             return;
         };
+        let auto_mode = self.auto_mode_configured();
         let mut modes = vec![
             lofi_types::BashApprovalMode::AllowAll,
             lofi_types::BashApprovalMode::AskManual,
         ];
-        if self.auto_mode_configured {
+        if auto_mode {
             modes.push(lofi_types::BashApprovalMode::AskAuto);
         }
         modes.push(lofi_types::BashApprovalMode::DenyAll);
-        let current = override_handle.effective(self.auto_mode_configured);
+        let current = override_handle.effective(auto_mode);
         let selected = modes.iter().position(|m| *m == current).unwrap_or(1);
-        self.policy_picker = Some(PolicyPickerState { modes, selected });
+        self.open_modal(ActiveModal::Policy(PolicyPickerState { modes, selected }));
     }
 
-    pub(in crate::tui) fn policy_picker_confirm(&mut self) {
-        if let Some(picker) = self.policy_picker.take() {
-            if let Some(mode) = picker.modes.get(picker.selected) {
-                if let Some(override_handle) = &self.policy_override {
-                    override_handle.set(Some(*mode));
-                }
+    pub(in crate::tui) fn policy_picker_confirm_inner(&mut self, picker: &PolicyPickerState) {
+        if let Some(mode) = picker.modes.get(picker.selected) {
+            if let Some(override_handle) = self.policy_override() {
+                override_handle.set(Some(*mode));
             }
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::tui) fn policy_picker_confirm(&mut self) {
+        if let Some(ActiveModal::Policy(picker)) = self.modal.take() {
+            self.policy_picker_confirm_inner(&picker);
+        }
+    }
+
+    pub(in crate::tui) fn thinking_picker_confirm_inner(&mut self, picker: &ThinkingPickerState) {
+        if let Some(level) = picker.levels.get(picker.selected) {
+            self.pending_model_switch = Some(format!("{}:{}", self.switch_label(), level.as_str()));
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::tui) fn thinking_picker_confirm(&mut self) {
-        if let Some(picker) = self.thinking_picker.take() {
-            if let Some(level) = picker.levels.get(picker.selected) {
-                self.pending_model_switch =
-                    Some(format!("{}:{}", self.switch_label(), level.as_str()));
-            }
+        if let Some(ActiveModal::Thinking(picker)) = self.modal.take() {
+            self.thinking_picker_confirm_inner(&picker);
         }
     }
 

@@ -334,6 +334,47 @@ impl ToolExecutor {
         })
     }
 
+    /// Construct execution state in memory without creating a temporary
+    /// directory or opening workspace state files on disk.
+    #[must_use]
+    pub fn in_memory(root: impl Into<PathBuf>) -> Self {
+        let config = lofi_types::Config::default();
+        let ids = lofi_types::IdSpace::new();
+        Self {
+            root: root.into(),
+            tmp_dir: PathBuf::new(),
+            tmp_lease: None,
+            bash_env: crate::bash_env::resolve_bash_env(&config.bash, &[]),
+            shell_policy: lofi_code::policy::defaults::resolve(&config.shell_policy),
+            truncate: lofi_code::TruncatedCap {
+                max_lines: config.truncate.max_lines,
+                max_bytes: config.truncate.max_bytes,
+            },
+            image: config.image,
+            confirm_tx: None,
+            confirm_counter: Arc::new(AtomicU64::new(0)),
+            confirm_watch: Arc::new(ConfirmWatch::default()),
+            activity: Arc::new(ActivityWatch::default()),
+            auto_mode: None,
+            auto_mode_config: None,
+            auto_mode_hints: super::auto_mode::hint_handle(),
+            policy_override: lofi_code::policy::PolicyOverride::default(),
+            skills_dir: None,
+            grants: Vec::new(),
+            memory: None,
+            jobs: lofi_code::tools::JobRegistry::with_ids(ids.clone()),
+            timers: lofi_code::tools::TimerRegistry::with_ids(ids.clone()),
+            job_owner: None,
+            exec_worker: Arc::new(std::sync::OnceLock::new()),
+            subagent: None,
+            mailbox: None,
+            subagents: super::SubagentRegistry::with_ids(ids),
+            subagent_support: None,
+            models: None,
+            session_cache: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
     pub(crate) fn invalidate_session(&mut self) {
         self.session_cache = Arc::new(std::sync::OnceLock::new());
     }
@@ -396,11 +437,48 @@ impl ToolExecutor {
     pub fn paths(&self) -> crate::paths::PathsHandle {
         crate::paths::PathsHandle::new(
             self.root.clone(),
-            Some(self.tmp_dir.clone()),
+            (!self.tmp_dir.as_os_str().is_empty()).then(|| self.tmp_dir.clone()),
             self.skills_dir.clone(),
             self.memory.as_ref().map(|file| file.path.clone()),
             self.grants.clone(),
         )
+    }
+
+    #[must_use]
+    pub fn with_grants(mut self, grants: Vec<lofi_code::GrantedDir>) -> Self {
+        self.grants = grants;
+        self.invalidate_session();
+        self
+    }
+
+    #[must_use]
+    pub fn with_jobs(mut self, jobs: lofi_code::tools::JobRegistry) -> Self {
+        self.jobs = jobs;
+        self.invalidate_session();
+        self
+    }
+
+    #[must_use]
+    pub fn with_timers(mut self, timers: lofi_code::tools::TimerRegistry) -> Self {
+        self.timers = timers;
+        self.invalidate_session();
+        self
+    }
+
+    #[must_use]
+    pub fn with_subagents(mut self, subagents: super::SubagentRegistry) -> Self {
+        self.subagents = subagents;
+        self
+    }
+
+    #[must_use]
+    pub fn with_policy_override(
+        mut self,
+        policy_override: lofi_code::policy::PolicyOverride,
+    ) -> Self {
+        self.policy_override = policy_override;
+        self.invalidate_session();
+        self
     }
 
     /// Config and registry a subagent hook resolves model overrides with.

@@ -213,7 +213,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
     }
     if let Some(prompt) = cli.print.clone() {
         let opts = build_print_opts(&cli, prompt, root)?;
-        crate::run_print(opts).await?;
+        Box::pin(crate::run_print(opts)).await?;
     } else {
         let opts = build_interactive_opts(&cli, root);
         Box::pin(crate::run_interactive(opts)).await?;

@@ -60,11 +60,12 @@ impl App {
                 self.notify(NotifyKind::Info, "no saved sessions for this workspace");
             }
             Ok(files) => {
+                self.close_modal();
                 let generation = self
                     .picker_generation
                     .fetch_add(1, Ordering::Relaxed)
                     .wrapping_add(1);
-                self.picker = Some(PickerState {
+                self.modal = Some(ActiveModal::Resume(PickerState {
                     entries: files
                         .iter()
                         .cloned()
@@ -76,7 +77,7 @@ impl App {
                         .collect(),
                     selected: 0,
                     generation,
-                });
+                }));
                 if let (Some(tx), Some(sink)) =
                     (self.picker_load_tx.clone(), self.session.sink.as_ref())
                 {
@@ -84,7 +85,7 @@ impl App {
                     sink.submit_io(Box::new(move |_state| {
                         run_resume_load(generation, &generation_clock, &files, &tx);
                     }));
-                } else if let Some(picker) = self.picker.as_mut() {
+                } else if let Some(picker) = self.picker_mut() {
                     for row in &mut picker.entries {
                         row.preview = row.file.quick_preview();
                         row.details = row.file.inspect();
@@ -101,8 +102,7 @@ impl App {
         match load {
             PickerLoad::ResumePreviews { generation, rows } => {
                 let Some(picker) = self
-                    .picker
-                    .as_mut()
+                    .picker_mut()
                     .filter(|picker| picker.generation == generation)
                 else {
                     return;
@@ -115,8 +115,7 @@ impl App {
             }
             PickerLoad::ResumeRows { generation, rows } => {
                 let Some(picker) = self
-                    .picker
-                    .as_mut()
+                    .picker_mut()
                     .filter(|picker| picker.generation == generation)
                 else {
                     return;
@@ -131,55 +130,21 @@ impl App {
                 generation,
                 entries,
                 snapshot_id,
-            } => {
-                let Some(picker) = self
-                    .tree_picker
-                    .as_mut()
-                    .filter(|picker| picker.generation == generation)
-                else {
-                    // Picker was closed before the snapshot was ready. Move
-                    // its rows back to the allocating worker so both the rows
-                    // and snapshot are dropped before that worker trims.
-                    if let Some(sink) = self.session.sink.as_ref() {
-                        sink.submit_io(Box::new(move |state| {
-                            drop(entries);
-                            state.remove_tree_snapshot(snapshot_id);
-                        }));
-                    } else {
-                        drop(entries);
-                        lofi_core::release_freed_memory();
-                    }
-                    return;
-                };
-                if entries.is_empty() {
-                    self.tree_picker = None;
-                    self.notify(NotifyKind::Info, "no branch points in this session yet");
-                    if let Some(sink) = self.session.sink.as_ref() {
-                        sink.submit_io(Box::new(move |state| {
-                            state.remove_tree_snapshot(snapshot_id);
-                        }));
-                    }
-                } else {
-                    picker.selected = entries.len().saturating_sub(1);
-                    picker.entries = entries;
-                    picker.loading = false;
-                    self.tree_picker_snapshot = Some(snapshot_id);
-                    self.tree_picker_pending.clear();
-                    self.tree_picker_pending
-                        .extend(picker.entries.len().saturating_sub(20)..picker.entries.len());
-                }
-            }
+            } => self.apply_tree_ready(generation, entries, snapshot_id),
             PickerLoad::TreeRows { generation, rows } => {
-                let Some(picker) = self
-                    .tree_picker
-                    .as_mut()
-                    .filter(|picker| picker.generation == generation)
+                let Some(ActiveModal::Tree {
+                    picker, pending, ..
+                }) = self.modal.as_mut()
                 else {
                     self.release_tree_rows(rows);
                     return;
                 };
+                if picker.generation != generation {
+                    self.release_tree_rows(rows);
+                    return;
+                }
                 for (index, mut entry) in rows {
-                    self.tree_picker_pending.remove(&index);
+                    pending.remove(&index);
                     entry.prefill = Box::default();
                     if let Some(row) = picker.entries.get_mut(index) {
                         *row = entry;
@@ -188,17 +153,59 @@ impl App {
             }
             PickerLoad::TreeFailed { generation, error } => {
                 if self
-                    .tree_picker
-                    .as_ref()
+                    .tree_picker()
                     .is_some_and(|picker| picker.generation == generation)
                 {
-                    self.tree_picker = None;
+                    self.close_modal();
                     self.notify(
                         NotifyKind::Error,
                         format!("load session for /tree: {error}"),
                     );
                 }
             }
+        }
+    }
+
+    fn apply_tree_ready(&mut self, generation: u64, entries: Vec<TreeEntry>, snapshot_id: u64) {
+        let matches_tree = matches!(
+            &self.modal,
+            Some(ActiveModal::Tree { picker, .. }) if picker.generation == generation
+        );
+        if !matches_tree {
+            // Picker was closed before the snapshot was ready. Move its rows
+            // back to the allocating worker so both the rows and snapshot are
+            // dropped before that worker trims.
+            if let Some(sink) = self.session.sink.as_ref() {
+                sink.submit_io(Box::new(move |state| {
+                    drop(entries);
+                    state.remove_tree_snapshot(snapshot_id);
+                }));
+            } else {
+                drop(entries);
+                lofi_core::release_freed_memory();
+            }
+            return;
+        }
+        if entries.is_empty() {
+            self.modal = None;
+            self.notify(NotifyKind::Info, "no branch points in this session yet");
+            if let Some(sink) = self.session.sink.as_ref() {
+                sink.submit_io(Box::new(move |state| {
+                    state.remove_tree_snapshot(snapshot_id);
+                }));
+            }
+        } else if let Some(ActiveModal::Tree {
+            picker,
+            snapshot,
+            pending,
+        }) = &mut self.modal
+        {
+            picker.selected = entries.len().saturating_sub(1);
+            picker.entries = entries;
+            picker.loading = false;
+            *snapshot = Some(snapshot_id);
+            pending.clear();
+            pending.extend(picker.entries.len().saturating_sub(20)..picker.entries.len());
         }
     }
 
@@ -271,8 +278,8 @@ impl App {
                 }
                 self.bump_render_epoch();
                 self.session.attach_cursor(cursor);
-                self.pinned = true;
-                self.top_line = 0;
+                self.viewport.pinned = true;
+                self.viewport.top_line = 0;
             }
             Err(e) => self.transcript.push_turn(Turn {
                 prompt: "/resume".to_string(),

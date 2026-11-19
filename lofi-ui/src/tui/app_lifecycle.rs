@@ -19,8 +19,10 @@ impl App {
         Self {
             transcript: Transcript::new(),
             layout: TranscriptLayout::new(),
-            input: String::new(),
-            input_cursor: 0,
+            prompt: PromptEditor::default(),
+            viewport: ViewportState::default(),
+            modal: None,
+            confirms: ConfirmQueue::default(),
             lifecycle: AgentLifecycle::new(
                 compaction,
                 if ctx_limit > 0 {
@@ -30,9 +32,6 @@ impl App {
                 },
             ),
             system_prompt,
-            history_nav: Vec::new(),
-            history_idx: None,
-            input_stash: String::new(),
             model_label,
             selected_model_label: None,
             thinking_label,
@@ -52,7 +51,6 @@ impl App {
             cost: 0.0,
             turn_cost: 0.0,
             turn_has_round_usage: false,
-
             total_in: 0,
             total_out: 0,
             prompt_queue: Vec::new(),
@@ -68,18 +66,6 @@ impl App {
             lifecycle_tx: None,
             lifecycle_busy: false,
             continue_after_hard_compact: false,
-            pinned: true,
-            top_line: 0,
-            last_base: 0,
-            view_anchor: None,
-            view_anchor_line: 0,
-            nav_anchor: None,
-            nav_anchor_line: 0,
-            nav_anchor_row: None,
-            sel_anchor: None,
-            sel_anchor_line: 0,
-            scroll_gauge: None,
-            scroll_gauge_stamp: None,
             expanded_details: HashMap::new(),
             detail_focus: None,
             debug_after_draw: None,
@@ -90,69 +76,23 @@ impl App {
                 cursor: None,
                 cwd: PathBuf::new(),
             },
-            picker: None,
-            tree_picker: None,
-            tree_picker_snapshot: None,
-            tree_picker_pending: std::collections::HashSet::new(),
             picker_load_tx: None,
             picker_generation: Arc::new(AtomicU64::new(0)),
-            model_picker: None,
-            thinking_picker: None,
-            policy_picker: None,
-            paths_picker: None,
             executor: None,
-            paths: None,
-            policy_override: None,
-            auto_mode_configured: false,
-            service_picker: None,
-            theme_picker: None,
             model_choices: Vec::new(),
             pending_model_switch: None,
-            info: None,
-            slash_complete: None,
             no_models_hint: None,
             theme: Theme::default(),
             theme_manager: theme::ThemeManager::default(),
-            kill_ring: String::new(),
-            last_kill_was_kill: false,
             ctrl_c_at: None,
             cancel_at: None,
             run_event_at: None,
-            log_rect: Rect::default(),
-            input_rect: Rect::default(),
-            log_vis: Vec::new(),
-            log_details: Vec::new(),
-            log_off: 0,
-            input_scroll: 0,
-            sel: None,
-            mode: Mode::Input,
-            pending_confirms: Vec::new(),
-            deferred_confirms: Vec::new(),
-            confirm_waiting: None,
-            confirm_selected: 0,
-            confirm_narrow: false,
-            confirm_scroll: 0,
-            confirm_total: 0,
-            confirm_view_h: 0,
             yank_notify: None,
-            yank_cursor: None,
             notify: None,
-            nav_cursor: 0,
-            nav_col: 0,
-            select_anchor: (0, 0),
-            log_total: 0,
-            last_turn_height: 0,
-            log_view_h: 0,
             render_profile: Box::default(),
-            // Cloned session job registry. Set by the caller from the running
-            // agent; `None` until the agent attaches.
-            jobs: None,
-            timers: None,
-            subagents: None,
             timers_recorded: Vec::new(),
             resumed_timers: Vec::new(),
             stale_jobs: Vec::new(),
-            background_modal: None,
         }
     }
 
@@ -440,6 +380,7 @@ impl App {
             debug_assert_eq!(self.transcript.turns.len(), previous_turns + 1);
             self.transcript.turn_byte_ranges.push(None);
             self.transcript.turn_event_offsets.push(None);
+            self.transcript.turn_compactions.push(Vec::new());
             // The output of a direct `!cmd` is the point of running it:
             // show it expanded instead of hiding it behind a detail toggle.
             // Covers the live event and the file-backed replay paths, both
@@ -541,7 +482,7 @@ impl App {
     /// inbox still holds mail: the turn that just ended may have read it.
     fn take_mailbox_wake(&mut self) -> Option<String> {
         let text = self.mailbox_wake.take()?;
-        let registry = self.subagents.as_ref()?;
+        let registry = self.subagents()?;
         registry.claim_mailbox_wake().then_some(text)
     }
 
@@ -549,7 +490,7 @@ impl App {
     /// buffered across a session switch names a sender the new inbox does
     /// not hold.
     pub(super) fn has_unclaimed_mailbox_wake(&self) -> bool {
-        self.subagents
+        self.subagents()
             .as_ref()
             .is_some_and(lofi_core::SubagentRegistry::mailbox_wake_unclaimed)
     }
@@ -558,7 +499,7 @@ impl App {
     /// rebuilt: one the host already spent may name mail a cancelled turn
     /// left unread.
     pub(super) fn lost_mailbox_wake(&self) -> Option<String> {
-        self.subagents
+        self.subagents()
             .as_ref()
             .and_then(lofi_core::SubagentRegistry::lost_mailbox_wake)
     }
@@ -624,20 +565,35 @@ impl App {
             .iter()
             .rposition(Option::is_some)
             .unwrap_or(self.transcript.turns.len().saturating_sub(1));
-        // A file-backed turn renders from disk on demand; appending the
-        // compaction marker to its empty live shell would make that lone block
-        // the turn's entire live content, so the renderer stops re-reading the
-        // real response from disk and the transcript collapses to just the
-        // marker. Hydrate the turn first so the marker appends to, rather than
-        // replaces, the visible content.
-        let hydrated = (*self.materialize_turn(target)).clone();
+        // Store the marker alongside the turn's byte range so frozen turns stay
+        // unhydrated on disk and live turns can still release their blocks on
+        // the next freeze without losing the marker.
+        let file_end = self
+            .transcript
+            .turn_byte_ranges
+            .get(target)
+            .copied()
+            .flatten()
+            .map(|(_, end)| end);
+        if let Some(end) = file_end {
+            if let Some(markers) = self.transcript.turn_compactions.get_mut(target) {
+                markers.push(transcript::CompactionMarker {
+                    after_byte: end,
+                    summarized: compaction.summarized_count,
+                    kept: compaction.kept_count,
+                    summary: compaction.summary.clone(),
+                });
+            }
+            self.transcript.collapsed_turns.get_mut().remove(target);
+        }
         if let Some(turn) = self.transcript.turns.get_mut(target) {
-            turn.blocks = hydrated.blocks;
-            turn.blocks.push(Block::Compaction {
-                summarized: compaction.summarized_count,
-                kept: compaction.kept_count,
-                summary: compaction.summary.clone(),
-            });
+            if file_end.is_none() || !turn.blocks.is_empty() {
+                turn.blocks.push(Block::Compaction {
+                    summarized: compaction.summarized_count,
+                    kept: compaction.kept_count,
+                    summary: compaction.summary.clone(),
+                });
+            }
         }
         self.mark_compacted();
         self.bump_render_epoch();

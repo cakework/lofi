@@ -609,3 +609,42 @@ impl Popover for SlashComplete {
         self.selected = n;
     }
 }
+
+/// The single user-opened modal currently active on screen. Confirmation
+/// prompts stay in [`ConfirmQueue`] so asynchronous tool approvals stack above
+/// any open picker.
+pub(crate) enum ActiveModal {
+    Resume(PickerState),
+    Tree {
+        picker: TreePickerState,
+        snapshot: Option<u64>,
+        pending: std::collections::HashSet<usize>,
+    },
+    Model(ModelPickerState),
+    Thinking(ThinkingPickerState),
+    Policy(PolicyPickerState),
+    Paths(PathsPickerState),
+    Service(ServicePickerState),
+    Theme(ThemePickerState),
+    Background(Box<BackgroundModalState>),
+    Info(InfoModal),
+}
+
+/// Asynchronous tool-approval queue. Confirmations arrive from background runs
+/// or auto-mode timeouts and stack above any [`ActiveModal`].
+#[derive(Default)]
+pub(crate) struct ConfirmQueue {
+    pub(crate) pending: Vec<lofi_core::ConfirmRequest>,
+    pub(crate) deferred: Vec<lofi_core::ConfirmRequest>,
+    /// The front confirmation and when it became the user's to answer. The
+    /// terminal report debounces a plain policy prompt against it, so an
+    /// approval that takes a moment never leaves a `blocked` record behind.
+    pub(crate) waiting: Option<(u64, Instant)>,
+    pub(crate) selected: usize,
+    /// Whether the front directory grant answers for the requested directory
+    /// instead of the project root the prompt offers by default.
+    pub(crate) narrow: bool,
+    pub(crate) scroll: usize,
+    pub(crate) total: usize,
+    pub(crate) view_h: usize,
+}

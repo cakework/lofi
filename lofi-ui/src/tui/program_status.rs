@@ -166,7 +166,7 @@ pub(crate) fn report<'a>(app: &'a App, settled: &'a Settled) -> Report<'a> {
 /// once — the wait is already real; and a plain policy prompt waits out a
 /// short debounce, because an approval that takes a moment needs no record.
 fn waiting(app: &App) -> Option<&ConfirmRequest> {
-    let request = app.pending_confirms.first()?;
+    let request = app.confirms.pending.first()?;
     let ready = match *request
         .reason
         .lock()
@@ -177,7 +177,8 @@ fn waiting(app: &App) -> Option<&ConfirmRequest> {
         | ConfirmReason::AutoRisk { .. }
         | ConfirmReason::AutoFailed { .. } => true,
         ConfirmReason::Policy { .. } | ConfirmReason::OutsideRoot { .. } => app
-            .confirm_waiting
+            .confirms
+            .waiting
             .is_some_and(|(_, since)| since.elapsed() >= PERMISSION_DEBOUNCE),
     };
     ready.then_some(request)

@@ -4,7 +4,7 @@ use super::*;
 fn insert_str_normalizes_line_endings() {
     let mut a = app();
     a.insert_str("a\r\nb\rc");
-    assert_eq!(a.input, "a\nb\nc");
+    assert_eq!(a.prompt.text, "a\nb\nc");
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn model_picker_open_preselects_current() {
         },
     ];
     a.open_model_picker();
-    let picker = a.model_picker.as_ref().unwrap();
+    let picker = a.model_picker().unwrap();
     assert_eq!(picker.choices.len(), 2);
     assert_eq!(picker.selected, 1);
     assert!(a.modal_open());
@@ -42,7 +42,7 @@ fn model_picker_open_empty_notifies() {
     let mut a = app();
     a.model_choices = Vec::new();
     a.open_model_picker();
-    assert!(a.model_picker.is_none());
+    assert!(a.model_picker().is_none());
     assert!(a.notify.is_some());
 }
 
@@ -70,10 +70,10 @@ fn model_picker_confirm_sets_pending_switch() {
         },
     ];
     a.open_model_picker();
-    a.model_picker.as_mut().unwrap().selected = 0;
+    a.model_picker_mut().unwrap().selected = 0;
     a.model_picker_confirm();
     assert_eq!(a.pending_model_switch.as_deref(), Some("anthropic/claude"));
-    assert!(a.model_picker.is_none());
+    assert!(a.model_picker().is_none());
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn thinking_picker_open_preselects_current() {
         context_window: None,
     }];
     a.open_thinking_picker();
-    let picker = a.thinking_picker.as_ref().unwrap();
+    let picker = a.thinking_picker().unwrap();
     assert_eq!(
         picker.levels,
         vec![
@@ -180,7 +180,7 @@ fn thinking_picker_open_no_levels_notifies() {
         context_window: None,
     }];
     a.open_thinking_picker();
-    assert!(a.thinking_picker.is_none());
+    assert!(a.thinking_picker().is_none());
     assert!(a.notify.is_some());
 }
 
@@ -197,22 +197,21 @@ fn thinking_picker_confirm_sets_pending_switch() {
         context_window: None,
     }];
     a.open_thinking_picker();
-    a.thinking_picker.as_mut().unwrap().selected = 2;
+    a.thinking_picker_mut().unwrap().selected = 2;
     a.thinking_picker_confirm();
     assert_eq!(
         a.pending_model_switch.as_deref(),
         Some("openai/gpt-4o:high")
     );
-    assert!(a.thinking_picker.is_none());
+    assert!(a.thinking_picker().is_none());
 }
 
 #[test]
 fn policy_picker_defaults_to_ask_manual_without_auto_mode() {
     let mut a = app();
-    a.policy_override = Some(lofi_core::PolicyOverride::default());
-    a.auto_mode_configured = false;
+    a.executor = Some(lofi_core::agent::ToolExecutor::in_memory("/ws"));
     a.open_policy_picker();
-    let picker = a.policy_picker.as_ref().unwrap();
+    let picker = a.policy_picker().unwrap();
     assert_eq!(
         picker.modes,
         vec![
@@ -228,10 +227,13 @@ fn policy_picker_defaults_to_ask_manual_without_auto_mode() {
 #[test]
 fn policy_picker_includes_and_defaults_to_ask_auto_when_configured() {
     let mut a = app();
-    a.policy_override = Some(lofi_core::PolicyOverride::default());
-    a.auto_mode_configured = true;
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws").with_auto_mode(Some(std::sync::Arc::new(
+            |_| Box::pin(async { unreachable!() }),
+        ))),
+    );
     a.open_policy_picker();
-    let picker = a.policy_picker.as_ref().unwrap();
+    let picker = a.policy_picker().unwrap();
     assert_eq!(
         picker.modes,
         vec![
@@ -248,12 +250,14 @@ fn policy_picker_includes_and_defaults_to_ask_auto_when_configured() {
 fn policy_picker_confirm_writes_the_shared_override() {
     let mut a = app();
     let override_handle = lofi_core::PolicyOverride::default();
-    a.policy_override = Some(override_handle.clone());
-    a.auto_mode_configured = false;
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws")
+            .with_policy_override(override_handle.clone()),
+    );
     a.open_policy_picker();
-    a.policy_picker.as_mut().unwrap().selected = 2; // deny all
+    a.policy_picker_mut().unwrap().selected = 2; // deny all
     a.policy_picker_confirm();
-    assert!(a.policy_picker.is_none());
+    assert!(a.policy_picker().is_none());
     assert_eq!(
         override_handle.current(),
         Some(lofi_types::BashApprovalMode::DenyAll)
@@ -263,8 +267,7 @@ fn policy_picker_confirm_writes_the_shared_override() {
 #[test]
 fn policy_badge_hidden_at_default_and_for_a_default_pick() {
     let mut a = app();
-    a.policy_override = Some(lofi_core::PolicyOverride::default());
-    a.auto_mode_configured = false;
+    a.executor = Some(lofi_core::agent::ToolExecutor::in_memory("/ws"));
     assert_eq!(a.policy_badge(), None);
 
     a.open_policy_picker();
@@ -275,10 +278,9 @@ fn policy_badge_hidden_at_default_and_for_a_default_pick() {
 #[test]
 fn policy_badge_shows_a_non_default_pick() {
     let mut a = app();
-    a.policy_override = Some(lofi_core::PolicyOverride::default());
-    a.auto_mode_configured = false;
+    a.executor = Some(lofi_core::agent::ToolExecutor::in_memory("/ws"));
     a.open_policy_picker();
-    a.policy_picker.as_mut().unwrap().selected = 2; // deny all
+    a.policy_picker_mut().unwrap().selected = 2; // deny all
     a.policy_picker_confirm();
     assert_eq!(a.policy_badge().as_deref(), Some("deny all"));
 }
@@ -287,7 +289,7 @@ fn policy_badge_shows_a_non_default_pick() {
 fn policy_picker_requires_an_agent() {
     let mut a = app();
     assert!(a.slash_command("/policy"));
-    assert!(a.policy_picker.is_none());
+    assert!(a.policy_picker().is_none());
     let (msg, kind) = a.notify_badge().expect("no-agent /policy notified");
     assert_eq!(kind, NotifyKind::Error);
     assert!(msg.contains("/policy"));
@@ -310,7 +312,7 @@ fn service_picker_open_lists_auto_plus_declared() {
         context_window: None,
     }];
     a.open_service_picker();
-    let picker = a.service_picker.as_ref().unwrap();
+    let picker = a.service_picker().unwrap();
     assert_eq!(
         picker.tiers,
         vec![ServiceTier::Auto, ServiceTier::Flex, ServiceTier::Priority]
@@ -332,7 +334,7 @@ fn service_picker_open_no_tiers_notifies() {
         context_window: None,
     }];
     a.open_service_picker();
-    assert!(a.service_picker.is_none());
+    assert!(a.service_picker().is_none());
     assert!(a.notify.is_some());
 }
 
@@ -349,13 +351,13 @@ fn service_picker_confirm_sets_pending_switch() {
         context_window: None,
     }];
     a.open_service_picker();
-    a.service_picker.as_mut().unwrap().selected = 2;
+    a.service_picker_mut().unwrap().selected = 2;
     a.service_picker_confirm();
     assert_eq!(
         a.pending_model_switch.as_deref(),
         Some("openai/gpt-4o:medium@priority")
     );
-    assert!(a.service_picker.is_none());
+    assert!(a.service_picker().is_none());
 
     // Selecting "auto" drops the @tier suffix entirely.
     let mut a2 = app();
@@ -369,7 +371,7 @@ fn service_picker_confirm_sets_pending_switch() {
         context_window: None,
     }];
     a2.open_service_picker();
-    a2.service_picker.as_mut().unwrap().selected = 0;
+    a2.service_picker_mut().unwrap().selected = 0;
     a2.service_picker_confirm();
     assert_eq!(
         a2.pending_model_switch.as_deref(),

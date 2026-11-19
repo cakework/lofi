@@ -99,14 +99,14 @@ fn startup_convergence_keeps_a_scrolled_view_and_its_thumb_still() {
         a.layout.frozen_heights_estimated.iter().any(|&e| e),
         "estimates pending after the first frame"
     );
-    let estimate_total = a.log_total;
+    let estimate_total = a.viewport.log_total;
 
-    a.mode = Mode::Input;
+    a.viewport.mode = Mode::Input;
     a.page_up();
     let (screen, gutter) = draw(&mut a);
-    assert!(!a.pinned, "page up leaves the tail");
+    assert!(!a.viewport.pinned, "page up leaves the tail");
     assert!(
-        a.log_off + a.log_view_h < estimate_total,
+        a.viewport.log_off + a.viewport.log_view_h < estimate_total,
         "scrolled up off the tail"
     );
 
@@ -127,14 +127,17 @@ fn startup_convergence_keeps_a_scrolled_view_and_its_thumb_still() {
     }
     assert!(steps > 1, "the test needs several convergence steps");
     assert_ne!(
-        a.log_total, estimate_total,
+        a.viewport.log_total, estimate_total,
         "the estimate was replaced by exact heights"
     );
     // Once the extent is exact the gauge takes it, and the thumb then means
     // what it says.
     assert_eq!(a.layout.height_remeasure_from, None);
     let _ = draw(&mut a);
-    assert_eq!(a.scroll_gauge, Some((a.log_off, a.log_total)));
+    assert_eq!(
+        a.viewport.scroll_gauge,
+        Some((a.viewport.log_off, a.viewport.log_total))
+    );
 }
 
 /// A submitted prompt changes the content, so the thumb must take the new
@@ -150,8 +153,12 @@ fn a_submit_moves_the_thumb_while_estimates_are_still_pending() {
         "estimates pending after the first frame"
     );
     let _ = draw(&mut a);
-    let stale_total = a.scroll_gauge.map(|(_, total)| total);
-    assert_eq!(stale_total, Some(a.log_total), "the gauge is current");
+    let stale_total = a.viewport.scroll_gauge.map(|(_, total)| total);
+    assert_eq!(
+        stale_total,
+        Some(a.viewport.log_total),
+        "the gauge is current"
+    );
 
     a.transcript.push_turn(Turn {
         prompt: "next".into(),
@@ -162,13 +169,13 @@ fn a_submit_moves_the_thumb_while_estimates_are_still_pending() {
     let _ = draw(&mut a);
 
     assert_ne!(
-        Some(a.log_total),
+        Some(a.viewport.log_total),
         stale_total,
         "the submitted turn grew the content"
     );
     assert_eq!(
-        a.scroll_gauge,
-        Some((a.log_off, a.log_total)),
+        a.viewport.scroll_gauge,
+        Some((a.viewport.log_off, a.viewport.log_total)),
         "the gauge must follow the submitted turn"
     );
 }
@@ -179,28 +186,28 @@ fn a_submit_moves_the_thumb_while_estimates_are_still_pending() {
 #[test]
 fn page_up_from_a_tail_following_start_moves_one_page() {
     let mut a = app();
-    a.mode = Mode::Input;
-    a.log_total = 40;
-    a.log_view_h = 10;
-    a.last_base = 30;
-    a.top_line = 0;
-    a.pinned = true;
+    a.viewport.mode = Mode::Input;
+    a.viewport.log_total = 40;
+    a.viewport.log_view_h = 10;
+    a.viewport.last_base = 30;
+    a.viewport.top_line = 0;
+    a.viewport.pinned = true;
     a.page_up();
-    assert!(!a.pinned);
-    assert_eq!(a.top_line, 20);
+    assert!(!a.viewport.pinned);
+    assert_eq!(a.viewport.top_line, 20);
     assert_eq!(a.view_off(), 20);
 }
 
 #[test]
 fn page_down_from_a_tail_following_start_stays_at_the_tail() {
     let mut a = app();
-    a.mode = Mode::Input;
-    a.log_total = 40;
-    a.log_view_h = 10;
-    a.last_base = 30;
-    a.pinned = true;
+    a.viewport.mode = Mode::Input;
+    a.viewport.log_total = 40;
+    a.viewport.log_view_h = 10;
+    a.viewport.last_base = 30;
+    a.viewport.pinned = true;
     a.page_down();
-    assert!(a.pinned);
+    assert!(a.viewport.pinned);
     assert_eq!(a.view_off(), 30);
 }
 
@@ -222,10 +229,10 @@ fn final_height_batch_still_requests_a_redraw() {
     }
     assert!(a.layout.height_remeasure_from.is_none(), "converged");
     let exact = a.layout.frozen_heights.iter().sum::<usize>()
-        + a.last_turn_height
+        + a.viewport.last_turn_height
         + a.transcript.turns.len().saturating_sub(1);
     assert_eq!(
-        a.log_total, exact,
+        a.viewport.log_total, exact,
         "the last batch needs a frame of its own ({steps} steps)"
     );
 }
@@ -241,10 +248,10 @@ fn the_first_frame_publishes_measured_geometry() {
         "the first frame lands on the tail, not on a window sliced by stale estimates"
     );
     let published = a.layout.frozen_heights.iter().sum::<usize>()
-        + a.last_turn_height
+        + a.viewport.last_turn_height
         + a.transcript.turns.len().saturating_sub(1);
-    assert_eq!(a.log_total, published);
-    assert_eq!(a.log_off, a.view_off());
+    assert_eq!(a.viewport.log_total, published);
+    assert_eq!(a.viewport.log_off, a.view_off());
 }
 
 /// Re-anchoring keeps the same turn row at the top when a turn above the
@@ -257,16 +264,16 @@ fn reanchoring_follows_the_content_above_the_viewport() {
     }
     a.layout.frozen_heights = vec![10, 10];
     a.layout.frozen_heights_estimated = vec![false, false];
-    a.last_turn_height = 10;
-    a.pinned = false;
-    a.log_off = 25;
-    a.top_line = 25;
+    a.viewport.last_turn_height = 10;
+    a.viewport.pinned = false;
+    a.viewport.log_off = 25;
+    a.viewport.top_line = 25;
     a.remember_view_anchor();
     // The first turn was overestimated: it is really 4 rows, so everything
     // below it moves up 6.
     a.layout.frozen_heights[0] = 4;
     a.reanchor_view_top();
-    assert_eq!(a.top_line, 19);
+    assert_eq!(a.viewport.top_line, 19);
 }
 
 /// The anchor is a position, not a lock: a `top_line` the user changed after
@@ -279,15 +286,15 @@ fn reanchoring_leaves_a_newly_requested_position_alone() {
     }
     a.layout.frozen_heights = vec![10, 10];
     a.layout.frozen_heights_estimated = vec![false, false];
-    a.last_turn_height = 10;
-    a.pinned = false;
-    a.log_off = 25;
-    a.top_line = 25;
+    a.viewport.last_turn_height = 10;
+    a.viewport.pinned = false;
+    a.viewport.log_off = 25;
+    a.viewport.top_line = 25;
     a.remember_view_anchor();
-    a.top_line = 3;
+    a.viewport.top_line = 3;
     a.layout.frozen_heights[0] = 4;
     a.reanchor_view_top();
-    assert_eq!(a.top_line, 3);
+    assert_eq!(a.viewport.top_line, 3);
 }
 
 /// Absolute line numbers shift whenever an estimated frozen height is
@@ -303,26 +310,32 @@ fn the_content_anchor_round_trips_every_line() {
     }
     a.layout.frozen_heights = vec![10, 10];
     a.layout.frozen_heights_estimated = vec![false, false];
-    a.last_turn_height = 10;
+    a.viewport.last_turn_height = 10;
     assert_eq!(a.turn_start_line(1), 11);
     let total = 10 + 10 + 10 + 3;
     for line in 0..total {
-        a.pinned = false;
-        a.log_off = line;
-        a.top_line = line;
+        a.viewport.pinned = false;
+        a.viewport.log_off = line;
+        a.viewport.top_line = line;
         a.remember_view_anchor();
         a.reanchor_view_top();
-        assert_eq!(a.top_line, line, "line {line} did not survive its anchor");
+        assert_eq!(
+            a.viewport.top_line, line,
+            "line {line} did not survive its anchor"
+        );
     }
     // Line 10 is turn 0's separator: it belongs to that turn one row past its
     // last content row, so it follows the turn when the turn shrinks.
-    a.pinned = false;
-    a.log_off = 10;
-    a.top_line = 10;
+    a.viewport.pinned = false;
+    a.viewport.log_off = 10;
+    a.viewport.top_line = 10;
     a.remember_view_anchor();
     a.layout.frozen_heights[0] = 4;
     a.reanchor_view_top();
-    assert_eq!(a.top_line, 4, "the separator follows the turn it ends");
+    assert_eq!(
+        a.viewport.top_line, 4,
+        "the separator follows the turn it ends"
+    );
 }
 
 /// The reported bug: after a resume, a Navigate keypress sits between ticks
@@ -336,24 +349,24 @@ fn nav_keystrokes_hold_the_content_while_estimates_settle() {
     a.enter_nav();
     let mut ticks = 0;
     for _ in 0..8 {
-        let before = a.nav_cursor;
+        let before = a.viewport.nav_cursor;
         a.nav_move(-1);
         assert_eq!(
-            a.nav_cursor,
+            a.viewport.nav_cursor,
             before - 1,
             "one press moves the cursor one line"
         );
         let (rows, _) = draw(&mut a);
         if a.remeasure_heights_step(16) {
             ticks += 1;
-            let row = a.nav_cursor - a.log_off;
+            let row = a.viewport.nav_cursor - a.viewport.log_off;
             let (after, _) = draw(&mut a);
             assert_eq!(
                 after, rows,
                 "convergence tick {ticks} moved the transcript with no input"
             );
             assert_eq!(
-                a.nav_cursor - a.log_off,
+                a.viewport.nav_cursor - a.viewport.log_off,
                 row,
                 "convergence tick {ticks} moved the cursor off its screen row"
             );
@@ -369,24 +382,24 @@ fn the_selection_end_holds_its_content_while_estimates_settle() {
     let mut a = resumed_with_estimates(600);
     let _ = draw(&mut a);
     a.enter_nav();
-    a.mode = Mode::Select;
+    a.viewport.mode = Mode::Select;
     let anchor_turn = 590;
     let cursor_turn = 598;
-    a.select_anchor = (a.turn_start_line(anchor_turn), 0);
-    a.nav_cursor = a.turn_start_line(cursor_turn);
-    a.sel = Some(a.select_sel());
+    a.viewport.select_anchor = (a.turn_start_line(anchor_turn), 0);
+    a.viewport.nav_cursor = a.turn_start_line(cursor_turn);
+    a.viewport.sel = Some(a.select_sel());
     let _ = draw(&mut a);
     let mut ticks = 0;
     while a.remeasure_heights_step(16) {
         ticks += 1;
         let _ = draw(&mut a);
         assert_eq!(
-            a.select_anchor.0,
+            a.viewport.select_anchor.0,
             a.turn_start_line(anchor_turn),
             "tick {ticks} moved the selection's free end off its content"
         );
         assert_eq!(
-            a.nav_cursor,
+            a.viewport.nav_cursor,
             a.turn_start_line(cursor_turn),
             "tick {ticks} moved the cursor off its content"
         );
@@ -407,9 +420,9 @@ fn a_turn_jump_moves_one_turn_while_estimates_settle() {
     let _ = draw(&mut a);
     // Park the cursor mid-log, where a stale line and a converged one land on
     // different turns.
-    a.nav_cursor = a.turn_start_line(300);
+    a.viewport.nav_cursor = a.turn_start_line(300);
     let _ = draw(&mut a);
-    let start = turn_of(&a, a.nav_cursor);
+    let start = turn_of(&a, a.viewport.nav_cursor);
     assert_eq!(start, 300);
 
     // The heights the cursor and the turn starts were measured with are
@@ -426,22 +439,22 @@ fn a_turn_jump_moves_one_turn_while_estimates_settle() {
     let mut run = None;
     handle_event(&plain_key(KeyCode::Char('[')), &mut a, None, &mut run);
     assert_eq!(
-        turn_of(&a, a.nav_cursor),
+        turn_of(&a, a.viewport.nav_cursor),
         start - 1,
         "the press must move one turn back from the turn the cursor is on"
     );
     let _ = draw(&mut a);
     assert_eq!(
-        turn_of(&a, a.nav_cursor),
+        turn_of(&a, a.viewport.nav_cursor),
         start - 1,
         "the frame that followed moved the cursor off the turn it was sent to"
     );
-    assert_eq!(a.nav_cursor, a.turn_start_line(start - 1));
+    assert_eq!(a.viewport.nav_cursor, a.turn_start_line(start - 1));
 
     handle_event(&plain_key(KeyCode::Char(']')), &mut a, None, &mut run);
     let _ = draw(&mut a);
     assert_eq!(
-        turn_of(&a, a.nav_cursor),
+        turn_of(&a, a.viewport.nav_cursor),
         start,
         "`]` must return to the next turn's start"
     );
@@ -465,11 +478,11 @@ fn turn_of(a: &App, line: usize) -> usize {
 fn a_submitted_prompt_is_on_screen_right_away() {
     let mut a = resumed_with_estimates(40);
     let _ = draw(&mut a);
-    a.pinned = false;
-    a.top_line = 0;
+    a.viewport.pinned = false;
+    a.viewport.top_line = 0;
     let _ = draw(&mut a);
     assert!(
-        a.log_off + a.log_view_h < a.log_total,
+        a.viewport.log_off + a.viewport.log_view_h < a.viewport.log_total,
         "the fixture must start scrolled up"
     );
 

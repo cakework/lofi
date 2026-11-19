@@ -89,6 +89,53 @@ fn accounting_offsets(
     kept
 }
 
+struct TurnHeaders {
+    prompts: Vec<(String, lofi_types::PromptKind)>,
+    shells: HashMap<usize, SessionEvent>,
+}
+
+fn load_turn_headers(
+    cursor: &store::SessionCursor,
+    index: &[store::SessionIndexEntry],
+    visible: &[usize],
+    starts: &[usize],
+) -> Result<TurnHeaders> {
+    let prompt_entries: Vec<(usize, u64)> = starts
+        .iter()
+        .enumerate()
+        .filter_map(|(turn, &start_pos)| {
+            (index[visible[start_pos]].kind == store::IndexKind::UserPrompt)
+                .then_some((turn, index[visible[start_pos]].offset))
+        })
+        .collect();
+    let prompt_offsets: Vec<u64> = prompt_entries.iter().map(|(_, offset)| *offset).collect();
+    let prompt_texts = cursor.prompt_texts(&prompt_offsets)?;
+    let mut prompts = vec![(String::new(), lofi_types::PromptKind::User); starts.len()];
+    for ((turn, _), prompt) in prompt_entries.into_iter().zip(prompt_texts) {
+        prompts[turn] = prompt;
+    }
+    let shell_entries: Vec<(usize, u64)> = starts
+        .iter()
+        .enumerate()
+        .filter_map(|(turn, &start_pos)| {
+            (index[visible[start_pos]].kind == store::IndexKind::UserShell)
+                .then_some((turn, index[visible[start_pos]].offset))
+        })
+        .collect();
+    let shell_offsets: Vec<u64> = shell_entries.iter().map(|(_, offset)| *offset).collect();
+    let shell_events = if shell_offsets.is_empty() {
+        Vec::new()
+    } else {
+        cursor.display_events_at(&shell_offsets)?
+    };
+    let shells: HashMap<usize, SessionEvent> = shell_entries
+        .into_iter()
+        .map(|(turn, _)| turn)
+        .zip(shell_events)
+        .collect();
+    Ok(TurnHeaders { prompts, shells })
+}
+
 /// Restore the transcript as file-backed turn shells. Turns need only their
 /// prompt, offsets, and terminal accounting at startup; their full blocks are
 /// materialized from disk only when the viewport reaches them. This includes
@@ -113,22 +160,13 @@ pub(super) fn replay_indexed_session(
             .then_some(p)
         })
         .collect();
-    let prompt_entries: Vec<(usize, u64)> = starts
-        .iter()
-        .enumerate()
-        .filter_map(|(turn, &start_pos)| {
-            (index[visible[start_pos]].kind == store::IndexKind::UserPrompt)
-                .then_some((turn, index[visible[start_pos]].offset))
-        })
-        .collect();
-    let prompt_offsets: Vec<u64> = prompt_entries.iter().map(|(_, offset)| *offset).collect();
-    let prompt_texts = cursor.prompt_texts(&prompt_offsets)?;
-    let mut prompts = vec![(String::new(), lofi_types::PromptKind::User); starts.len()];
-    for ((turn, _), prompt) in prompt_entries.into_iter().zip(prompt_texts) {
-        prompts[turn] = prompt;
-    }
+    let TurnHeaders {
+        prompts,
+        mut shells,
+    } = load_turn_headers(cursor, index, &visible, &starts)?;
     app.transcript.turn_byte_ranges.clear();
     app.transcript.turn_event_offsets.clear();
+    app.transcript.turn_compactions.clear();
     // A notice opens a display row, not a turn: its spend belongs to the turn
     // that auto-continued through it.
     let notices: HashSet<usize> = starts
@@ -169,10 +207,11 @@ pub(super) fn replay_indexed_session(
         let selected = &visible[start_pos..end_pos];
         let offsets: Vec<u64> = selected.iter().map(|&i| index[i].offset).collect();
         if index[visible[start_pos]].kind == store::IndexKind::UserShell {
-            let event = cursor.display_event_at(index[visible[start_pos]].offset)?;
-            replay_selected_session_events(&[event], |ev| {
-                app.apply_file_backed_replay_event(ev);
-            });
+            if let Some(event) = shells.remove(&turn) {
+                replay_selected_session_events(&[event], |ev| {
+                    app.apply_file_backed_replay_event(ev);
+                });
+            }
         } else {
             // Notices keep their persisted kind: a hollow bullet marks them
             // as app-injected, not typed input.
@@ -205,6 +244,10 @@ pub(super) fn replay_indexed_session(
     debug_assert_eq!(
         app.transcript.turns.len(),
         app.transcript.turn_event_offsets.len()
+    );
+    debug_assert_eq!(
+        app.transcript.turns.len(),
+        app.transcript.turn_compactions.len()
     );
     Ok(())
 }

@@ -2,8 +2,8 @@
 use super::*;
 use crate::tui::tree::tree_entry_loading_label;
 use crate::tui::{
-    BackgroundKill, BackgroundModalState, BackgroundTab, BackgroundView, InfoLine, JobOutputView,
-    JobRow, JobViewContent, SubagentRow, SubagentTranscriptView, Theme, TreeEntry,
+    ActiveModal, BackgroundKill, BackgroundModalState, BackgroundTab, BackgroundView, InfoLine,
+    JobOutputView, JobRow, JobViewContent, SubagentRow, SubagentTranscriptView, Theme, TreeEntry,
 };
 
 use lofi_types::short_id;
@@ -167,7 +167,7 @@ fn resume_preview_spans(t: Theme, preview: String) -> Vec<Span<'static>> {
 
 pub(super) fn render_picker(f: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::ListState;
-    let Some(picker) = &app.picker else {
+    let Some(picker) = app.picker() else {
         return;
     };
     let t = app.theme;
@@ -256,7 +256,7 @@ pub(super) fn render_picker(f: &mut Frame, area: Rect, app: &App) {
 
 pub(super) fn render_slash_complete(f: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::ListState;
-    let Some(sc) = &app.slash_complete else {
+    let Some(sc) = &app.prompt.slash_complete else {
         return;
     };
     let t = app.theme;
@@ -271,17 +271,19 @@ pub(super) fn render_slash_complete(f: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(40)
         .min(area.width);
     // Anchor horizontally at the cursor's column within the prompt area,
-    // so the popover tracks the cursor as the user types. `input_rect` is
+    // so the popover tracks the cursor as the user types. `prompt.rect` is
     // already inset past the gutter, and the cursor x is relative to its
     // left edge, so add directly. Clamp so the popover stays on screen.
-    let content_width = app.input_rect.width as usize;
+    let content_width = app.prompt.rect.width as usize;
     let (cursor_row, cursor_x) = app.input_cursor_pos(content_width);
     let cursor_screen_x = app
-        .input_rect
+        .prompt
+        .rect
         .x
         .saturating_add(u16::try_from(cursor_x).unwrap_or(u16::MAX));
     let cursor_screen_y = app
-        .input_rect
+        .prompt
+        .rect
         .y
         .saturating_add(u16::try_from(cursor_row).unwrap_or(u16::MAX));
     // Border and bottom hint consume three rows; autocomplete deliberately
@@ -376,17 +378,10 @@ fn render_info_lines(lines: &[InfoLine], width: usize, t: Theme) -> Vec<Line<'st
 
 pub(super) fn render_info_modal(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme;
-    let Some(info) = app.info.as_mut() else {
+    let Some(info) = app.info_mut() else {
         return;
     };
     let title = format!(" {} ", info.title);
-    // Body lines are styled spans; ratatui wraps them span-aware into the
-    // body area. We only need the wrapped row *count* up front (for the
-    // scrollbar and scroll clamping), computed from each line's plain text
-    // with the same greedy word-wrap prim uses.
-    // Body lines are styled spans; we pre-wrap them span-aware (preserving
-    // whitespace and styles) so the row count for the scrollbar and the
-    // rendered output agree exactly.
     let max_w = area.width.saturating_sub(4) as usize;
     let line_w = |line: &InfoLine| match line {
         InfoLine::Section(label) => prim::width(label),
@@ -399,10 +394,10 @@ pub(super) fn render_info_modal(f: &mut Frame, area: Rect, app: &mut App) {
     let max_body = info.lines.iter().map(line_w).max().unwrap_or(0);
     let inner_w = max_body.min(max_w).max(prim::width(&title));
     let max_body_h = (area.height as usize).saturating_sub(4);
-    let need_sb = render_info_lines(&info.lines, inner_w.max(1), t).len() > max_body_h;
-    let body_w = inner_w;
+    let body_w = inner_w.max(1);
     let wrapped = render_info_lines(&info.lines, body_w, t);
     let total = wrapped.len();
+    let need_sb = total > max_body_h;
     let view_h = total.min(max_body_h);
     let desired_frame_h = u16::try_from(view_h + 4).unwrap_or(12);
 
@@ -516,7 +511,7 @@ fn render_pick_modal(
 }
 
 pub(super) fn render_model_picker(f: &mut Frame, area: Rect, app: &App) {
-    let Some(picker) = &app.model_picker else {
+    let Some(picker) = app.model_picker() else {
         return;
     };
     let rows: Vec<String> = picker
@@ -558,7 +553,7 @@ pub(super) fn render_model_picker(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn render_theme_picker(f: &mut Frame, area: Rect, app: &App) {
-    let Some(picker) = &app.theme_picker else {
+    let Some(picker) = app.theme_picker() else {
         return;
     };
     let rows: Vec<String> = picker
@@ -583,7 +578,7 @@ pub(super) fn render_theme_picker(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn render_thinking_picker(f: &mut Frame, area: Rect, app: &App) {
-    let Some(picker) = &app.thinking_picker else {
+    let Some(picker) = app.thinking_picker() else {
         return;
     };
     let rows: Vec<String> = picker
@@ -606,7 +601,7 @@ pub(super) fn render_thinking_picker(f: &mut Frame, area: Rect, app: &App) {
 
 pub(super) fn render_paths_picker(f: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::ListState;
-    let Some(picker) = &app.paths_picker else {
+    let Some(picker) = app.paths_picker() else {
         return;
     };
     let t = app.theme;
@@ -699,7 +694,7 @@ pub(super) fn render_paths_picker(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn render_policy_picker(f: &mut Frame, area: Rect, app: &App) {
-    let Some(picker) = &app.policy_picker else {
+    let Some(picker) = app.policy_picker() else {
         return;
     };
     let rows: Vec<String> = picker
@@ -707,9 +702,10 @@ pub(super) fn render_policy_picker(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|m| crate::tui::policy_mode_label(*m).to_string())
         .collect();
-    let current = app.policy_override.as_ref().map_or_else(
-        || lofi_core::default_approval_mode(app.auto_mode_configured),
-        |o| o.effective(app.auto_mode_configured),
+    let auto_mode = app.auto_mode_configured();
+    let current = app.policy_override().map_or_else(
+        || lofi_core::default_approval_mode(auto_mode),
+        |o| o.effective(auto_mode),
     );
     let active = picker.modes.iter().position(|m| *m == current);
     render_pick_modal(
@@ -725,7 +721,7 @@ pub(super) fn render_policy_picker(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn render_service_picker(f: &mut Frame, area: Rect, app: &App) {
-    let Some(picker) = &app.service_picker else {
+    let Some(picker) = app.service_picker() else {
         return;
     };
     let rows: Vec<String> = picker
@@ -758,7 +754,7 @@ fn tree_entry_label(entry: &TreeEntry) -> &str {
 
 pub(super) fn render_tree_picker(f: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::ListState;
-    let Some(picker) = &app.tree_picker else {
+    let Some(picker) = app.tree_picker() else {
         return;
     };
     let t = app.theme;
@@ -844,7 +840,7 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
 
     use ratatui::layout::Alignment;
     let t = app.theme;
-    let Some(req) = app.pending_confirms.first() else {
+    let Some(req) = app.confirms.pending.first() else {
         return;
     };
 
@@ -875,7 +871,7 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
             requested,
             current,
         } => {
-            let shown = confirm_grant_unit(dir, narrow.as_deref(), app.confirm_narrow);
+            let shown = confirm_grant_unit(dir, narrow.as_deref(), app.confirms.narrow);
             // Only a grant that holds the shown unit is described as already
             // covering it: a read-only grant for the requested directory does
             // not make the project root read-only.
@@ -890,7 +886,7 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
             };
             if widens {
                 format!("{unit} and its subdirectories are read-only; grant write access too?")
-            } else if app.confirm_narrow && narrow.is_some() {
+            } else if app.confirms.narrow && narrow.is_some() {
                 let root = crate::tui::text::abbreviate_path(std::path::Path::new(dir), content_w);
                 format!("lofi wants {access} access to {unit} and its subdirectories, not {root}")
             } else if let Some(marker) = marker {
@@ -927,7 +923,7 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
     // so it fits the panel instead of wrapping. Shell commands stay whole.
     let command = match &reason {
         lofi_core::ConfirmReason::OutsideRoot { dir, narrow, .. } => {
-            let unit = confirm_grant_unit(dir, narrow.as_deref(), app.confirm_narrow);
+            let unit = confirm_grant_unit(dir, narrow.as_deref(), app.confirms.narrow);
             crate::tui::text::abbreviate_path(std::path::Path::new(unit), content_w)
         }
         _ => req.command.clone(),
@@ -977,7 +973,7 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
     hints.push(Span::styled(" deny", t.subtle_style()));
     let help = Line::from(hints);
 
-    let queue_count = app.pending_confirms.len();
+    let queue_count = app.confirms.pending.len();
     let counter = if queue_count > 1 {
         format!("  1/{queue_count}")
     } else {
@@ -1028,14 +1024,14 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
     let command_scroll_area = modal_scroll_area(command_inner);
     let command_content = command_scroll_area.content;
     f.render_widget(command_panel, rows[3]);
-    app.confirm_total = cmd_lines.len();
-    app.confirm_view_h = command_content.height as usize;
-    let max_scroll = app.confirm_total.saturating_sub(app.confirm_view_h);
-    app.confirm_scroll = app.confirm_scroll.min(max_scroll);
+    app.confirms.total = cmd_lines.len();
+    app.confirms.view_h = command_content.height as usize;
+    let max_scroll = app.confirms.total.saturating_sub(app.confirms.view_h);
+    app.confirms.scroll = app.confirms.scroll.min(max_scroll);
     let body_lines: Vec<Line> = cmd_lines
         .iter()
-        .skip(app.confirm_scroll)
-        .take(app.confirm_view_h)
+        .skip(app.confirms.scroll)
+        .take(app.confirms.view_h)
         .map(|line| {
             Line::from(Span::styled(
                 line.clone(),
@@ -1044,13 +1040,13 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     f.render_widget(Paragraph::new(body_lines), command_content);
-    if app.confirm_total > app.confirm_view_h {
+    if app.confirms.total > app.confirms.view_h {
         prim::render_scrollbar(
             f,
             command_scroll_area.gutter,
-            app.confirm_scroll,
-            app.confirm_view_h,
-            app.confirm_total,
+            app.confirms.scroll,
+            app.confirms.view_h,
+            app.confirms.total,
             t.subtle,
             t.user,
         );
@@ -1070,7 +1066,7 @@ pub(super) fn render_confirm_modal(f: &mut Frame, area: Rect, app: &mut App) {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(button(label, app.confirm_selected == i));
+        spans.push(button(label, app.confirms.selected == i));
     }
     let actions = Line::from(spans).alignment(Alignment::Right);
     f.render_widget(Paragraph::new(actions), rows[5]);
@@ -1139,7 +1135,7 @@ fn job_span_style(attrs: lofi_core::JobStyle) -> Style {
 /// whose render context borrows `&App`.
 pub(super) fn render_background_modal(f: &mut Frame, area: Rect, app: &mut App) {
     app.refresh_background_modal();
-    let Some(mut modal) = app.background_modal.take() else {
+    let Some(mut modal) = app.take_background_modal() else {
         return;
     };
     if let Some(view) = &mut modal.view {
@@ -1147,7 +1143,7 @@ pub(super) fn render_background_modal(f: &mut Frame, area: Rect, app: &mut App) 
     } else {
         render_background_list(f, area, app, &mut modal);
     }
-    app.background_modal = Some(modal);
+    app.modal = Some(ActiveModal::Background(modal));
 }
 
 /// The drill-in of one row: a job's output or a subagent's transcript.

@@ -6,7 +6,7 @@ fn multi_line_input_editing() {
     a.insert_char('a');
     a.insert_newline();
     a.insert_char('b');
-    assert_eq!(a.input, "a\nb");
+    assert_eq!(a.prompt.text, "a\nb");
     assert_eq!(a.cursor_row_col(), (1, 1));
     a.move_up();
     assert_eq!(a.cursor_row_col().0, 0);
@@ -51,53 +51,53 @@ fn input_cursor_tracks_word_wrap_past_cursor() {
     // after the space (col 6) sits at the end of row 0; after 'w' (col 7)
     // it is on row 1. A prefix-only wrap would misplace the cursor on row 0
     // because it cannot see that "world" wraps.
-    a.input_cursor = "hello ".len();
+    a.prompt.cursor = "hello ".len();
     assert_eq!(a.input_cursor_pos(7), (0, 6));
-    a.input_cursor = "hello w".len();
+    a.prompt.cursor = "hello w".len();
     assert_eq!(a.input_cursor_pos(7), (1, 1));
-    a.input_cursor = "hello world".len();
+    a.prompt.cursor = "hello world".len();
     assert_eq!(a.input_cursor_pos(7), (1, 5));
 }
 
 #[test]
 fn cursor_up_recalls_at_first_cell() {
     let mut a = app();
-    a.history_nav.push("first".to_string());
-    a.history_nav.push("second".to_string());
+    a.prompt.history.push("first".to_string());
+    a.prompt.history.push("second".to_string());
     a.set_input("Hello".to_string());
     a.cursor_up();
-    assert_eq!(a.input, "Hello");
-    assert_eq!(a.input_cursor, 0);
+    assert_eq!(a.prompt.text, "Hello");
+    assert_eq!(a.prompt.cursor, 0);
     a.cursor_up();
-    assert_eq!(a.input, "second");
-    assert_eq!(a.input_cursor, 0);
+    assert_eq!(a.prompt.text, "second");
+    assert_eq!(a.prompt.cursor, 0);
     a.cursor_up();
-    assert_eq!(a.input, "first");
-    assert_eq!(a.input_cursor, 0);
+    assert_eq!(a.prompt.text, "first");
+    assert_eq!(a.prompt.cursor, 0);
     a.cursor_up();
-    assert_eq!(a.input, "first");
+    assert_eq!(a.prompt.text, "first");
 }
 
 #[test]
 fn cursor_down_recalls_at_last_cell() {
     let mut a = app();
-    a.history_nav.push("first".to_string());
-    a.history_nav.push("second".to_string());
+    a.prompt.history.push("first".to_string());
+    a.prompt.history.push("second".to_string());
     a.set_input("Hello".to_string());
     a.cursor_up();
     a.cursor_up();
     a.cursor_up();
     a.cursor_up();
-    assert_eq!(a.input, "first");
+    assert_eq!(a.prompt.text, "first");
     a.cursor_down();
-    assert_eq!(a.input, "first");
-    assert_eq!(a.input_cursor, "first".len());
+    assert_eq!(a.prompt.text, "first");
+    assert_eq!(a.prompt.cursor, "first".len());
     a.cursor_down();
-    assert_eq!(a.input, "second");
-    assert_eq!(a.input_cursor, "second".len());
+    assert_eq!(a.prompt.text, "second");
+    assert_eq!(a.prompt.cursor, "second".len());
     a.cursor_down();
-    assert_eq!(a.input, "Hello");
-    assert_eq!(a.input_cursor, "Hello".len());
+    assert_eq!(a.prompt.text, "Hello");
+    assert_eq!(a.prompt.cursor, "Hello".len());
 }
 
 #[test]
@@ -120,18 +120,18 @@ fn cursor_up_down_navigate_multiline() {
 fn history_recall_round_trip() {
     let mut a = app();
     a.set_input("first".to_string());
-    a.history_nav.push("first".to_string());
+    a.prompt.history.push("first".to_string());
     a.set_input("second".to_string());
-    a.history_nav.push("second".to_string());
+    a.prompt.history.push("second".to_string());
     a.clear_input();
     a.recall_prev();
-    assert_eq!(a.input, "second");
+    assert_eq!(a.prompt.text, "second");
     a.recall_prev();
-    assert_eq!(a.input, "first");
+    assert_eq!(a.prompt.text, "first");
     a.recall_next();
-    assert_eq!(a.input, "second");
+    assert_eq!(a.prompt.text, "second");
     a.recall_next();
-    assert_eq!(a.input, "");
+    assert_eq!(a.prompt.text, "");
 }
 
 #[test]
@@ -143,8 +143,8 @@ fn slash_clear_help_session_resume_new() {
 
     a.slash_command("/help");
     assert!(a.transcript.turns.is_empty());
-    assert!(a.info.is_some());
-    a.info = None;
+    assert!(a.info().is_some());
+    a.close_modal();
 
     // Unknown commands notify on the rule line instead of pushing a turn.
     assert!(a.slash_command("/nope"));
@@ -154,7 +154,7 @@ fn slash_clear_help_session_resume_new() {
     assert!(msg.contains("unknown command"));
 
     assert!(a.slash_command("/resume"));
-    assert!(a.picker.is_none());
+    assert!(a.picker().is_none());
     let (msg, kind) = a.notify_badge().expect("/resume notified");
     assert_eq!(kind, NotifyKind::Warn);
     assert!(msg.contains("disabled"));
@@ -176,7 +176,7 @@ fn session_info_opens_modal() {
     let mut a = app();
     assert!(a.slash_command("/session"));
     assert!(a.transcript.turns.is_empty());
-    let info = a.info.as_ref().expect("modal opened");
+    let info = a.info().expect("modal opened");
     assert_eq!(info.title, "Session");
     let body = info
         .lines
@@ -234,7 +234,7 @@ fn session_info_modal_shows_id_when_path_set() {
         None,
     ));
     assert!(a.slash_command("/session"));
-    let info = a.info.as_ref().expect("modal opened");
+    let info = a.info().expect("modal opened");
     let body = info
         .lines
         .iter()
@@ -268,10 +268,10 @@ fn paste_blocked_while_modal_open() {
     a.slash_command("/help");
     assert!(a.modal_open());
     handle_event(&Event::Paste("pasted".to_string()), &mut a, None, &mut run);
-    assert_eq!(a.input, "");
+    assert_eq!(a.prompt.text, "");
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
     handle_event(&Event::Paste("pasted".to_string()), &mut a, None, &mut run);
-    assert_eq!(a.input, "pasted");
+    assert_eq!(a.prompt.text, "pasted");
 }
 
 #[test]
@@ -282,11 +282,11 @@ fn the_debounce_clock_starts_with_the_prompt_and_clears_with_it() {
     let (req, _response) = confirm_request("touch queued.txt");
     a.queue_confirmation(req);
     a.refresh_confirmations();
-    assert!(a.confirm_waiting.is_some());
+    assert!(a.confirms.waiting.is_some());
 
-    a.pending_confirms.clear();
+    a.confirms.pending.clear();
     a.refresh_confirmations();
-    assert!(a.confirm_waiting.is_none());
+    assert!(a.confirms.waiting.is_none());
 }
 
 #[test]
@@ -301,8 +301,8 @@ fn auto_evaluation_is_deferred_until_the_ui_grace_expires() {
     let reason = req.reason.clone();
 
     a.queue_confirmation(req);
-    assert!(a.pending_confirms.is_empty());
-    assert_eq!(a.deferred_confirms.len(), 1);
+    assert!(a.confirms.pending.is_empty());
+    assert_eq!(a.confirms.deferred.len(), 1);
     assert!(!a.modal_open());
 
     *reason
@@ -311,8 +311,8 @@ fn auto_evaluation_is_deferred_until_the_ui_grace_expires() {
         reason: "command deletes a file".to_string(),
     };
     assert!(a.refresh_confirmations());
-    assert_eq!(a.pending_confirms.len(), 1);
-    assert!(a.deferred_confirms.is_empty());
+    assert_eq!(a.confirms.pending.len(), 1);
+    assert!(a.confirms.deferred.is_empty());
     assert!(a.modal_open());
 }
 
@@ -362,82 +362,84 @@ fn elapsed_auto_evaluation_is_shown_by_the_ui() {
 
     a.queue_confirmation(req);
 
-    assert_eq!(a.pending_confirms.len(), 1);
-    assert!(a.deferred_confirms.is_empty());
+    assert_eq!(a.confirms.pending.len(), 1);
+    assert!(a.confirms.deferred.is_empty());
 }
 
 #[test]
 fn topmost_permission_dialog_handles_input_before_tree_picker() {
     let mut a = app();
     let mut run = None;
-    a.tree_picker = Some(TreePickerState {
-        entries: vec![TreeEntry {
-            branch_point: "root".into(),
-            label: "user: earlier prompt".into(),
-            prefix: "- ".into(),
-            prefill: Box::default(),
-            is_active: true,
-            source_index: 0,
-            source_offset: 0,
-            source_kind: store::IndexKind::UserPrompt,
-            hydrated: true,
-        }],
-        selected: 0,
-        generation: 0,
-        loading: false,
+    a.open_modal(ActiveModal::Tree {
+        picker: TreePickerState {
+            entries: vec![TreeEntry {
+                branch_point: "root".into(),
+                label: "user: earlier prompt".into(),
+                prefix: "- ".into(),
+                prefill: Box::default(),
+                is_active: true,
+                source_index: 0,
+                source_offset: 0,
+                source_kind: store::IndexKind::UserPrompt,
+                hydrated: true,
+            }],
+            selected: 0,
+            generation: 0,
+            loading: false,
+        },
+        snapshot: None,
+        pending: std::collections::HashSet::new(),
     });
     let (req, mut response) = confirm_request("rm generated.txt");
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
 
     handle_event(&plain_key(KeyCode::Char('d')), &mut a, None, &mut run);
 
     assert_eq!(response.try_recv(), Ok(lofi_core::ConfirmResponse::Deny));
-    assert!(a.pending_confirms.is_empty());
-    assert!(a.tree_picker.is_some());
+    assert!(a.confirms.pending.is_empty());
+    assert!(a.tree_picker().is_some());
 
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
-    assert!(a.tree_picker.is_none());
+    assert!(a.tree_picker().is_none());
 }
 
 #[test]
 fn permission_dialog_requires_an_explicit_choice() {
     let mut a = app();
     let (req, mut response) = confirm_request("rm -rf build");
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
 
     assert!(a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE,)));
-    assert_eq!(a.pending_confirms.len(), 1);
+    assert_eq!(a.confirms.pending.len(), 1);
     assert!(matches!(
         response.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
 
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-    assert_eq!(a.confirm_selected, 1);
+    assert_eq!(a.confirms.selected, 1);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-    assert_eq!(a.confirm_selected, 0);
+    assert_eq!(a.confirms.selected, 0);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
-    assert_eq!(a.confirm_selected, 1);
+    assert_eq!(a.confirms.selected, 1);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(a.pending_confirms.is_empty());
+    assert!(a.confirms.pending.is_empty());
     assert_eq!(response.try_recv(), Ok(lofi_core::ConfirmResponse::Deny));
 }
 
 #[test]
 fn paths_modal_lists_rows_and_edits_only_state_rows() {
     let mut a = app();
-    a.paths = Some(lofi_core::paths::PathsHandle::new(
-        std::path::PathBuf::from("/ws"),
-        None,
-        None,
-        None,
-        vec![lofi_types::GrantedDir {
-            dir: std::path::PathBuf::from("/nix/store"),
-            access: lofi_types::Access::Read,
-        }],
-    ));
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws").with_grants(vec![
+            lofi_types::GrantedDir {
+                dir: std::path::PathBuf::from("/nix/store"),
+                access: lofi_types::Access::Read,
+            },
+        ]),
+    );
     a.open_paths_picker();
-    let picker = a.paths_picker.as_ref().unwrap();
+    let picker = a.paths_picker().unwrap();
     // The workspace row, the config grant row, no state rows.
     assert_eq!(picker.rows.len(), 2);
     assert_eq!(picker.rows[1].source, lofi_core::paths::PathSource::Config);
@@ -446,15 +448,15 @@ fn paths_modal_lists_rows_and_edits_only_state_rows() {
     // Toggling a config row is a no-op: the config file owns it.
     a.handle_paths_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     assert_eq!(
-        a.paths_picker.as_ref().unwrap().rows[1].access,
+        a.paths_picker().unwrap().rows[1].access,
         lofi_types::Access::Read
     );
 
     // Forgetting a config row is a no-op too, and escape closes.
     a.handle_paths_key(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-    assert_eq!(a.paths_picker.as_ref().unwrap().rows.len(), 2);
+    assert_eq!(a.paths_picker().unwrap().rows.len(), 2);
     a.handle_paths_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(a.paths_picker.is_none());
+    assert!(a.paths_picker().is_none());
 }
 
 #[test]
@@ -464,17 +466,15 @@ fn paths_modal_keeps_columns_visible_for_long_paths() {
 
     let mut a = app();
     let home = dirs::home_dir().unwrap();
-    a.paths = Some(lofi_core::paths::PathsHandle::new(
-        std::path::PathBuf::from("/ws"),
-        None,
-        None,
-        None,
-        vec![lofi_types::GrantedDir {
-            dir: home
-                .join("an/extremely/long/configured/directory/tree/that/cannot/fit/the/dialog"),
-            access: lofi_types::Access::Read,
-        }],
-    ));
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws").with_grants(vec![
+            lofi_types::GrantedDir {
+                dir: home
+                    .join("an/extremely/long/configured/directory/tree/that/cannot/fit/the/dialog"),
+                access: lofi_types::Access::Read,
+            },
+        ]),
+    );
     a.open_paths_picker();
 
     let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
@@ -504,12 +504,12 @@ fn paths_modal_keeps_columns_visible_for_long_paths() {
 fn grant_dialog_offers_read_only_by_default_for_reads() {
     let mut a = app();
     let (req, mut response) = grant_request("/nix/store", lofi_types::Access::Read, None);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
 
     // Enter takes the selected choice: read only, the least access the
     // operation needs.
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(a.pending_confirms.is_empty());
+    assert!(a.confirms.pending.is_empty());
     assert_eq!(
         response.try_recv(),
         Ok(lofi_core::ConfirmResponse::Grant {
@@ -520,9 +520,9 @@ fn grant_dialog_offers_read_only_by_default_for_reads() {
 
     // The write hotkey grants read and write without moving the selection.
     let (req, mut response) = grant_request("/nix/store", lofi_types::Access::Read, None);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-    assert!(a.pending_confirms.is_empty());
+    assert!(a.confirms.pending.is_empty());
     assert_eq!(
         response.try_recv(),
         Ok(lofi_core::ConfirmResponse::Grant {
@@ -539,10 +539,10 @@ fn grant_dialog_offers_the_requested_directory_on_request() {
     let mut a = app();
     let (req, mut response) =
         grant_request_with_narrow("/data/repo", "/data/repo/src", lofi_types::Access::Read);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(a.pending_confirms.is_empty());
+    assert!(a.confirms.pending.is_empty());
     assert_eq!(
         response.try_recv(),
         Ok(lofi_core::ConfirmResponse::Grant {
@@ -554,7 +554,7 @@ fn grant_dialog_offers_the_requested_directory_on_request() {
     // Without the toggle the same prompt grants the project root.
     let (req, mut response) =
         grant_request_with_narrow("/data/repo", "/data/repo/src", lofi_types::Access::Read);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         response.try_recv(),
@@ -571,7 +571,7 @@ fn the_scope_toggle_only_exists_for_a_narrowed_grant() {
     // prompt starts at the project root again.
     let mut a = app();
     let (req, mut response) = grant_request("/nix/store", lofi_types::Access::Read, None);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
@@ -585,7 +585,7 @@ fn the_scope_toggle_only_exists_for_a_narrowed_grant() {
     // Answering a narrowed prompt leaves the next one at the project root.
     let (req, mut response) =
         grant_request_with_narrow("/data/repo", "/data/repo/src", lofi_types::Access::Read);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
@@ -598,7 +598,7 @@ fn the_scope_toggle_only_exists_for_a_narrowed_grant() {
 
     let (req, mut response) =
         grant_request_with_narrow("/data/repo", "/data/repo/src", lofi_types::Access::Read);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         response.try_recv(),
@@ -614,14 +614,14 @@ fn the_scope_toggle_only_exists_for_a_narrowed_grant() {
 fn grant_dialog_offers_only_write_for_writes() {
     let mut a = app();
     let (req, mut response) = grant_request("/nix/store", lofi_types::Access::Write, None);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
 
     // The read hotkey cannot answer a write request, so it stays open.
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-    assert_eq!(a.pending_confirms.len(), 1);
+    assert_eq!(a.confirms.pending.len(), 1);
 
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(a.pending_confirms.is_empty());
+    assert!(a.confirms.pending.is_empty());
     assert_eq!(
         response.try_recv(),
         Ok(lofi_core::ConfirmResponse::Grant {
@@ -641,7 +641,7 @@ fn permission_dialog_action_keys_resolve_directly() {
     ] {
         let mut a = app();
         let (req, mut response) = confirm_request("dangerous command");
-        a.pending_confirms.push(req);
+        a.confirms.pending.push(req);
         a.handle_confirm_key(&KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         assert_eq!(response.try_recv(), Ok(expected), "key {key}");
     }
@@ -668,7 +668,7 @@ fn grant_dialog_names_the_project_root_and_offers_the_toggle() {
     let mut a = app();
     let (req, _response) =
         grant_request_with_narrow("/data/repo", "/data/repo/src", lofi_types::Access::Read);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     let screen = screen_of(&mut a);
     // The panel wraps, so the prose is asserted by its parts.
     assert!(screen.contains("/data/repo and its"), "{screen}");
@@ -704,7 +704,7 @@ fn a_read_grant_below_the_root_does_not_make_it_read_only() {
         lofi_types::Access::Write,
         Some(read_grant("/data/repo/src")),
     );
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     let screen = screen_of(&mut a);
     assert!(
         screen.contains("lofi wants read and write access"),
@@ -723,7 +723,7 @@ fn a_read_grant_on_the_root_offers_widening_it() {
         lofi_types::Access::Write,
         Some(read_grant("/data/repo")),
     );
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     let screen = screen_of(&mut a);
     assert!(screen.contains("read-only"), "{screen}");
     assert!(!screen.contains("lofi wants read and write"), "{screen}");
@@ -744,7 +744,7 @@ fn permission_dialog_names_the_rule_that_reserved_the_answer() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = lofi_core::ConfirmReason::Policy {
         reason: "requires confirmation by a configured rule: git push".to_string(),
     };
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     // Wrapping splits the sentence across rows; compare the flattened screen
     // without the panel's box-drawing characters.
     let screen = screen_of(&mut a);
@@ -767,7 +767,7 @@ fn permission_dialog_renders_command_and_selectable_actions() {
     use ratatui::Terminal;
     let mut a = app();
     let (req, _response) = confirm_request("sudo systemctl restart lofi");
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     let mut term = Terminal::new(TestBackend::new(90, 28)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let buf = term.backend().buffer();
@@ -805,8 +805,8 @@ fn prompt_panel_uses_full_height_user_rail() {
     use ratatui::Terminal;
 
     let mut a = app();
-    a.input = "hello".to_string();
-    a.input_cursor = a.input.len();
+    a.prompt.text = "hello".to_string();
+    a.prompt.cursor = a.prompt.text.len();
     let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let buf = term.backend().buffer();
@@ -816,7 +816,7 @@ fn prompt_panel_uses_full_height_user_rail() {
         assert_eq!(buf[(0, y)].fg, a.theme.user, "focused rail row {y}");
     }
 
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let buf = term.backend().buffer();
     for y in panel_top..20 {
@@ -838,24 +838,24 @@ fn scrollbars_use_a_gutter_outside_transcript_and_prompt_text() {
             .collect::<Vec<_>>()
             .join("\n"),
     ));
-    a.input = (0..12).map(|_| "prompt row").collect::<Vec<_>>().join("\n");
-    a.input_cursor = a.input.len();
+    a.prompt.text = (0..12).map(|_| "prompt row").collect::<Vec<_>>().join("\n");
+    a.prompt.cursor = a.prompt.text.len();
 
     let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let buf = term.backend().buffer();
 
-    assert_eq!(a.log_rect.right(), 59);
-    assert_eq!(a.input_rect.right(), 59);
-    let log_gutter_x = a.log_rect.right();
-    let input_gutter_x = a.input_rect.right();
+    assert_eq!(a.viewport.log_rect.right(), 59);
+    assert_eq!(a.prompt.rect.right(), 59);
+    let log_gutter_x = a.viewport.log_rect.right();
+    let input_gutter_x = a.prompt.rect.right();
     assert!(
-        (a.log_rect.y..a.log_rect.bottom())
+        (a.viewport.log_rect.y..a.viewport.log_rect.bottom())
             .any(|y| matches!(buf[(log_gutter_x, y)].symbol(), "┃" | "│")),
         "transcript scrollbar should be in its own gutter"
     );
     assert!(
-        (a.input_rect.y..a.input_rect.bottom())
+        (a.prompt.rect.y..a.prompt.rect.bottom())
             .any(|y| matches!(buf[(input_gutter_x, y)].symbol(), "┃" | "│")),
         "prompt scrollbar should be in its own gutter"
     );
@@ -867,8 +867,8 @@ fn autocomplete_uses_primary_focus_default_background_and_no_header() {
     use ratatui::Terminal;
 
     let mut a = app();
-    a.input = "/".to_string();
-    a.input_cursor = 1;
+    a.prompt.text = "/".to_string();
+    a.prompt.cursor = 1;
     a.refresh_slash_complete();
     let mut term = Terminal::new(TestBackend::new(90, 28)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
@@ -918,34 +918,38 @@ fn tree_picker_is_centered() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     let mut a = app();
-    a.tree_picker = Some(TreePickerState {
-        entries: vec![
-            TreeEntry {
-                branch_point: "x".into(),
-                label: "agent: hi".into(),
-                prefix: "`- ".into(),
-                prefill: Box::default(),
-                is_active: true,
-                source_index: 0,
-                source_offset: 0,
-                source_kind: store::IndexKind::TurnEnd,
-                hydrated: true,
-            },
-            TreeEntry {
-                branch_point: "y".into(),
-                label: "user: yo".into(),
-                prefix: "|- ".into(),
-                prefill: Box::default(),
-                is_active: false,
-                source_index: 1,
-                source_offset: 0,
-                source_kind: store::IndexKind::UserPrompt,
-                hydrated: true,
-            },
-        ],
-        selected: 0,
-        generation: 0,
-        loading: false,
+    a.open_modal(ActiveModal::Tree {
+        picker: TreePickerState {
+            entries: vec![
+                TreeEntry {
+                    branch_point: "x".into(),
+                    label: "agent: hi".into(),
+                    prefix: "`- ".into(),
+                    prefill: Box::default(),
+                    is_active: true,
+                    source_index: 0,
+                    source_offset: 0,
+                    source_kind: store::IndexKind::TurnEnd,
+                    hydrated: true,
+                },
+                TreeEntry {
+                    branch_point: "y".into(),
+                    label: "user: yo".into(),
+                    prefix: "|- ".into(),
+                    prefill: Box::default(),
+                    is_active: false,
+                    source_index: 1,
+                    source_offset: 0,
+                    source_kind: store::IndexKind::UserPrompt,
+                    hydrated: true,
+                },
+            ],
+            selected: 0,
+            generation: 0,
+            loading: false,
+        },
+        snapshot: None,
+        pending: std::collections::HashSet::new(),
     });
     let backend = TestBackend::new(80, 22);
     let mut term = Terminal::new(backend).unwrap();
@@ -986,21 +990,25 @@ fn tree_picker_renders_a_loading_placeholder_for_a_skeleton_row() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     let mut a = app();
-    a.tree_picker = Some(TreePickerState {
-        entries: vec![TreeEntry {
-            branch_point: Box::default(),
-            label: Box::default(),
-            prefix: "- ".into(),
-            prefill: Box::default(),
-            is_active: true,
-            source_index: 0,
-            source_offset: 0,
-            source_kind: store::IndexKind::UserPrompt,
-            hydrated: false,
-        }],
-        selected: 0,
-        generation: 0,
-        loading: false,
+    a.open_modal(ActiveModal::Tree {
+        picker: TreePickerState {
+            entries: vec![TreeEntry {
+                branch_point: Box::default(),
+                label: Box::default(),
+                prefix: "- ".into(),
+                prefill: Box::default(),
+                is_active: true,
+                source_index: 0,
+                source_offset: 0,
+                source_kind: store::IndexKind::UserPrompt,
+                hydrated: false,
+            }],
+            selected: 0,
+            generation: 0,
+            loading: false,
+        },
+        snapshot: None,
+        pending: std::collections::HashSet::new(),
     });
     let backend = TestBackend::new(80, 22);
     let mut term = Terminal::new(backend).unwrap();
@@ -1026,23 +1034,23 @@ fn help_modal_scrolls_and_dismisses() {
     let backend = TestBackend::new(64, 18);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    let total = a.info.as_ref().unwrap().total;
-    let view_h = a.info.as_ref().unwrap().view_h;
+    let total = a.info().unwrap().total;
+    let view_h = a.info().unwrap().view_h;
     assert!(total > view_h, "help should overflow the viewport");
     handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
-    assert_eq!(a.info.as_ref().unwrap().scroll, 1);
+    assert_eq!(a.info().unwrap().scroll, 1);
     for _ in 0..5 {
         handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
     }
-    assert_eq!(a.info.as_ref().unwrap().scroll, 6);
+    assert_eq!(a.info().unwrap().scroll, 6);
     handle_event(&plain_key(KeyCode::Char('k')), &mut a, None, &mut run);
-    assert_eq!(a.info.as_ref().unwrap().scroll, 5);
+    assert_eq!(a.info().unwrap().scroll, 5);
     for _ in 0..total {
         handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
     }
-    assert_eq!(a.info.as_ref().unwrap().scroll, total - view_h);
+    assert_eq!(a.info().unwrap().scroll, total - view_h);
     handle_event(&plain_key(KeyCode::Char('q')), &mut a, None, &mut run);
-    assert!(a.info.is_none());
+    assert!(a.info().is_none());
 }
 
 #[test]
@@ -1055,7 +1063,7 @@ fn pasted_image_path_inserts_literal_text() {
 
     handle_event(&Event::Paste(pasted.clone()), &mut a, None, &mut None);
 
-    assert_eq!(a.input, pasted);
+    assert_eq!(a.prompt.text, pasted);
 }
 
 #[test]
@@ -1069,19 +1077,19 @@ fn pasted_multiline_text_inserts_literal_text() {
         &mut None,
     );
 
-    assert_eq!(a.input, "line one\nline two");
+    assert_eq!(a.prompt.text, "line one\nline two");
 }
 
 #[test]
 fn slash_complete_filters_and_accepts() {
     let mut a = app();
-    a.input = "/".to_string();
+    a.prompt.text = "/".to_string();
     a.refresh_slash_complete();
-    let sc = a.slash_complete.as_ref().expect("popover open");
+    let sc = a.prompt.slash_complete.as_ref().expect("popover open");
     assert_eq!(sc.candidates.len(), SLASH_COMMANDS.len());
-    a.input = "/tr".to_string();
+    a.prompt.text = "/tr".to_string();
     a.refresh_slash_complete();
-    let sc = a.slash_complete.as_ref().expect("popover open");
+    let sc = a.prompt.slash_complete.as_ref().expect("popover open");
     // `/tr` matches only /tree; resolve its index rather than hardcoding it so
     // adding a command does not shift the assertion.
     let tree_idx = SLASH_COMMANDS
@@ -1089,38 +1097,38 @@ fn slash_complete_filters_and_accepts() {
         .position(|(c, _)| *c == "/tree")
         .unwrap();
     assert_eq!(sc.candidates, vec![tree_idx]);
-    a.input = "/tree".to_string();
+    a.prompt.text = "/tree".to_string();
     a.refresh_slash_complete();
-    assert!(a.slash_complete.is_none());
-    a.input = "hello".to_string();
+    assert!(a.prompt.slash_complete.is_none());
+    a.prompt.text = "hello".to_string();
     a.refresh_slash_complete();
-    assert!(a.slash_complete.is_none());
-    a.input = "/".to_string();
+    assert!(a.prompt.slash_complete.is_none());
+    a.prompt.text = "/".to_string();
     a.refresh_slash_complete();
     a.slash_complete_down(); // index 1 = /compact
     a.slash_complete_down(); // index 2 = /debug
     a.slash_complete_down(); // index 3 = /exit
     a.slash_complete_down(); // index 4 = /help
     a.slash_complete_accept();
-    assert_eq!(a.input, "/help");
-    assert_eq!(a.input_cursor, a.input.len());
-    assert!(a.slash_complete.is_none());
+    assert_eq!(a.prompt.text, "/help");
+    assert_eq!(a.prompt.cursor, a.prompt.text.len());
+    assert!(a.prompt.slash_complete.is_none());
 }
 
 #[test]
 fn slash_complete_enter_accepts_tab_wraps() {
     let mut a = app();
     let mut run = None;
-    a.input = "/".to_string();
+    a.prompt.text = "/".to_string();
     a.refresh_slash_complete();
-    let len = a.slash_complete.as_ref().unwrap().candidates.len();
+    let len = a.prompt.slash_complete.as_ref().unwrap().candidates.len();
     for _ in 0..len {
         handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
     }
-    assert_eq!(a.slash_complete.as_ref().unwrap().selected, 0);
+    assert_eq!(a.prompt.slash_complete.as_ref().unwrap().selected, 0);
     handle_event(&plain_key(KeyCode::Enter), &mut a, None, &mut run);
-    assert_eq!(a.input, "/clear");
-    assert!(a.slash_complete.is_none());
+    assert_eq!(a.prompt.text, "/clear");
+    assert!(a.prompt.slash_complete.is_none());
 }
 
 #[test]
@@ -1129,17 +1137,20 @@ fn slash_complete_single_item_tab_accepts() {
     // instead of cycling (a no-op on a single candidate).
     let mut a = app();
     let mut run = None;
-    a.input = "/tr".to_string();
+    a.prompt.text = "/tr".to_string();
     a.refresh_slash_complete();
-    assert_eq!(a.slash_complete.as_ref().unwrap().candidates.len(), 1);
+    assert_eq!(
+        a.prompt.slash_complete.as_ref().unwrap().candidates.len(),
+        1
+    );
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
-    assert_eq!(a.input, "/tree");
-    assert!(a.slash_complete.is_none());
-    a.input = "/tr".to_string();
+    assert_eq!(a.prompt.text, "/tree");
+    assert!(a.prompt.slash_complete.is_none());
+    a.prompt.text = "/tr".to_string();
     a.refresh_slash_complete();
     handle_event(&plain_key(KeyCode::BackTab), &mut a, None, &mut run);
-    assert_eq!(a.input, "/tree");
-    assert!(a.slash_complete.is_none());
+    assert_eq!(a.prompt.text, "/tree");
+    assert!(a.prompt.slash_complete.is_none());
 }
 
 #[test]
@@ -1156,10 +1167,10 @@ fn subagent_command_opens_empty_modal_without_a_session() {
 fn subagent_modal_esc_closes() {
     let mut a = app();
     assert!(a.slash_command("/subagent"));
-    assert!(a.background_modal.is_some());
+    assert!(a.background_modal().is_some());
     let mut run = None;
     handle_event(&plain_key(KeyCode::Esc), &mut a, None, &mut run);
-    assert!(a.background_modal.is_none());
+    assert!(a.background_modal().is_none());
 }
 
 #[test]
@@ -1330,8 +1341,10 @@ fn subagent_rows_name_the_model_the_live_cost_and_the_elapsed_time() {
     use ratatui::Terminal;
 
     let mut a = app();
-    a.background_modal = Some(background_modal(BackgroundTab::Subagents));
-    a.background_modal.as_mut().unwrap().subagents.rows = vec![SubagentRow {
+    a.open_modal(ActiveModal::Background(background_modal(
+        BackgroundTab::Subagents,
+    )));
+    a.background_modal_mut().unwrap().subagents.rows = vec![SubagentRow {
         id: "abc12345".into(),
         running: true,
         preview: "fix the parser".into(),
@@ -1364,10 +1377,12 @@ fn a_settled_subagent_row_names_what_it_ran_without_the_turn_label() {
     use ratatui::Terminal;
 
     let mut a = app();
-    a.background_modal = Some(background_modal(BackgroundTab::Subagents));
+    a.open_modal(ActiveModal::Background(background_modal(
+        BackgroundTab::Subagents,
+    )));
     // A row read from the store: its preview carries the picker's role label,
     // and the header and settle marker handed it the model and the spend.
-    a.background_modal.as_mut().unwrap().subagents.rows = vec![SubagentRow {
+    a.background_modal_mut().unwrap().subagents.rows = vec![SubagentRow {
         id: "abc12345".into(),
         running: false,
         preview: "agent: the parser is fixed".into(),
@@ -1396,8 +1411,10 @@ fn a_row_that_knows_only_its_label_keeps_the_columns() {
     use ratatui::Terminal;
 
     let mut a = app();
-    a.background_modal = Some(background_modal(BackgroundTab::Subagents));
-    a.background_modal.as_mut().unwrap().subagents.rows = vec![
+    a.open_modal(ActiveModal::Background(background_modal(
+        BackgroundTab::Subagents,
+    )));
+    a.background_modal_mut().unwrap().subagents.rows = vec![
         SubagentRow {
             id: "abc12345".into(),
             running: false,
@@ -1663,7 +1680,9 @@ fn refresh_subagent_view_skips_the_final_reload_when_the_file_is_unchanged() {
 
     let mut a = app();
     attach_session_sink(&mut a, store, cwd, parent);
-    a.background_modal = Some(background_modal(BackgroundTab::Subagents));
+    a.open_modal(ActiveModal::Background(background_modal(
+        BackgroundTab::Subagents,
+    )));
     open_subagent_view(
         &mut a,
         SubagentTranscriptView {
@@ -1726,7 +1745,9 @@ fn refresh_subagent_view_reloads_once_when_a_live_run_settles() {
 
     let mut a = app();
     attach_session_sink(&mut a, store, cwd, parent);
-    a.background_modal = Some(background_modal(BackgroundTab::Subagents));
+    a.open_modal(ActiveModal::Background(background_modal(
+        BackgroundTab::Subagents,
+    )));
     open_subagent_view(
         &mut a,
         SubagentTranscriptView {

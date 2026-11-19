@@ -94,9 +94,9 @@ impl App {
     }
 
     pub(in crate::tui) fn refresh_slash_complete(&mut self) {
-        let input = self.input.as_str();
+        let input = self.prompt.text.as_str();
         if !input.starts_with('/') || input.is_empty() {
-            self.slash_complete = None;
+            self.prompt.slash_complete = None;
             return;
         }
         let candidates: Vec<usize> = SLASH_COMMANDS
@@ -108,35 +108,35 @@ impl App {
         if candidates.is_empty()
             || (candidates.len() == 1 && SLASH_COMMANDS[candidates[0]].0 == input)
         {
-            self.slash_complete = None;
+            self.prompt.slash_complete = None;
             return;
         }
         // Preserve the selection if the previously-selected command is still
         // a candidate; otherwise reset to the first match.
-        let prev = self.slash_complete.as_ref().and_then(|sc| {
+        let prev = self.prompt.slash_complete.as_ref().and_then(|sc| {
             sc.candidates
                 .get(sc.selected)
                 .and_then(|&idx| candidates.iter().position(|&c| c == idx))
         });
         let selected = prev.unwrap_or(0);
-        self.slash_complete = Some(SlashComplete {
+        self.prompt.slash_complete = Some(SlashComplete {
             candidates,
             selected,
         });
     }
 
     pub(in crate::tui) fn slash_complete_accept(&mut self) {
-        if let Some(sc) = self.slash_complete.take() {
+        if let Some(sc) = self.prompt.slash_complete.take() {
             if let Some(&idx) = sc.candidates.get(sc.selected) {
-                self.input = SLASH_COMMANDS[idx].0.to_string();
-                self.input_cursor = self.input.chars().count();
+                self.prompt.text = SLASH_COMMANDS[idx].0.to_string();
+                self.prompt.cursor = self.prompt.text.len();
             }
         }
-        self.slash_complete = None;
+        self.prompt.slash_complete = None;
     }
 
     pub(in crate::tui) fn slash_complete_up(&mut self) {
-        if let Some(sc) = self.slash_complete.as_mut() {
+        if let Some(sc) = self.prompt.slash_complete.as_mut() {
             if sc.selected > 0 {
                 sc.selected -= 1;
             }
@@ -144,7 +144,7 @@ impl App {
     }
 
     pub(in crate::tui) fn slash_complete_down(&mut self) {
-        if let Some(sc) = self.slash_complete.as_mut() {
+        if let Some(sc) = self.prompt.slash_complete.as_mut() {
             if sc.selected + 1 < sc.candidates.len() {
                 sc.selected += 1;
             }
@@ -245,13 +245,13 @@ impl App {
             t,
             "Type / for slash-command autocomplete (↑/↓ and Tab).",
         ));
-        self.info = Some(InfoModal {
+        self.open_modal(ActiveModal::Info(InfoModal {
             title: "Help".to_string(),
             lines,
             scroll: 0,
             total: 0,
             view_h: 0,
-        });
+        }));
     }
 
     pub(in crate::tui) fn show_session_info(&mut self) {
@@ -296,13 +296,13 @@ impl App {
             "root",
             &crate::tui::text::abbreviate_path(&self.session.cwd, 60),
         ));
-        self.info = Some(InfoModal {
+        self.open_modal(ActiveModal::Info(InfoModal {
             title: "Session".to_string(),
             lines,
             scroll: 0,
             total: 0,
             view_h: 0,
-        });
+        }));
     }
 
     pub(in crate::tui) fn start_new_session(&mut self) {
@@ -331,8 +331,8 @@ impl App {
             sink.clear_cursor();
         }
         self.session.cursor = None;
-        self.pinned = true;
-        self.top_line = 0;
+        self.viewport.pinned = true;
+        self.viewport.top_line = 0;
         // Reset the footer usage/cost stats so a fresh session doesn't
         // carry over the previous one's context gauge and accumulated cost.
         self.reset_compaction_gauges();
@@ -343,18 +343,20 @@ impl App {
     }
 
     pub(in crate::tui) fn reset_session_jobs(&mut self) {
-        if let Some(jobs) = &self.jobs {
+        if let Some(jobs) = self.jobs() {
             jobs.reset();
         }
         // Pending timers belong to the old conversation; a `/new` session
         // must not be woken by them.
-        if let Some(timers) = &self.timers {
+        if let Some(timers) = self.timers() {
             timers.reset();
         }
         self.timers_recorded.clear();
         self.resumed_timers.clear();
         self.stale_jobs.clear();
-        self.background_modal = None;
+        if matches!(self.modal, Some(ActiveModal::Background(_))) {
+            self.modal = None;
+        }
         self.prompt_queue
             .retain(|queued| queued.kind == lofi_types::PromptKind::User);
         self.startup_notices.clear();

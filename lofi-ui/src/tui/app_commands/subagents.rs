@@ -7,7 +7,7 @@ impl App {
     /// session's transcript. Runs before the session is replaced (/new,
     /// /resume) or dropped (quit).
     pub(in crate::tui) fn record_subagent_spend(&mut self) {
-        let (Some(subagents), Some(sink)) = (&self.subagents, &self.session.sink) else {
+        let (Some(subagents), Some(sink)) = (self.subagents(), &self.session.sink) else {
             return;
         };
         let Some((cost, usage)) = subagents.take_unreported() else {
@@ -31,7 +31,7 @@ impl App {
         // The registry reset drops the inbox a stored wake points at. Clear
         // the text here too, so no turn starts on the old session's sender.
         self.mailbox_wake = None;
-        let Some(subagents) = &self.subagents else {
+        let Some(subagents) = self.subagents() else {
             return;
         };
         let (cost, usage) = subagents.clear();
@@ -76,7 +76,7 @@ impl App {
                 .collect(),
             _ => Vec::new(),
         };
-        if let Some(registry) = &self.subagents {
+        if let Some(registry) = self.subagents() {
             for run in registry.live() {
                 match rows.iter_mut().find(|row| row.is_run(&run)) {
                     Some(row) => row.fill_live(&run),
@@ -143,7 +143,7 @@ impl App {
         let was_live = view.live;
         let due = view.last_reload.elapsed() >= RELOAD_INTERVAL;
         let live = self
-            .subagents
+            .subagents()
             .as_ref()
             .is_some_and(|registry| registry.is_running(&id));
         // A live run reloads on the throttle; a just-settled run reloads
@@ -167,7 +167,7 @@ impl App {
         // name yet; pick it up once the registry knows it.
         let file = match file {
             Some(file) => Some(file),
-            None => self.subagents.as_ref().and_then(|registry| {
+            None => self.subagents().and_then(|registry| {
                 registry
                     .live()
                     .into_iter()

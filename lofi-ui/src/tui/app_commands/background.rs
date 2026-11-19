@@ -14,14 +14,14 @@ impl App {
             selected: 0,
             rows: self.timers_snapshot(),
         };
-        self.background_modal = Some(BackgroundModalState {
+        self.open_modal(ActiveModal::Background(Box::new(BackgroundModalState {
             tab,
             jobs: JobsModalState { selected: 0 },
             subagents,
             timers,
             view: None,
             confirm: None,
-        });
+        })));
     }
 
     /// The tab a bare keybinding should land on: the one whose youngest
@@ -56,7 +56,7 @@ impl App {
     /// live registry fields, and a listing the frame re-reads (jobs, timers)
     /// also clamps the selection it may have shrunk under.
     pub(in crate::tui) fn refresh_background_modal(&mut self) {
-        let Some(modal) = self.background_modal.as_ref() else {
+        let Some(modal) = self.background_modal() else {
             return;
         };
         let tab = modal.tab;
@@ -64,19 +64,19 @@ impl App {
         match tab {
             BackgroundTab::Subagents => {
                 if viewing {
-                    let Some(mut modal) = self.background_modal.take() else {
+                    let Some(mut modal) = self.take_background_modal() else {
                         return;
                     };
                     if let Some(BackgroundView::Subagent(view)) = &mut modal.view {
                         self.refresh_subagent_view(view);
                     }
-                    self.background_modal = Some(modal);
+                    self.modal = Some(ActiveModal::Background(modal));
                 } else {
-                    let Some(registry) = self.subagents.as_ref() else {
+                    let Some(registry) = self.subagents() else {
                         return;
                     };
                     let runs = registry.live();
-                    if let Some(modal) = self.background_modal.as_mut() {
+                    if let Some(modal) = self.background_modal_mut() {
                         modal.subagents.overlay_live(&runs);
                         clamp_selection(&mut modal.subagents.selected, modal.subagents.rows.len());
                     }
@@ -84,7 +84,7 @@ impl App {
             }
             BackgroundTab::Jobs => {
                 let jobs = self.jobs_rows();
-                let Some(mut modal) = self.background_modal.take() else {
+                let Some(mut modal) = self.take_background_modal() else {
                     return;
                 };
                 if let Some(BackgroundView::Job(view)) = &mut modal.view {
@@ -92,12 +92,12 @@ impl App {
                 } else {
                     clamp_selection(&mut modal.jobs.selected, jobs.len());
                 }
-                self.background_modal = Some(modal);
+                self.modal = Some(ActiveModal::Background(modal));
             }
             BackgroundTab::Timers => {
                 if !viewing {
                     let rows = self.timers_snapshot();
-                    let Some(modal) = self.background_modal.as_mut() else {
+                    let Some(modal) = self.background_modal_mut() else {
                         return;
                     };
                     modal.timers.rows = rows;
@@ -113,7 +113,7 @@ impl App {
     pub(in crate::tui) fn handle_background_key(&mut self, k: &KeyEvent) -> bool {
         // Take the modal out so the body can call `&mut self` helpers without
         // overlapping the borrow; put it back (or not, on close).
-        let Some(mut modal) = self.background_modal.take() else {
+        let Some(mut modal) = self.take_background_modal() else {
             return true;
         };
 
@@ -121,7 +121,7 @@ impl App {
             if matches!(k.code, KeyCode::Char('y' | 'Y')) {
                 self.kill_background(target);
             }
-            self.background_modal = Some(modal);
+            self.modal = Some(ActiveModal::Background(modal));
             return true;
         }
 
@@ -130,7 +130,7 @@ impl App {
             if Self::background_view_key(view, k) {
                 modal.view = None;
             }
-            self.background_modal = Some(modal);
+            self.modal = Some(ActiveModal::Background(modal));
             return true;
         }
 
@@ -148,7 +148,7 @@ impl App {
             if tab == BackgroundTab::Timers {
                 modal.timers.rows = self.timers_snapshot();
             }
-            self.background_modal = Some(modal);
+            self.modal = Some(ActiveModal::Background(modal));
             return true;
         }
 
@@ -182,7 +182,7 @@ impl App {
             }
             _ => {}
         }
-        self.background_modal = Some(modal);
+        self.modal = Some(ActiveModal::Background(modal));
         true
     }
 
@@ -252,8 +252,7 @@ impl App {
                     return None;
                 };
                 let content = if job.tty {
-                    self.jobs
-                        .as_ref()
+                    self.jobs()
                         .and_then(|jobs| jobs.screen(job.id))
                         .map_or_else(JobViewContent::empty_log, JobViewContent::Terminal)
                 } else {
@@ -297,30 +296,30 @@ impl App {
     pub(in crate::tui) fn kill_background(&mut self, target: BackgroundKill) {
         match target {
             BackgroundKill::Job(id) => {
-                if let Some(jobs) = &self.jobs {
+                if let Some(jobs) = self.jobs() {
                     jobs.kill(id);
                 }
             }
             BackgroundKill::Subagent(id) => {
-                if let Some(registry) = &self.subagents {
+                if let Some(registry) = self.subagents() {
                     let _ = registry.kill(&id, Some("stopped from the background dialog"));
                 }
             }
             BackgroundKill::Timer(id) => {
-                if let Some(timers) = &self.timers {
+                if let Some(timers) = self.timers() {
                     let _ = timers.cancel(id);
                 }
             }
             BackgroundKill::All(tab) => match tab {
                 BackgroundTab::Jobs => {
-                    if let Some(jobs) = &self.jobs {
+                    if let Some(jobs) = self.jobs() {
                         for job in jobs.active_items().iter().filter(|job| job.running) {
                             jobs.kill(job.id);
                         }
                     }
                 }
                 BackgroundTab::Subagents => {
-                    if let Some(registry) = &self.subagents {
+                    if let Some(registry) = self.subagents() {
                         for run in registry.running() {
                             let _ =
                                 registry.kill(&run.id, Some("stopped from the background dialog"));
@@ -328,7 +327,7 @@ impl App {
                     }
                 }
                 BackgroundTab::Timers => {
-                    if let Some(timers) = &self.timers {
+                    if let Some(timers) = self.timers() {
                         timers.reset();
                     }
                 }

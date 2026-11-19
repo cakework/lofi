@@ -28,7 +28,7 @@ fn log_scrollbar_thumb_tracks_scroll_input_ownership() {
         Some(a.theme.muted),
         "Input mode: the transcript scrollbar is passive"
     );
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
     assert_eq!(
         thumb_fg(&mut a),
         Some(a.theme.user),

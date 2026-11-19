@@ -411,3 +411,87 @@ impl BackendFactory {
         }
     }
 }
+
+/// Prepared session configuration, model factory, and tool executor shared by
+/// interactive startup, no-model fallback, and headless print runs.
+pub struct SessionBootstrap {
+    pub config: Config,
+    pub factory: BackendFactory,
+    pub executor: ToolExecutor,
+}
+
+impl SessionBootstrap {
+    /// Load configuration, build the model catalog, and initialize session
+    /// execution state (`SessionTempDir` and auto-mode evaluator) once.
+    ///
+    /// # Errors
+    /// Propagates configuration, temporary-directory, or auto-mode errors.
+    pub async fn prepare(
+        config_path: Option<PathBuf>,
+        root: &Path,
+        env: Vec<(String, String)>,
+        persist_subagents: bool,
+    ) -> Result<Self> {
+        let path = config_path.map_or_else(crate::config_loader::user_config_path, Ok)?;
+        let config = crate::config_loader::load_backend_config(&path)?;
+        let skills_dir = path.parent().map(|dir| dir.join("skills"));
+        let factory = BackendFactory::new(config.clone(), root, env.clone())?
+            .with_skills_dir(skills_dir.clone())
+            .with_subagent_persistence(persist_subagents);
+        let executor = factory
+            .executor()?
+            .with_skills_dir(skills_dir)
+            .with_auto_mode_config(&config, &env)
+            .await?;
+        Ok(Self {
+            config,
+            factory,
+            executor,
+        })
+    }
+
+    /// Open a backend for `query` constrained by an optional `--backend` flag,
+    /// cloning the prepared session executor so fallback attempts reuse it.
+    ///
+    /// # Errors
+    /// Propagates backend constraint, model selection, or credential errors.
+    pub async fn open(&self, backend: Option<&str>, query: Option<&str>) -> Result<BackendRef> {
+        let constrained = constrain_backend_query(&self.config, backend, query)?;
+        self.factory
+            .open(constrained.as_deref(), self.executor.clone())
+            .await
+    }
+}
+
+/// Honour `--backend`: constrain `query` to `backend` instead of silently
+/// switching providers, or select `backend`'s configured default model.
+///
+/// # Errors
+/// Returns `Error::Config` when a qualified `query` names a different backend.
+pub fn constrain_backend_query(
+    config: &Config,
+    backend: Option<&str>,
+    query: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(name) = backend else {
+        return Ok(query.map(str::to_owned));
+    };
+    if let Some(query) = query {
+        return match query.split_once('/') {
+            Some((prefix, _)) if prefix == name => Ok(Some(query.to_owned())),
+            _ => Err(Error::Config(format!(
+                "model \"{query}\" conflicts with --backend \"{name}\""
+            ))),
+        };
+    }
+    let model = config
+        .backends
+        .get(name)
+        .and_then(|entry| {
+            entry
+                .model()
+                .or_else(|| entry.models().first().map(String::as_str))
+        })
+        .unwrap_or("default");
+    Ok(Some(format!("{name}/{model}")))
+}

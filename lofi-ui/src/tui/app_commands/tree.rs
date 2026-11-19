@@ -85,8 +85,11 @@ impl App {
         }
     }
 
-    pub(super) fn release_tree_resources(&mut self, entries: Vec<TreeEntry>) {
-        let snapshot_id = self.tree_picker_snapshot.take();
+    pub(super) fn release_tree_resources(
+        &mut self,
+        entries: Vec<TreeEntry>,
+        snapshot_id: Option<u64>,
+    ) {
         if entries.is_empty() && snapshot_id.is_none() {
             return;
         }
@@ -105,10 +108,6 @@ impl App {
         }
     }
 
-    fn release_tree_snapshot(&mut self) {
-        self.release_tree_resources(Vec::new());
-    }
-
     /// '/tree': open the branch-picker overlay over the active session's
     /// event log. Lists every user-prompt event (the natural branch points)
     /// with its preview. Confirmed entry feeds the prompt text back into the
@@ -122,21 +121,24 @@ impl App {
             );
             return;
         };
+        // Release any open modal (and any prior tree snapshot on the IO thread)
+        // before bumping generation for the new tree load.
+        self.close_modal();
         let generation = self
             .picker_generation
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        // Release any prior tree snapshot on the IO thread before opening a
-        // new one; otherwise a stale snapshot would leak until process exit.
-        self.release_tree_snapshot();
-        self.tree_picker_pending.clear();
-        self.tree_picker = Some(TreePickerState {
-            entries: Vec::new(),
-            selected: 0,
-            generation,
-            loading: true,
-        });
         if let (Some(tx), Some(sink)) = (self.picker_load_tx.clone(), self.session.sink.as_ref()) {
+            self.modal = Some(ActiveModal::Tree {
+                picker: TreePickerState {
+                    entries: Vec::new(),
+                    selected: 0,
+                    generation,
+                    loading: true,
+                },
+                snapshot: None,
+                pending: std::collections::HashSet::new(),
+            });
             let generation_clock = Arc::clone(&self.picker_generation);
             let cursor = cursor.clone();
             sink.submit_io(Box::new(move |state| {
@@ -147,20 +149,22 @@ impl App {
                 Ok(snapshot) => {
                     let entries = build_tree_entries(&snapshot.index, snapshot.leaf_pos, &cursor);
                     if entries.is_empty() {
-                        self.tree_picker = None;
                         self.notify(NotifyKind::Info, "no branch points in this session yet");
                     } else {
                         let selected = entries.len().saturating_sub(1);
-                        self.tree_picker = Some(TreePickerState {
-                            entries,
-                            selected,
-                            generation,
-                            loading: false,
+                        self.modal = Some(ActiveModal::Tree {
+                            picker: TreePickerState {
+                                entries,
+                                selected,
+                                generation,
+                                loading: false,
+                            },
+                            snapshot: None,
+                            pending: std::collections::HashSet::new(),
                         });
                     }
                 }
                 Err(e) => {
-                    self.tree_picker = None;
                     self.notify(NotifyKind::Error, format!("load session for /tree: {e}"));
                 }
             }
@@ -169,39 +173,40 @@ impl App {
 
     pub(super) fn request_tree_viewport(&mut self) {
         const VIEW_ROWS: usize = 20;
-        let Some(picker) = self.tree_picker.as_ref() else {
-            return;
-        };
-        let Some(snapshot_id) = self.tree_picker_snapshot else {
-            return;
-        };
-        if !self.tree_picker_pending.is_empty() {
-            return;
-        }
         let Some(tx) = self.picker_load_tx.clone() else {
             return;
         };
-        let generation = picker.generation;
-        let start = picker
-            .selected
-            .saturating_sub(VIEW_ROWS.saturating_sub(1))
-            .min(picker.entries.len().saturating_sub(VIEW_ROWS));
-        let end = (start + VIEW_ROWS).min(picker.entries.len());
-        // Include one page before the visible viewport. Since the tree starts
-        // at its tail and users normally move upward, this amortizes topology
-        // setup to roughly once per 20 rows instead of once per keypress.
-        let prefetch_start = start.saturating_sub(VIEW_ROWS);
-        let requested: Vec<_> = (prefetch_start..end)
-            .filter(|row| !picker.entries[*row].hydrated && !self.tree_picker_pending.contains(row))
-            .map(|row| (row, picker.entries[row].clone()))
-            .collect();
-        if requested.is_empty() {
-            return;
-        }
-        self.tree_picker_pending
-            .extend(requested.iter().map(|(row, _)| *row));
         let Some(cursor) = self.session.cursor.clone() else {
             return;
+        };
+        let (generation, snapshot_id, requested) = {
+            let Some(ActiveModal::Tree {
+                picker,
+                snapshot: Some(snapshot_id),
+                pending,
+            }) = &mut self.modal
+            else {
+                return;
+            };
+            if !pending.is_empty() {
+                return;
+            }
+            let generation = picker.generation;
+            let start = picker
+                .selected
+                .saturating_sub(VIEW_ROWS.saturating_sub(1))
+                .min(picker.entries.len().saturating_sub(VIEW_ROWS));
+            let end = (start + VIEW_ROWS).min(picker.entries.len());
+            let prefetch_start = start.saturating_sub(VIEW_ROWS);
+            let requested: Vec<_> = (prefetch_start..end)
+                .filter(|row| !picker.entries[*row].hydrated && !pending.contains(row))
+                .map(|row| (row, picker.entries[row].clone()))
+                .collect();
+            if requested.is_empty() {
+                return;
+            }
+            pending.extend(requested.iter().map(|(row, _)| *row));
+            (generation, *snapshot_id, requested)
         };
         let Some(sink) = self.session.sink.as_ref() else {
             return;
@@ -209,8 +214,6 @@ impl App {
         let generation_clock = Arc::clone(&self.picker_generation);
         sink.submit_io(Box::new(move |state| {
             let Some(snapshot) = state.tree_snapshot(snapshot_id) else {
-                // Picker was closed between request and execution; nothing to
-                // hydrate. The pending-set entry will be cleared on close.
                 return;
             };
             hydrate_tree_entry_rows(
@@ -230,7 +233,7 @@ impl App {
         cursor: &store::SessionCursor,
         index: &[store::SessionIndexEntry],
     ) {
-        if let Some(jobs) = self.jobs.clone() {
+        if let Some(jobs) = self.jobs() {
             match self
                 .lifecycle
                 .reconcile_jobs_after_lineage_switch(cursor, index, &jobs)
@@ -253,7 +256,7 @@ impl App {
                 // a wake-up is owed whether or not its moment passed while
                 // another branch was showing, and a timer dropped here would
                 // be one the selected transcript still lists.
-                if let Some(registry) = &self.timers {
+                if let Some(registry) = self.timers() {
                     registry.restore(&timers);
                 }
                 self.timers_recorded.clone_from(&timers);
@@ -300,11 +303,14 @@ impl App {
         }
     }
 
-    pub(in crate::tui) fn tree_picker_confirm_inner(&mut self, picker: TreePickerState) {
+    pub(in crate::tui) fn tree_picker_confirm_inner(
+        &mut self,
+        picker: TreePickerState,
+        snapshot: Option<u64>,
+    ) {
         let entry = picker.entries.get(picker.selected).cloned();
         self.picker_generation.fetch_add(1, Ordering::Relaxed);
-        self.release_tree_resources(picker.entries);
-        self.tree_picker_pending.clear();
+        self.release_tree_resources(picker.entries, snapshot);
         if self.busy() {
             self.notify(
                 NotifyKind::Warn,
@@ -387,15 +393,21 @@ impl App {
             String::new()
         };
         if !prefill.is_empty() {
-            self.input = prefill;
-            self.input_cursor = self.input.len();
+            self.prompt.text = prefill;
+            self.prompt.cursor = self.prompt.text.len();
         }
     }
 
     #[cfg(test)]
     pub(in crate::tui) fn tree_picker_confirm(&mut self) {
-        if let Some(picker) = self.tree_picker.take() {
-            self.tree_picker_confirm_inner(picker);
+        if matches!(self.modal, Some(ActiveModal::Tree { .. })) {
+            let Some(ActiveModal::Tree {
+                picker, snapshot, ..
+            }) = self.modal.take()
+            else {
+                unreachable!()
+            };
+            self.tree_picker_confirm_inner(picker, snapshot);
         }
     }
 
@@ -415,8 +427,8 @@ impl App {
             turn.blocks.clear();
         }
         self.bump_render_epoch();
-        self.pinned = true;
-        self.top_line = 0;
+        self.viewport.pinned = true;
+        self.viewport.top_line = 0;
         Ok(())
     }
 }

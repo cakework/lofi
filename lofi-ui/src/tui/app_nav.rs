@@ -2,38 +2,108 @@
 
 use super::*;
 
+/// Scroll offset, content anchors, Navigate/Select cursor, charwise selection,
+/// and rendered viewport window geometry.
+pub(crate) struct ViewportState {
+    pub(crate) mode: Mode,
+    pub(crate) pinned: bool,
+    pub(crate) top_line: usize,
+    pub(crate) last_base: usize,
+    /// Top visible row as content: `(turn index, row within that turn)`.
+    pub(crate) view_anchor: Option<(usize, usize)>,
+    pub(crate) view_anchor_line: usize,
+    pub(crate) nav_cursor: usize,
+    pub(crate) nav_col: usize,
+    /// Navigate/Select cursor as content: `(turn index, row within that turn)`.
+    pub(crate) nav_anchor: Option<(usize, usize)>,
+    pub(crate) nav_anchor_line: usize,
+    pub(crate) nav_anchor_row: Option<usize>,
+    pub(crate) sel: Option<Selection>,
+    pub(crate) select_anchor: (usize, usize),
+    /// Selection's free end as content: `(turn index, row within that turn)`.
+    pub(crate) sel_anchor: Option<(usize, usize)>,
+    pub(crate) sel_anchor_line: usize,
+    pub(crate) yank_cursor: Option<(usize, usize)>,
+    /// Scrollbar geometry `(offset, extent)` as of the last final frame.
+    pub(crate) scroll_gauge: Option<(usize, usize)>,
+    pub(crate) scroll_gauge_stamp: Option<(usize, usize)>,
+    pub(crate) log_rect: Rect,
+    pub(crate) log_vis: Vec<view::VisLine>,
+    pub(crate) log_details: Vec<Option<view::DetailTarget>>,
+    pub(crate) log_off: usize,
+    pub(crate) log_total: usize,
+    pub(crate) last_turn_height: usize,
+    pub(crate) log_view_h: usize,
+}
+
+impl Default for ViewportState {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Input,
+            pinned: true,
+            top_line: 0,
+            last_base: 0,
+            view_anchor: None,
+            view_anchor_line: 0,
+            nav_cursor: 0,
+            nav_col: 0,
+            nav_anchor: None,
+            nav_anchor_line: 0,
+            nav_anchor_row: None,
+            sel: None,
+            select_anchor: (0, 0),
+            sel_anchor: None,
+            sel_anchor_line: 0,
+            yank_cursor: None,
+            scroll_gauge: None,
+            scroll_gauge_stamp: None,
+            log_rect: Rect::default(),
+            log_vis: Vec::new(),
+            log_details: Vec::new(),
+            log_off: 0,
+            log_total: 0,
+            last_turn_height: 0,
+            log_view_h: 0,
+        }
+    }
+}
+
 impl App {
     pub(super) fn enter_nav(&mut self) {
-        self.mode = Mode::Navigate;
-        self.sel = None;
+        self.viewport.mode = Mode::Navigate;
+        self.viewport.sel = None;
         // If the user yanked from a non-last-line position, jump back to
         // that line so they can continue reading from where they were.
         // Clamp to the current transcript bounds in case lines were added.
-        if let Some((cursor, col)) = self.yank_cursor.take() {
-            let total = self.log_total;
+        if let Some((cursor, col)) = self.viewport.yank_cursor.take() {
+            let total = self.viewport.log_total;
             let last = total.saturating_sub(1);
             self.place_nav_cursor(cursor.min(last));
-            self.nav_col = col;
+            self.viewport.nav_col = col;
             // Un-pin so the viewport stays where the cursor is, not the
             // bottom of the transcript. The render loop will clamp the
             // viewport to keep the cursor visible.
-            self.pinned = false;
-            self.top_line = self.nav_cursor.saturating_sub(self.log_view_h / 2);
+            self.viewport.pinned = false;
+            self.viewport.top_line = self
+                .viewport
+                .nav_cursor
+                .saturating_sub(self.viewport.log_view_h / 2);
         } else {
-            self.pinned = false;
-            self.top_line = self.log_off;
+            self.viewport.pinned = false;
+            self.viewport.top_line = self.viewport.log_off;
             let last = self
+                .viewport
                 .log_off
-                .saturating_add(self.log_view_h)
+                .saturating_add(self.viewport.log_view_h)
                 .saturating_sub(1);
-            self.place_nav_cursor(last.min(self.log_total.saturating_sub(1)));
-            self.nav_col = 0;
+            self.place_nav_cursor(last.min(self.viewport.log_total.saturating_sub(1)));
+            self.viewport.nav_col = 0;
         }
     }
 
     pub(super) fn enter_input(&mut self) {
-        self.mode = Mode::Input;
-        self.sel = None;
+        self.viewport.mode = Mode::Input;
+        self.viewport.sel = None;
         self.collapse_detail_focus();
     }
 
@@ -67,15 +137,15 @@ impl App {
     /// Snap the viewport to the bottom (latest) transcript line. Used when
     /// leaving Navigate/Select so the user lands on the newest output.
     pub(super) fn pin_to_latest(&mut self) {
-        self.pinned = true;
-        self.top_line = self.last_base;
+        self.viewport.pinned = true;
+        self.viewport.top_line = self.viewport.last_base;
     }
 
     pub(super) fn enter_select(&mut self) {
-        self.mode = Mode::Select;
+        self.viewport.mode = Mode::Select;
         self.sync_detail_nav_position();
-        self.select_anchor = (self.nav_cursor, self.nav_col);
-        self.sel = Some(self.select_sel());
+        self.viewport.select_anchor = (self.viewport.nav_cursor, self.viewport.nav_col);
+        self.viewport.sel = Some(self.select_sel());
     }
 
     /// Charwise selection from the anchor to the cursor (inclusive of both
@@ -83,15 +153,16 @@ impl App {
     /// content-aware clamp treats it as an exclusive bound for rendering and
     /// [`selection_text`].
     pub(super) fn select_sel(&self) -> Selection {
-        let a = self.select_anchor;
-        let c = (self.nav_cursor, self.nav_col);
+        let a = self.viewport.select_anchor;
+        let c = (self.viewport.nav_cursor, self.viewport.nav_col);
         let (s, mut e) = if a <= c { (a, c) } else { (c, a) };
         e.1 = e.1.saturating_add(1);
         Selection { start: s, end: e }
     }
 
     fn detail_target(&self, key: &DetailKey) -> Option<view::DetailTarget> {
-        self.log_details
+        self.viewport
+            .log_details
             .iter()
             .flatten()
             .find(|target| target.key == *key)
@@ -105,7 +176,7 @@ impl App {
 
     pub(super) fn focused_detail_row_index(&self, row: usize) -> Option<usize> {
         let focus = self.detail_focus.as_ref()?;
-        self.log_details.iter().position(|target| {
+        self.viewport.log_details.iter().position(|target| {
             target
                 .as_ref()
                 .is_some_and(|target| target.key == focus.key && target.row == Some(row))
@@ -114,14 +185,15 @@ impl App {
 
     fn focused_detail_header_line(&self) -> Option<usize> {
         let focus = self.detail_focus.as_ref()?;
-        self.log_details
+        self.viewport
+            .log_details
             .iter()
             .position(|target| {
                 target
                     .as_ref()
                     .is_some_and(|target| target.key == focus.key && target.row.is_none())
             })
-            .map(|rel| self.log_off.saturating_add(rel))
+            .map(|rel| self.viewport.log_off.saturating_add(rel))
     }
 
     fn sync_detail_nav_position(&mut self) {
@@ -132,26 +204,26 @@ impl App {
         else {
             return;
         };
-        let Some(rel) = self.log_details.iter().position(|target| {
+        let Some(rel) = self.viewport.log_details.iter().position(|target| {
             target
                 .as_ref()
                 .is_some_and(|target| target.key == key && target.row == Some(cursor))
         }) else {
             return;
         };
-        self.place_nav_cursor(self.log_off.saturating_add(rel));
-        self.nav_col = col;
+        self.place_nav_cursor(self.viewport.log_off.saturating_add(rel));
+        self.viewport.nav_col = col;
     }
 
     pub(super) fn focused_detail_content_range(&self) -> Option<(usize, usize)> {
         let focus = self.detail_focus.as_ref()?;
         let rel = self.focused_detail_row_index(focus.cursor)?;
-        self.log_vis.get(rel).map(|line| line.content)
+        self.viewport.log_vis.get(rel).map(|line| line.content)
     }
 
     fn rendered_content_range(&self, line: usize) -> (usize, usize) {
-        let rel = line.saturating_sub(self.log_off);
-        self.log_vis.get(rel).map_or((0, 0), |v| v.content)
+        let rel = line.saturating_sub(self.viewport.log_off);
+        self.viewport.log_vis.get(rel).map_or((0, 0), |v| v.content)
     }
 
     /// Content char range [cstart, cend] of the cursor line (absolute char
@@ -160,18 +232,21 @@ impl App {
         if let Some(range) = self.focused_detail_content_range() {
             return range;
         }
-        self.rendered_content_range(self.nav_cursor)
+        self.rendered_content_range(self.viewport.nav_cursor)
     }
 
     fn cursor_detail(&self) -> Option<view::DetailTarget> {
-        let rel = self.nav_cursor.checked_sub(self.log_off)?;
-        self.log_details.get(rel)?.clone()
+        let rel = self
+            .viewport
+            .nav_cursor
+            .checked_sub(self.viewport.log_off)?;
+        self.viewport.log_details.get(rel)?.clone()
     }
 
     fn cursor_turn(&self) -> usize {
         let mut turn = 0;
         for idx in 0..self.transcript.turns.len() {
-            if self.turn_start_line(idx) <= self.nav_cursor {
+            if self.turn_start_line(idx) <= self.viewport.nav_cursor {
                 turn = idx;
             } else {
                 break;
@@ -208,15 +283,15 @@ impl App {
         let header = self.focused_detail_header_line();
         if let Some(focus) = self.detail_focus.take() {
             let Some(state) = self.release_focused_detail(&focus.key) else {
-                self.mode = Mode::Navigate;
-                self.sel = None;
+                self.viewport.mode = Mode::Navigate;
+                self.viewport.sel = None;
                 return false;
             };
             if let Some(header) = header {
                 self.place_nav_cursor(header);
             }
-            self.mode = Mode::Navigate;
-            self.sel = None;
+            self.viewport.mode = Mode::Navigate;
+            self.viewport.sel = None;
             self.invalidate_detail_layout(state.turn);
             return true;
         }
@@ -244,10 +319,10 @@ impl App {
         if target.row.is_some() {
             return;
         }
-        let Some(rel) = self.nav_cursor.checked_sub(self.log_off) else {
+        let Some(rel) = self.viewport.nav_cursor.checked_sub(self.viewport.log_off) else {
             return;
         };
-        let header_rows = self.log_details[rel..]
+        let header_rows = self.viewport.log_details[rel..]
             .iter()
             .take_while(|detail| {
                 detail
@@ -264,7 +339,8 @@ impl App {
             0
         };
         self.place_nav_cursor(
-            self.nav_cursor
+            self.viewport
+                .nav_cursor
                 .saturating_add(header_rows)
                 .saturating_add(body_row),
         );
@@ -300,19 +376,19 @@ impl App {
                 focus.col.saturating_sub(1).max(cstart)
             };
             self.sync_detail_nav_position();
-            if self.mode == Mode::Select {
-                self.sel = Some(self.select_sel());
+            if self.viewport.mode == Mode::Select {
+                self.viewport.sel = Some(self.select_sel());
             }
             return;
         }
         let raw = if delta > 0 {
-            self.nav_col.saturating_add(1)
+            self.viewport.nav_col.saturating_add(1)
         } else {
-            self.nav_col.saturating_sub(1)
+            self.viewport.nav_col.saturating_sub(1)
         };
-        self.nav_col = raw.clamp(cstart, cend);
-        if self.mode == Mode::Select {
-            self.sel = Some(self.select_sel());
+        self.viewport.nav_col = raw.clamp(cstart, cend);
+        if self.viewport.mode == Mode::Select {
+            self.viewport.sel = Some(self.select_sel());
         }
     }
 
@@ -326,14 +402,14 @@ impl App {
         if let Some(focus) = &mut self.detail_focus {
             focus.col = col;
             self.sync_detail_nav_position();
-            if self.mode == Mode::Select {
-                self.sel = Some(self.select_sel());
+            if self.viewport.mode == Mode::Select {
+                self.viewport.sel = Some(self.select_sel());
             }
             return;
         }
-        self.nav_col = col;
-        if self.mode == Mode::Select {
-            self.sel = Some(self.select_sel());
+        self.viewport.nav_col = col;
+        if self.viewport.mode == Mode::Select {
+            self.viewport.sel = Some(self.select_sel());
         }
     }
 
@@ -358,13 +434,16 @@ impl App {
             let Some(rel) = self.focused_detail_row_index(focus.cursor) else {
                 return cstart;
             };
-            let Some(line) = self.log_vis.get(rel) else {
+            let Some(line) = self.viewport.log_vis.get(rel) else {
                 return cstart;
             };
             return Self::first_nonblank_col_in(&line.rendered, cstart, cend);
         }
-        let rel = self.nav_cursor.saturating_sub(self.log_off);
-        let Some(line) = self.log_vis.get(rel) else {
+        let rel = self
+            .viewport
+            .nav_cursor
+            .saturating_sub(self.viewport.log_off);
+        let Some(line) = self.viewport.log_vis.get(rel) else {
             return cstart;
         };
         Self::first_nonblank_col_in(&line.rendered, cstart, cend)
@@ -377,11 +456,17 @@ impl App {
         }
         let Some((vl, current_col)) = (if let Some(focus) = &self.detail_focus {
             self.focused_detail_row_index(focus.cursor)
-                .and_then(|rel| self.log_vis.get(rel))
+                .and_then(|rel| self.viewport.log_vis.get(rel))
                 .map(|line| (line, focus.col))
         } else {
-            let rel = self.nav_cursor.saturating_sub(self.log_off);
-            self.log_vis.get(rel).map(|line| (line, self.nav_col))
+            let rel = self
+                .viewport
+                .nav_cursor
+                .saturating_sub(self.viewport.log_off);
+            self.viewport
+                .log_vis
+                .get(rel)
+                .map(|line| (line, self.viewport.nav_col))
         }) else {
             return cstart;
         };
@@ -494,52 +579,52 @@ impl App {
 
     pub(super) fn nav_move(&mut self, delta: i32) {
         if self.detail_focus.is_some() && self.move_focused_detail(delta) {
-            if self.mode == Mode::Select {
-                self.sel = Some(self.select_sel());
+            if self.viewport.mode == Mode::Select {
+                self.viewport.sel = Some(self.select_sel());
             }
             return;
         }
         // The step is one line of content, so it applies to the line the
         // cursor sits on now, not to the absolute line of the last frame.
         self.reanchor_nav_cursor();
-        let max = self.log_total.saturating_sub(1);
+        let max = self.viewport.log_total.saturating_sub(1);
         let step = delta.unsigned_abs() as usize;
         let next = if delta > 0 {
-            self.nav_cursor.saturating_add(step).min(max)
+            self.viewport.nav_cursor.saturating_add(step).min(max)
         } else {
-            self.nav_cursor.saturating_sub(step)
+            self.viewport.nav_cursor.saturating_sub(step)
         };
         self.place_nav_cursor(next);
-        if self.mode == Mode::Select {
-            self.sel = Some(self.select_sel());
+        if self.viewport.mode == Mode::Select {
+            self.viewport.sel = Some(self.select_sel());
         }
         self.nav_show_cursor();
     }
 
     pub(super) fn nav_top(&mut self) {
         if self.detail_focus.is_some() && self.move_focused_detail(i32::MIN) {
-            if self.mode == Mode::Select {
-                self.sel = Some(self.select_sel());
+            if self.viewport.mode == Mode::Select {
+                self.viewport.sel = Some(self.select_sel());
             }
             return;
         }
         self.place_nav_cursor(0);
-        if self.mode == Mode::Select {
-            self.sel = Some(self.select_sel());
+        if self.viewport.mode == Mode::Select {
+            self.viewport.sel = Some(self.select_sel());
         }
         self.nav_show_cursor();
     }
 
     pub(super) fn nav_bottom(&mut self) {
         if self.detail_focus.is_some() && self.move_focused_detail(i32::MAX) {
-            if self.mode == Mode::Select {
-                self.sel = Some(self.select_sel());
+            if self.viewport.mode == Mode::Select {
+                self.viewport.sel = Some(self.select_sel());
             }
             return;
         }
-        self.place_nav_cursor(self.log_total.saturating_sub(1));
-        if self.mode == Mode::Select {
-            self.sel = Some(self.select_sel());
+        self.place_nav_cursor(self.viewport.log_total.saturating_sub(1));
+        if self.viewport.mode == Mode::Select {
+            self.viewport.sel = Some(self.select_sel());
         }
         self.nav_show_cursor();
     }
@@ -551,27 +636,32 @@ impl App {
     /// reached the end.
     pub(super) fn nav_show_cursor(&mut self) {
         self.nav_scroll_into_view();
-        let base = self.log_total.saturating_sub(self.log_view_h);
+        let base = self
+            .viewport
+            .log_total
+            .saturating_sub(self.viewport.log_view_h);
         // Reaching the latest transcript line is an explicit request to
         // follow the tail. Record that intent immediately rather than waiting
         // for a render to infer it from offsets: a settling event can append
         // or reflow rows before that render and otherwise make the viewport
         // fall back to the previous bottom.
-        self.pinned = self.nav_cursor == self.log_total.saturating_sub(1) && self.top_line >= base;
+        self.viewport.pinned = self.viewport.nav_cursor
+            == self.viewport.log_total.saturating_sub(1)
+            && self.viewport.top_line >= base;
     }
 
     /// Adjust [`top_line`] so the cursor is visible, without recording tail
     /// intent. Navigate never auto-pins (it doesn't follow new output); only
     /// the minimal scroll needed to keep the cursor on screen is applied.
     pub(super) fn nav_scroll_into_view(&mut self) {
-        let h = self.log_view_h;
-        let total = self.log_total;
+        let h = self.viewport.log_view_h;
+        let total = self.viewport.log_total;
         if h == 0 || total == 0 {
             return;
         }
         let base = total.saturating_sub(h);
-        let cur = self.nav_cursor;
-        let off = self.log_off;
+        let cur = self.viewport.nav_cursor;
+        let off = self.viewport.log_off;
         let new_top = if cur < off {
             cur
         } else if cur >= off + h {
@@ -579,7 +669,7 @@ impl App {
         } else {
             off
         };
-        self.top_line = new_top.min(base);
+        self.viewport.top_line = new_top.min(base);
     }
 
     fn render_turn_at(&self, idx: usize, width: usize, active_turn: bool) -> Vec<view::RenderLine> {
@@ -629,11 +719,11 @@ impl App {
     }
 
     pub(super) fn nav_content_anchor(&self) -> Option<(usize, usize)> {
-        self.content_anchor_for(self.nav_cursor, self.nav_col)
+        self.content_anchor_for(self.viewport.nav_cursor, self.viewport.nav_col)
     }
 
     pub(super) fn sel_content_anchor(&self) -> Option<(usize, usize)> {
-        self.content_anchor_for(self.select_anchor.0, self.select_anchor.1)
+        self.content_anchor_for(self.viewport.select_anchor.0, self.viewport.select_anchor.1)
     }
 
     fn reseat_position(
@@ -670,9 +760,9 @@ impl App {
     ) {
         if let Some((cursor, col)) = self.reseat_position(anchor, last_lines, width) {
             self.place_nav_cursor(cursor);
-            self.nav_col = col;
-            if self.mode == Mode::Select {
-                self.sel = Some(self.select_sel());
+            self.viewport.nav_col = col;
+            if self.viewport.mode == Mode::Select {
+                self.viewport.sel = Some(self.select_sel());
             }
         }
     }
@@ -684,8 +774,8 @@ impl App {
         width: usize,
     ) {
         if let Some((cursor, col)) = self.reseat_position(anchor, last_lines, width) {
-            self.select_anchor = (cursor, col);
-            self.sel = Some(self.select_sel());
+            self.viewport.select_anchor = (cursor, col);
+            self.viewport.sel = Some(self.select_sel());
         }
     }
 
@@ -701,7 +791,7 @@ impl App {
                 .frozen_heights
                 .get(j)
                 .copied()
-                .unwrap_or(self.last_turn_height);
+                .unwrap_or(self.viewport.last_turn_height);
             start += h + 1;
         }
         start
@@ -723,14 +813,14 @@ impl App {
         self.reanchor_nav_cursor();
         let mut cur = 0;
         for i in 0..n {
-            if self.nav_cursor < self.turn_start_line(i) {
+            if self.viewport.nav_cursor < self.turn_start_line(i) {
                 break;
             }
             cur = i;
         }
         let target_turn = if dir > 0 {
             (cur + 1).min(n - 1)
-        } else if self.nav_cursor > self.turn_start_line(cur) {
+        } else if self.viewport.nav_cursor > self.turn_start_line(cur) {
             // Inside a turn, the first press goes to the top of that turn.
             // A live turn has no settled end, so it must be a stop of its
             // own: skipping it drops the answer as it is written.
@@ -738,30 +828,30 @@ impl App {
         } else {
             cur.saturating_sub(1)
         };
-        let max = self.log_total.saturating_sub(1);
+        let max = self.viewport.log_total.saturating_sub(1);
         self.place_nav_cursor(self.turn_start_line(target_turn).min(max));
-        self.nav_col = 0;
-        if self.mode == Mode::Select {
-            self.sel = Some(self.select_sel());
+        self.viewport.nav_col = 0;
+        if self.viewport.mode == Mode::Select {
+            self.viewport.sel = Some(self.select_sel());
         } else {
-            self.sel = None;
+            self.viewport.sel = None;
         }
         self.nav_show_cursor();
     }
 
     pub(super) fn page_up(&mut self) {
-        let h = self.log_view_h;
+        let h = self.viewport.log_view_h;
         if h == 0 {
             return;
         }
         let step: i32 = h.try_into().unwrap_or(i32::MAX);
-        match self.mode {
+        match self.viewport.mode {
             Mode::Input => {
                 // Page from where the frame actually is, not from a stale
                 // `top_line`: a tail-following view never stores its own
                 // offset (`top_line` keeps the value from before it paged).
-                self.top_line = self.view_off().saturating_sub(h);
-                self.pinned = false;
+                self.viewport.top_line = self.view_off().saturating_sub(h);
+                self.viewport.pinned = false;
             }
             Mode::Navigate | Mode::Select if self.detail_focus.is_some() => {
                 self.nav_move(-i32::try_from(DETAIL_VIEW_ROWS).unwrap_or(i32::MAX));
@@ -771,19 +861,19 @@ impl App {
     }
 
     pub(super) fn page_down(&mut self) {
-        let h = self.log_view_h;
+        let h = self.viewport.log_view_h;
         if h == 0 {
             return;
         }
         let step: i32 = h.try_into().unwrap_or(i32::MAX);
-        match self.mode {
+        match self.viewport.mode {
             Mode::Input => {
                 let new = self.view_off().saturating_add(h);
-                if new >= self.last_base {
-                    self.pinned = true;
+                if new >= self.viewport.last_base {
+                    self.viewport.pinned = true;
                 } else {
-                    self.top_line = new;
-                    self.pinned = false;
+                    self.viewport.top_line = new;
+                    self.viewport.pinned = false;
                 }
             }
             Mode::Navigate | Mode::Select if self.detail_focus.is_some() => {
@@ -812,11 +902,11 @@ impl App {
     /// back to it. Not saved when the cursor is on the last line (the
     /// transcript-follow case) — in that case `enter_nav` follows as usual.
     fn save_yank_cursor(&mut self) {
-        let last = self.log_total.saturating_sub(1);
-        if self.nav_cursor < last {
-            self.yank_cursor = Some((self.nav_cursor, self.nav_col));
+        let last = self.viewport.log_total.saturating_sub(1);
+        if self.viewport.nav_cursor < last {
+            self.viewport.yank_cursor = Some((self.viewport.nav_cursor, self.viewport.nav_col));
         } else {
-            self.yank_cursor = None;
+            self.viewport.yank_cursor = None;
         }
     }
 
@@ -835,23 +925,23 @@ impl App {
         if delta == 0 {
             return;
         }
-        self.sel = None;
+        self.viewport.sel = None;
         // Scroll from the offset the frame is drawn at. `top_line` can sit
         // past the base (the view is clamped for display) and a tail-following
         // view does not store its own offset at all, so a step from it would
         // move by more or less than asked.
         if delta < 0 {
             let n = delta.unsigned_abs() as usize;
-            self.top_line = self.view_off().saturating_sub(n);
-            self.pinned = false;
+            self.viewport.top_line = self.view_off().saturating_sub(n);
+            self.viewport.pinned = false;
         } else {
             let n = usize::try_from(delta).unwrap_or(0);
-            if self.pinned {
+            if self.viewport.pinned {
                 return;
             }
-            self.top_line = self.view_off().saturating_add(n);
-            if self.top_line >= self.last_base {
-                self.pinned = true;
+            self.viewport.top_line = self.view_off().saturating_add(n);
+            if self.viewport.top_line >= self.viewport.last_base {
+                self.viewport.pinned = true;
             }
         }
     }
@@ -861,12 +951,12 @@ impl App {
     /// estimated frozen heights are replaced by exact ones, but the content at
     /// the top row does not.
     pub(super) fn remember_view_anchor(&mut self) {
-        self.view_anchor = if self.pinned {
+        self.viewport.view_anchor = if self.viewport.pinned {
             None
         } else {
-            self.content_row_anchor(self.log_off)
+            self.content_row_anchor(self.viewport.log_off)
         };
-        self.view_anchor_line = self.top_line;
+        self.viewport.view_anchor_line = self.viewport.top_line;
     }
 
     /// Re-derive `top_line` from the recorded content anchor, so a height
@@ -877,15 +967,17 @@ impl App {
     /// step is one screen up from the tail, but measuring the prefix shrinks
     /// the base until the absolute offset it produced no longer means that.
     pub(super) fn reanchor_view_top(&mut self) {
-        if self.pinned {
+        if self.viewport.pinned {
             return;
         }
-        if self.view_anchor.is_none() || self.top_line != self.view_anchor_line {
-            self.view_anchor = self.content_row_anchor(self.top_line);
-            self.view_anchor_line = self.top_line;
+        if self.viewport.view_anchor.is_none()
+            || self.viewport.top_line != self.viewport.view_anchor_line
+        {
+            self.viewport.view_anchor = self.content_row_anchor(self.viewport.top_line);
+            self.viewport.view_anchor_line = self.viewport.top_line;
             return;
         }
-        let Some((turn, row)) = self.view_anchor else {
+        let Some((turn, row)) = self.viewport.view_anchor else {
             return;
         };
         let height = self
@@ -893,9 +985,9 @@ impl App {
             .frozen_heights
             .get(turn)
             .copied()
-            .unwrap_or(self.last_turn_height);
-        self.top_line = self.turn_start_line(turn).saturating_add(row.min(height));
-        self.view_anchor_line = self.top_line;
+            .unwrap_or(self.viewport.last_turn_height);
+        self.viewport.top_line = self.turn_start_line(turn).saturating_add(row.min(height));
+        self.viewport.view_anchor_line = self.viewport.top_line;
     }
 
     /// Set the cursor line and pair it with the content it sits on in the same
@@ -910,21 +1002,22 @@ impl App {
     /// read the stale line with the new heights and clamped it to the end of
     /// the transcript.
     fn place_nav_cursor(&mut self, line: usize) {
-        self.nav_cursor = line;
-        self.nav_anchor = self.content_row_anchor(line);
-        self.nav_anchor_line = line;
-        self.nav_anchor_row = None;
+        self.viewport.nav_cursor = line;
+        self.viewport.nav_anchor = self.content_row_anchor(line);
+        self.viewport.nav_anchor_line = line;
+        self.viewport.nav_anchor_row = None;
     }
 
     /// Record the cursor as a content position and its screen row, so a height
     /// change above it cannot move it.
     pub(super) fn remember_nav_anchor(&mut self) {
-        self.nav_anchor = self.content_row_anchor(self.nav_cursor);
-        self.nav_anchor_line = self.nav_cursor;
-        let drawn = matches!(self.mode, Mode::Navigate | Mode::Select);
-        let on_screen =
-            self.nav_cursor >= self.log_off && self.nav_cursor < self.log_off + self.log_view_h;
-        self.nav_anchor_row = (drawn && on_screen).then(|| self.nav_cursor - self.log_off);
+        self.viewport.nav_anchor = self.content_row_anchor(self.viewport.nav_cursor);
+        self.viewport.nav_anchor_line = self.viewport.nav_cursor;
+        let drawn = matches!(self.viewport.mode, Mode::Navigate | Mode::Select);
+        let on_screen = self.viewport.nav_cursor >= self.viewport.log_off
+            && self.viewport.nav_cursor < self.viewport.log_off + self.viewport.log_view_h;
+        self.viewport.nav_anchor_row =
+            (drawn && on_screen).then(|| self.viewport.nav_cursor - self.viewport.log_off);
     }
 
     /// Put the cursor back on its content, on the screen row it had.
@@ -938,17 +1031,19 @@ impl App {
     /// A cursor that changed since the anchor was recorded is a position the
     /// user asked for; it becomes the new anchor.
     pub(super) fn reanchor_nav_cursor(&mut self) {
-        if !matches!(self.mode, Mode::Navigate | Mode::Select) {
+        if !matches!(self.viewport.mode, Mode::Navigate | Mode::Select) {
             return;
         }
-        if self.nav_anchor.is_none() || self.nav_cursor != self.nav_anchor_line {
+        if self.viewport.nav_anchor.is_none()
+            || self.viewport.nav_cursor != self.viewport.nav_anchor_line
+        {
             // A position set outside the navigation handlers: adopt it, but
             // claim no screen row. The row is only known once the frame has
             // put the cursor in a window.
-            self.place_nav_cursor(self.nav_cursor);
+            self.place_nav_cursor(self.viewport.nav_cursor);
             return;
         }
-        let Some((turn, row)) = self.nav_anchor else {
+        let Some((turn, row)) = self.viewport.nav_anchor else {
             return;
         };
         let height = self
@@ -956,32 +1051,34 @@ impl App {
             .frozen_heights
             .get(turn)
             .copied()
-            .unwrap_or(self.last_turn_height);
-        self.nav_cursor = self.turn_start_line(turn).saturating_add(row.min(height));
-        self.nav_anchor_line = self.nav_cursor;
-        if let Some(row) = self.nav_anchor_row {
-            self.top_line = self.nav_cursor.saturating_sub(row);
+            .unwrap_or(self.viewport.last_turn_height);
+        self.viewport.nav_cursor = self.turn_start_line(turn).saturating_add(row.min(height));
+        self.viewport.nav_anchor_line = self.viewport.nav_cursor;
+        if let Some(row) = self.viewport.nav_anchor_row {
+            self.viewport.top_line = self.viewport.nav_cursor.saturating_sub(row);
         }
     }
 
     /// Record the selection's free end as a content position.
     pub(super) fn remember_sel_anchor(&mut self) {
-        self.sel_anchor = self.content_row_anchor(self.select_anchor.0);
-        self.sel_anchor_line = self.select_anchor.0;
+        self.viewport.sel_anchor = self.content_row_anchor(self.viewport.select_anchor.0);
+        self.viewport.sel_anchor_line = self.viewport.select_anchor.0;
     }
 
     /// Put the selection's free end back on its content, for the same reason
     /// as the cursor: a converging height above it moves its absolute line, and
     /// an endpoint left behind highlights the wrong text.
     pub(super) fn reanchor_sel(&mut self) {
-        if self.mode != Mode::Select {
+        if self.viewport.mode != Mode::Select {
             return;
         }
-        if self.sel_anchor.is_none() || self.select_anchor.0 != self.sel_anchor_line {
+        if self.viewport.sel_anchor.is_none()
+            || self.viewport.select_anchor.0 != self.viewport.sel_anchor_line
+        {
             self.remember_sel_anchor();
             return;
         }
-        let Some((turn, row)) = self.sel_anchor else {
+        let Some((turn, row)) = self.viewport.sel_anchor else {
             return;
         };
         let height = self
@@ -989,10 +1086,10 @@ impl App {
             .frozen_heights
             .get(turn)
             .copied()
-            .unwrap_or(self.last_turn_height);
-        self.select_anchor.0 = self.turn_start_line(turn).saturating_add(row.min(height));
-        self.sel_anchor_line = self.select_anchor.0;
-        self.sel = Some(self.select_sel());
+            .unwrap_or(self.viewport.last_turn_height);
+        self.viewport.select_anchor.0 = self.turn_start_line(turn).saturating_add(row.min(height));
+        self.viewport.sel_anchor_line = self.viewport.select_anchor.0;
+        self.viewport.sel = Some(self.select_sel());
     }
 
     /// `line` as (turn index, row within that turn), walking the same heights
@@ -1013,7 +1110,7 @@ impl App {
             let height = if turn < frozen {
                 self.layout.frozen_heights[turn]
             } else {
-                self.last_turn_height
+                self.viewport.last_turn_height
             };
             start = start.saturating_add(height).saturating_add(1);
         }
@@ -1023,11 +1120,11 @@ impl App {
     /// Viewport offset that will be used at the next render: `base` when
     /// pinned, otherwise `top_line` clamped to `base`.
     pub(super) fn view_off(&self) -> usize {
-        let base = self.last_base;
-        if self.pinned {
+        let base = self.viewport.last_base;
+        if self.viewport.pinned {
             base
         } else {
-            self.top_line.min(base)
+            self.viewport.top_line.min(base)
         }
     }
 
@@ -1038,15 +1135,15 @@ impl App {
         if after == before {
             return;
         }
-        self.mode = Mode::Navigate;
-        self.sel = None;
+        self.viewport.mode = Mode::Navigate;
+        self.viewport.sel = None;
         let last = after
-            .saturating_add(self.log_view_h)
+            .saturating_add(self.viewport.log_view_h)
             .saturating_sub(1)
-            .min(self.log_total.saturating_sub(1));
-        if self.nav_cursor < after {
+            .min(self.viewport.log_total.saturating_sub(1));
+        if self.viewport.nav_cursor < after {
             self.place_nav_cursor(after);
-        } else if self.nav_cursor > last {
+        } else if self.viewport.nav_cursor > last {
             self.place_nav_cursor(last);
         }
     }
@@ -1062,7 +1159,7 @@ impl App {
     #[allow(clippy::needless_range_loop)]
     #[allow(clippy::too_many_lines)]
     pub(super) fn selection_text(&self) -> Option<String> {
-        let sel = self.sel.as_ref()?;
+        let sel = self.viewport.sel.as_ref()?;
         let (sl, sc) = sel.start;
         let (el, ec) = sel.end;
         let ((sl, sc), (el, ec)) = if (sl, sc) <= (el, ec) {
@@ -1073,8 +1170,8 @@ impl App {
         if sl == el && sc == ec {
             return None;
         }
-        let vis = &self.log_vis;
-        let off = self.log_off;
+        let vis = &self.viewport.log_vis;
+        let off = self.viewport.log_off;
         let vis_len = vis.len();
         if vis_len == 0 || el < off || sl >= off + vis_len {
             return None;
@@ -1168,8 +1265,8 @@ impl App {
         self.transcript.clear();
         self.expanded_details.clear();
         self.detail_focus = None;
-        self.pinned = true;
-        self.top_line = 0;
+        self.viewport.pinned = true;
+        self.viewport.top_line = 0;
         self.bump_render_epoch();
     }
 }

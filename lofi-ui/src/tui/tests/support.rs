@@ -229,22 +229,19 @@ pub(super) fn plain_key(code: KeyCode) -> Event {
 
 /// The background dialog's subagents tab, for tests that drive it directly.
 pub(super) fn subagents_tab(a: &App) -> &SubagentsModalState {
-    &a.background_modal
-        .as_ref()
-        .expect("background modal")
-        .subagents
+    &a.background_modal().expect("background modal").subagents
 }
 
 /// The subagent drill-in, when the dialog shows one.
 pub(super) fn subagent_view(a: &App) -> Option<&SubagentTranscriptView> {
-    match a.background_modal.as_ref()?.view.as_ref()? {
+    match a.background_modal()?.view.as_ref()? {
         BackgroundView::Subagent(view) => Some(view),
         BackgroundView::Job(_) => None,
     }
 }
 
 pub(super) fn subagent_view_mut(a: &mut App) -> Option<&mut SubagentTranscriptView> {
-    match a.background_modal.as_mut()?.view.as_mut()? {
+    match a.background_modal_mut()?.view.as_mut()? {
         BackgroundView::Subagent(view) => Some(view),
         BackgroundView::Job(_) => None,
     }
@@ -252,15 +249,19 @@ pub(super) fn subagent_view_mut(a: &mut App) -> Option<&mut SubagentTranscriptVi
 
 /// Put a subagent drill-in on the dialog, the way `Enter` does.
 pub(super) fn open_subagent_view(a: &mut App, view: SubagentTranscriptView) {
-    let modal = a
-        .background_modal
-        .get_or_insert_with(|| background_modal(BackgroundTab::Subagents));
-    modal.view = Some(BackgroundView::Subagent(view));
+    if a.background_modal().is_none() {
+        a.open_modal(ActiveModal::Background(background_modal(
+            BackgroundTab::Subagents,
+        )));
+    }
+    if let Some(modal) = a.background_modal_mut() {
+        modal.view = Some(BackgroundView::Subagent(view));
+    }
 }
 
 /// A fresh dialog on one tab, with no rows yet.
-pub(super) fn background_modal(tab: BackgroundTab) -> BackgroundModalState {
-    BackgroundModalState {
+pub(super) fn background_modal(tab: BackgroundTab) -> Box<BackgroundModalState> {
+    Box::new(BackgroundModalState {
         tab,
         jobs: JobsModalState { selected: 0 },
         subagents: SubagentsModalState {
@@ -273,5 +274,5 @@ pub(super) fn background_modal(tab: BackgroundTab) -> BackgroundModalState {
         },
         view: None,
         confirm: None,
-    }
+    })
 }

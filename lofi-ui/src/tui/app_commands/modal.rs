@@ -1,16 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy)]
-enum ModalSlot {
-    Picker,
-    Tree,
-    Model,
-    Thinking,
-    Policy,
-    Service,
-    Theme,
-}
-
 fn choice_label(choice: ConfirmResponse) -> &'static str {
     match choice {
         ConfirmResponse::Allow => "Allow",
@@ -27,11 +16,188 @@ fn choice_label(choice: ConfirmResponse) -> &'static str {
 }
 
 impl App {
+    pub(in crate::tui) fn open_modal(&mut self, next: ActiveModal) {
+        self.close_modal();
+        self.modal = Some(next);
+    }
+
+    pub(in crate::tui) fn close_modal(&mut self) {
+        match self.modal.take() {
+            Some(ActiveModal::Resume(_)) => {
+                self.picker_generation.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(ActiveModal::Tree {
+                picker, snapshot, ..
+            }) => {
+                self.picker_generation.fetch_add(1, Ordering::Relaxed);
+                self.release_tree_resources(picker.entries, snapshot);
+            }
+            _ => {}
+        }
+    }
+
+    pub(in crate::tui) fn picker(&self) -> Option<&PickerState> {
+        match &self.modal {
+            Some(ActiveModal::Resume(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn picker_mut(&mut self) -> Option<&mut PickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Resume(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn tree_picker(&self) -> Option<&TreePickerState> {
+        match &self.modal {
+            Some(ActiveModal::Tree { picker, .. }) => Some(picker),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn tree_picker_mut(&mut self) -> Option<&mut TreePickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Tree { picker, .. }) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn model_picker(&self) -> Option<&ModelPickerState> {
+        match &self.modal {
+            Some(ActiveModal::Model(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn model_picker_mut(&mut self) -> Option<&mut ModelPickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Model(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn thinking_picker(&self) -> Option<&ThinkingPickerState> {
+        match &self.modal {
+            Some(ActiveModal::Thinking(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn thinking_picker_mut(&mut self) -> Option<&mut ThinkingPickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Thinking(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn policy_picker(&self) -> Option<&PolicyPickerState> {
+        match &self.modal {
+            Some(ActiveModal::Policy(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn policy_picker_mut(&mut self) -> Option<&mut PolicyPickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Policy(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn paths_picker(&self) -> Option<&PathsPickerState> {
+        match &self.modal {
+            Some(ActiveModal::Paths(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn paths_picker_mut(&mut self) -> Option<&mut PathsPickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Paths(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn service_picker(&self) -> Option<&ServicePickerState> {
+        match &self.modal {
+            Some(ActiveModal::Service(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn service_picker_mut(&mut self) -> Option<&mut ServicePickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Service(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn theme_picker(&self) -> Option<&ThemePickerState> {
+        match &self.modal {
+            Some(ActiveModal::Theme(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn theme_picker_mut(&mut self) -> Option<&mut ThemePickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Theme(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn background_modal(&self) -> Option<&BackgroundModalState> {
+        match &self.modal {
+            Some(ActiveModal::Background(modal)) => Some(modal),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn background_modal_mut(&mut self) -> Option<&mut BackgroundModalState> {
+        match &mut self.modal {
+            Some(ActiveModal::Background(modal)) => Some(modal),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn take_background_modal(&mut self) -> Option<Box<BackgroundModalState>> {
+        if matches!(self.modal, Some(ActiveModal::Background(_))) {
+            let Some(ActiveModal::Background(modal)) = self.modal.take() else {
+                unreachable!()
+            };
+            Some(modal)
+        } else {
+            None
+        }
+    }
+
+    pub(in crate::tui) fn info(&self) -> Option<&InfoModal> {
+        match &self.modal {
+            Some(ActiveModal::Info(info)) => Some(info),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn info_mut(&mut self) -> Option<&mut InfoModal> {
+        match &mut self.modal {
+            Some(ActiveModal::Info(info)) => Some(info),
+            _ => None,
+        }
+    }
+
     pub(in crate::tui) fn queue_confirmation(&mut self, req: lofi_core::ConfirmRequest) {
         if Self::confirmation_ready(&req) {
-            self.pending_confirms.push(req);
+            self.confirms.pending.push(req);
         } else {
-            self.deferred_confirms.push(req);
+            self.confirms.deferred.push(req);
         }
     }
 
@@ -39,44 +205,45 @@ impl App {
     /// need user attention. The grace period is a presentation policy: core
     /// and tool layers emit the evaluating request immediately.
     pub(in crate::tui) fn refresh_confirmations(&mut self) -> bool {
-        let old_front = self.pending_confirms.first().map(|req| req.id);
-        let old_pending = self.pending_confirms.len();
-        let old_deferred = self.deferred_confirms.len();
+        let old_front = self.confirms.pending.first().map(|req| req.id);
+        let old_pending = self.confirms.pending.len();
+        let old_deferred = self.confirms.deferred.len();
 
-        self.pending_confirms
+        self.confirms
+            .pending
             .retain(|req| req.active.load(std::sync::atomic::Ordering::Relaxed));
 
-        let mut waiting = Vec::with_capacity(self.deferred_confirms.len());
-        for req in self.deferred_confirms.drain(..) {
+        let mut waiting = Vec::with_capacity(self.confirms.deferred.len());
+        for req in self.confirms.deferred.drain(..) {
             if !req.active.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
             if Self::confirmation_ready(&req) {
-                self.pending_confirms.push(req);
+                self.confirms.pending.push(req);
             } else {
                 waiting.push(req);
             }
         }
-        self.deferred_confirms = waiting;
+        self.confirms.deferred = waiting;
 
-        let new_front = self.pending_confirms.first().map(|req| req.id);
+        let new_front = self.confirms.pending.first().map(|req| req.id);
         if old_front != new_front {
-            self.confirm_selected = 0;
-            self.confirm_narrow = false;
-            self.confirm_scroll = 0;
-            self.confirm_total = 0;
-            self.confirm_view_h = 0;
+            self.confirms.selected = 0;
+            self.confirms.narrow = false;
+            self.confirms.scroll = 0;
+            self.confirms.total = 0;
+            self.confirms.view_h = 0;
         }
         // The terminal report counts its debounce from here. Compare ids
         // against the stored front rather than against `old_front`: a request
         // answered between ticks leaves the list before this runs, and the
         // next one has to start its own clock.
-        if new_front != self.confirm_waiting.map(|(id, _)| id) {
-            self.confirm_waiting = new_front.map(|id| (id, Instant::now()));
+        if new_front != self.confirms.waiting.map(|(id, _)| id) {
+            self.confirms.waiting = new_front.map(|id| (id, Instant::now()));
         }
 
-        old_pending != self.pending_confirms.len()
-            || old_deferred != self.deferred_confirms.len()
+        old_pending != self.confirms.pending.len()
+            || old_deferred != self.confirms.deferred.len()
             || old_front != new_front
     }
 
@@ -96,108 +263,94 @@ impl App {
     /// Whether a centered modal is open. The inline slash-complete popover is
     /// excluded because input remains active beneath it.
     pub(in crate::tui) fn modal_open(&self) -> bool {
-        self.info.is_some()
-            || self.picker.is_some()
-            || self.tree_picker.is_some()
-            || self.model_picker.is_some()
-            || self.thinking_picker.is_some()
-            || self.policy_picker.is_some()
-            || self.service_picker.is_some()
-            || self.theme_picker.is_some()
-            || self.background_modal.is_some()
-            || self.paths_picker.is_some()
-            || !self.pending_confirms.is_empty()
+        self.modal.is_some() || !self.confirms.pending.is_empty()
     }
 
     /// Dispatch a key to the topmost visible popup. This order is the reverse
     /// of the popup render order in `view::render`.
     pub(in crate::tui) fn handle_modal_stack_key(&mut self, k: &KeyEvent) -> bool {
-        if !self.pending_confirms.is_empty() {
+        if !self.confirms.pending.is_empty() {
             return self.handle_confirm_key(k);
         }
-        if self.info.is_some() {
-            return self.handle_info_key(k);
-        }
-        if self.background_modal.is_some()
-            || self.paths_picker.is_some()
-            || self.active_modal_slot().is_some()
-        {
+        if self.modal.is_some() {
             return self.handle_modal_key(k);
         }
         self.handle_popover_key(k)
     }
 
     pub(in crate::tui) fn handle_confirm_key(&mut self, k: &KeyEvent) -> bool {
-        if self.pending_confirms.is_empty() {
+        if self.confirms.pending.is_empty() {
             return false;
         }
         // Auto-mode may have approved between the last draw and this key.
         // Consume the key while dismissing that stale modal rather than
         // letting it leak through to the prompt or a queued confirmation.
-        if !self.pending_confirms[0]
+        if !self.confirms.pending[0]
             .active
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            self.pending_confirms.remove(0);
-            self.confirm_selected = 0;
-            self.confirm_narrow = false;
-            self.confirm_scroll = 0;
-            self.confirm_total = 0;
-            self.confirm_view_h = 0;
+            self.confirms.pending.remove(0);
+            self.confirms.selected = 0;
+            self.confirms.narrow = false;
+            self.confirms.scroll = 0;
+            self.confirms.total = 0;
+            self.confirms.view_h = 0;
             return true;
         }
         let choices = self.confirm_choices();
         let len = choices.len();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let max_scroll = self.confirm_total.saturating_sub(self.confirm_view_h);
+        let max_scroll = self.confirms.total.saturating_sub(self.confirms.view_h);
         let response = match k.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.confirm_scroll = self.confirm_scroll.saturating_sub(1);
+                self.confirms.scroll = self.confirms.scroll.saturating_sub(1);
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.confirm_scroll = self.confirm_scroll.saturating_add(1).min(max_scroll);
+                self.confirms.scroll = self.confirms.scroll.saturating_add(1).min(max_scroll);
                 None
             }
             KeyCode::PageUp => {
-                self.confirm_scroll = self
-                    .confirm_scroll
-                    .saturating_sub(self.confirm_view_h.max(1));
+                self.confirms.scroll = self
+                    .confirms
+                    .scroll
+                    .saturating_sub(self.confirms.view_h.max(1));
                 None
             }
             KeyCode::PageDown => {
-                self.confirm_scroll = self
-                    .confirm_scroll
-                    .saturating_add(self.confirm_view_h.max(1))
+                self.confirms.scroll = self
+                    .confirms
+                    .scroll
+                    .saturating_add(self.confirms.view_h.max(1))
                     .min(max_scroll);
                 None
             }
             KeyCode::Home => {
-                self.confirm_scroll = 0;
+                self.confirms.scroll = 0;
                 None
             }
             KeyCode::End => {
-                self.confirm_scroll = max_scroll;
+                self.confirms.scroll = max_scroll;
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.confirm_selected = self.confirm_selected.saturating_sub(1);
+                self.confirms.selected = self.confirms.selected.saturating_sub(1);
                 None
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.confirm_selected = (self.confirm_selected + 1).min(len - 1);
+                self.confirms.selected = (self.confirms.selected + 1).min(len - 1);
                 None
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                self.confirm_selected = (self.confirm_selected + 1) % len;
+                self.confirms.selected = (self.confirms.selected + 1) % len;
                 None
             }
-            KeyCode::Enter => choices.get(self.confirm_selected.min(len - 1)).copied(),
+            KeyCode::Enter => choices.get(self.confirms.selected.min(len - 1)).copied(),
             KeyCode::Char('a' | 'A' | 'y' | 'Y') => choices.first().copied(),
             KeyCode::Char('w' | 'W') => choices.iter().find(|c| c.is_grant_write()).copied(),
             KeyCode::Char('r' | 'R') => choices.iter().find(|c| c.is_grant_read()).copied(),
             KeyCode::Char('i' | 'I') => {
-                self.confirm_narrow = self.confirm_offers_narrow() && !self.confirm_narrow;
+                self.confirms.narrow = self.confirm_offers_narrow() && !self.confirms.narrow;
                 None
             }
             KeyCode::Char('d' | 'D' | 'n' | 'N') | KeyCode::Esc => Some(ConfirmResponse::Deny),
@@ -205,15 +358,15 @@ impl App {
             _ => None,
         };
         if let Some(choice) = response {
-            let req = self.pending_confirms.remove(0);
+            let req = self.confirms.pending.remove(0);
             req.active
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = req.respond.send(choice);
-            self.confirm_selected = 0;
-            self.confirm_narrow = false;
-            self.confirm_scroll = 0;
-            self.confirm_total = 0;
-            self.confirm_view_h = 0;
+            self.confirms.selected = 0;
+            self.confirms.narrow = false;
+            self.confirms.scroll = 0;
+            self.confirms.total = 0;
+            self.confirms.view_h = 0;
         }
         true
     }
@@ -223,7 +376,8 @@ impl App {
     /// user can see the prompt will not wait forever.
     pub(in crate::tui) fn confirm_choice_labels(&self) -> Vec<String> {
         let auto_deny_in = self
-            .pending_confirms
+            .confirms
+            .pending
             .first()
             .and_then(|req| {
                 *req.deny_at
@@ -246,7 +400,7 @@ impl App {
     /// Whether the front prompt offers the requested directory as a second,
     /// narrower unit beside the project root.
     fn confirm_offers_narrow(&self) -> bool {
-        let Some(req) = self.pending_confirms.first() else {
+        let Some(req) = self.confirms.pending.first() else {
             return false;
         };
         let reason = req
@@ -268,7 +422,7 @@ impl App {
     /// write, because read-only cannot satisfy it.
     fn confirm_choices(&self) -> Vec<ConfirmResponse> {
         use lofi_types::Access;
-        let Some(req) = self.pending_confirms.first() else {
+        let Some(req) = self.confirms.pending.first() else {
             return Vec::new();
         };
         let reason = req
@@ -279,7 +433,7 @@ impl App {
             lofi_core::ConfirmReason::OutsideRoot { requested, .. } => {
                 // The buttons choose the access; the scope the answer grants
                 // is the toggle the modal carries beside them.
-                let narrow = self.confirm_narrow;
+                let narrow = self.confirms.narrow;
                 if requested == Access::Read {
                     vec![
                         ConfirmResponse::Grant {
@@ -310,16 +464,16 @@ impl App {
     /// open; dismiss and navigation keys are consumed instead of reaching the
     /// prompt.
     pub(in crate::tui) fn handle_info_key(&mut self, k: &KeyEvent) -> bool {
-        if self.info.is_none() {
+        if self.info().is_none() {
             return false;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                self.info = None;
+                self.close_modal();
             }
             KeyCode::Char('y') => {
-                if let Some(info) = self.info.as_ref() {
+                if let Some(info) = self.info() {
                     let text = info
                         .lines
                         .iter()
@@ -337,32 +491,32 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(i) = self.info.as_mut() {
+                if let Some(i) = self.info_mut() {
                     i.scroll_down();
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(i) = self.info.as_mut() {
+                if let Some(i) = self.info_mut() {
                     i.scroll_up();
                 }
             }
             KeyCode::Char('n') if ctrl => {
-                if let Some(i) = self.info.as_mut() {
+                if let Some(i) = self.info_mut() {
                     i.scroll_down();
                 }
             }
             KeyCode::Char('p') if ctrl => {
-                if let Some(i) = self.info.as_mut() {
+                if let Some(i) = self.info_mut() {
                     i.scroll_up();
                 }
             }
             KeyCode::PageDown => {
-                if let Some(i) = self.info.as_mut() {
+                if let Some(i) = self.info_mut() {
                     i.scroll_page_down();
                 }
             }
             KeyCode::PageUp => {
-                if let Some(i) = self.info.as_mut() {
+                if let Some(i) = self.info_mut() {
                     i.scroll_page_up();
                 }
             }
@@ -371,42 +525,39 @@ impl App {
         true
     }
 
-    fn active_modal_slot(&self) -> Option<ModalSlot> {
-        if self.theme_picker.is_some() {
-            Some(ModalSlot::Theme)
-        } else if self.service_picker.is_some() {
-            Some(ModalSlot::Service)
-        } else if self.thinking_picker.is_some() {
-            Some(ModalSlot::Thinking)
-        } else if self.policy_picker.is_some() {
-            Some(ModalSlot::Policy)
-        } else if self.model_picker.is_some() {
-            Some(ModalSlot::Model)
-        } else if self.tree_picker.is_some() {
-            Some(ModalSlot::Tree)
-        } else if self.picker.is_some() {
-            Some(ModalSlot::Picker)
-        } else {
-            None
+    fn confirm_active_list_modal(&mut self) {
+        match self.modal.take() {
+            Some(ActiveModal::Resume(picker)) => self.picker_confirm_inner(picker),
+            Some(ActiveModal::Tree {
+                picker, snapshot, ..
+            }) => self.tree_picker_confirm_inner(picker, snapshot),
+            Some(ActiveModal::Model(picker)) => self.model_picker_confirm_inner(&picker),
+            Some(ActiveModal::Thinking(picker)) => self.thinking_picker_confirm_inner(&picker),
+            Some(ActiveModal::Policy(picker)) => self.policy_picker_confirm_inner(&picker),
+            Some(ActiveModal::Service(picker)) => self.service_picker_confirm_inner(&picker),
+            Some(ActiveModal::Theme(picker)) => self.theme_picker_confirm_inner(&picker),
+            other => self.modal = other,
         }
     }
 
-    /// Unified key dispatch for list-style modal overlays (`/resume` and
-    /// `/tree`). `↑/↓` or `j`/`k` or `Ctrl+N`/`Ctrl+P` move the selection
-    /// (clamped); `Tab`/`Shift+Tab` cycle with wrap-around; `Enter`
-    /// confirms; `Esc`/`q` cancels. Returns `true` if a modal handled the
-    /// key (so the caller skips normal Input-mode processing).
+    /// Unified key dispatch for modal overlays.
     #[allow(clippy::too_many_lines)]
     pub(in crate::tui) fn handle_modal_key(&mut self, k: &KeyEvent) -> bool {
-        if self.background_modal.is_some() {
-            return self.handle_background_key(k);
+        match self.modal.as_ref() {
+            None => return false,
+            Some(ActiveModal::Info(_)) => return self.handle_info_key(k),
+            Some(ActiveModal::Background(_)) => return self.handle_background_key(k),
+            Some(ActiveModal::Paths(_)) => return self.handle_paths_key(k),
+            Some(
+                ActiveModal::Resume(_)
+                | ActiveModal::Tree { .. }
+                | ActiveModal::Model(_)
+                | ActiveModal::Thinking(_)
+                | ActiveModal::Policy(_)
+                | ActiveModal::Service(_)
+                | ActiveModal::Theme(_),
+            ) => {}
         }
-        if self.paths_picker.is_some() {
-            return self.handle_paths_key(k);
-        }
-        let Some(slot) = self.active_modal_slot() else {
-            return false;
-        };
         let len = self.active_modal_mut().map_or(0, |m| m.len());
         // A progressive picker draws before it has rows. Escape still closes
         // it, but Enter cannot confirm an absent selection.
@@ -414,74 +565,21 @@ impl App {
             return true;
         }
         match k.code {
-            KeyCode::Enter => match slot {
-                ModalSlot::Picker => {
-                    if let Some(picker) = self.picker.take() {
-                        self.picker_confirm_inner(picker);
-                    }
-                }
-                ModalSlot::Tree => {
-                    if let Some(picker) = self.tree_picker.take() {
-                        self.tree_picker_confirm_inner(picker);
-                    }
-                }
-                ModalSlot::Model => self.model_picker_confirm(),
-                ModalSlot::Thinking => self.thinking_picker_confirm(),
-                ModalSlot::Policy => self.policy_picker_confirm(),
-                ModalSlot::Service => self.service_picker_confirm(),
-                ModalSlot::Theme => self.theme_picker_confirm(),
-            },
+            KeyCode::Enter => {
+                self.confirm_active_list_modal();
+                return true;
+            }
             // With a single entry, Tab/Shift+Tab confirm outright instead of
             // cycling (a no-op) — same as pressing Enter.
-            KeyCode::Tab | KeyCode::BackTab if len == 1 => match slot {
-                ModalSlot::Picker => {
-                    if let Some(picker) = self.picker.take() {
-                        self.picker_confirm_inner(picker);
-                    }
-                }
-                ModalSlot::Tree => {
-                    if let Some(picker) = self.tree_picker.take() {
-                        self.tree_picker_confirm_inner(picker);
-                    }
-                }
-                ModalSlot::Model => self.model_picker_confirm(),
-                ModalSlot::Thinking => self.thinking_picker_confirm(),
-                ModalSlot::Policy => self.policy_picker_confirm(),
-                ModalSlot::Service => self.service_picker_confirm(),
-                ModalSlot::Theme => self.theme_picker_confirm(),
-            },
-            KeyCode::Esc | KeyCode::Char('q') => match slot {
-                ModalSlot::Picker => {
-                    self.picker = None;
-                    self.picker_generation.fetch_add(1, Ordering::Relaxed);
-                }
-                ModalSlot::Tree => {
-                    let entries = self
-                        .tree_picker
-                        .take()
-                        .map(|picker| picker.entries)
-                        .unwrap_or_default();
-                    self.picker_generation.fetch_add(1, Ordering::Relaxed);
-                    self.release_tree_resources(entries);
-                    self.tree_picker_pending.clear();
-                }
-                ModalSlot::Model => self.model_picker = None,
-                ModalSlot::Thinking => self.thinking_picker = None,
-                ModalSlot::Policy => self.policy_picker = None,
-                ModalSlot::Service => self.service_picker = None,
-                ModalSlot::Theme => self.theme_picker = None,
-            },
+            KeyCode::Tab | KeyCode::BackTab if len == 1 => {
+                self.confirm_active_list_modal();
+                return true;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.close_modal();
+                return true;
+            }
             _ => {}
-        }
-        if (matches!(slot, ModalSlot::Picker) && self.picker.is_none())
-            || (matches!(slot, ModalSlot::Tree) && self.tree_picker.is_none())
-            || (matches!(slot, ModalSlot::Model) && self.model_picker.is_none())
-            || (matches!(slot, ModalSlot::Thinking) && self.thinking_picker.is_none())
-            || (matches!(slot, ModalSlot::Policy) && self.policy_picker.is_none())
-            || (matches!(slot, ModalSlot::Service) && self.service_picker.is_none())
-            || (matches!(slot, ModalSlot::Theme) && self.theme_picker.is_none())
-        {
-            return true;
         }
         let Some(m) = self.active_modal_mut() else {
             return true;
@@ -511,35 +609,35 @@ impl App {
             }
             _ => {}
         }
-        if self.tree_picker.is_some() {
+        if matches!(self.modal, Some(ActiveModal::Tree { .. })) {
             self.request_tree_viewport();
         }
         true
     }
 
     pub(in crate::tui) fn active_modal_mut(&mut self) -> Option<&mut dyn Modal> {
-        if self.theme_picker.is_some() {
-            self.theme_picker.as_mut().map(|t| t as &mut dyn Modal)
-        } else if self.service_picker.is_some() {
-            self.service_picker.as_mut().map(|t| t as &mut dyn Modal)
-        } else if self.thinking_picker.is_some() {
-            self.thinking_picker.as_mut().map(|t| t as &mut dyn Modal)
-        } else if self.policy_picker.is_some() {
-            self.policy_picker.as_mut().map(|p| p as &mut dyn Modal)
-        } else if self.model_picker.is_some() {
-            self.model_picker.as_mut().map(|m| m as &mut dyn Modal)
-        } else if self.tree_picker.is_some() {
-            self.tree_picker.as_mut().map(|t| t as &mut dyn Modal)
-        } else {
-            self.picker.as_mut().map(|p| p as &mut dyn Modal)
+        match self.modal.as_mut()? {
+            ActiveModal::Resume(p) => Some(p),
+            ActiveModal::Tree { picker, .. } => Some(picker),
+            ActiveModal::Model(m) => Some(m),
+            ActiveModal::Thinking(t) => Some(t),
+            ActiveModal::Policy(p) => Some(p),
+            ActiveModal::Paths(p) => Some(p),
+            ActiveModal::Service(s) => Some(s),
+            ActiveModal::Theme(t) => Some(t),
+            ActiveModal::Background(_) | ActiveModal::Info(_) => None,
         }
     }
 
     pub(in crate::tui) fn handle_popover_key(&mut self, k: &KeyEvent) -> bool {
-        if self.slash_complete.is_none() {
+        if self.prompt.slash_complete.is_none() {
             return false;
         }
-        let len = self.slash_complete.as_ref().map_or(0, super::Popover::len);
+        let len = self
+            .prompt
+            .slash_complete
+            .as_ref()
+            .map_or(0, super::Popover::len);
         match k.code {
             KeyCode::Enter => {
                 self.slash_complete_accept();
@@ -552,12 +650,17 @@ impl App {
                 return true;
             }
             KeyCode::Esc => {
-                self.slash_complete = None;
+                self.prompt.slash_complete = None;
                 return true;
             }
             _ => {}
         }
-        let Some(popover) = self.slash_complete.as_mut().map(|p| p as &mut dyn Popover) else {
+        let Some(popover) = self
+            .prompt
+            .slash_complete
+            .as_mut()
+            .map(|p| p as &mut dyn Popover)
+        else {
             return false;
         };
         if len == 0 {

@@ -1,8 +1,8 @@
 use super::*;
 
 fn feed_lines(a: &mut App, rls: &[view::RenderLine]) {
-    a.log_off = 0;
-    a.log_vis = rls
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = rls
         .iter()
         .map(|rl| view::VisLine {
             rendered: rl.line.spans.iter().map(|s| s.content.as_ref()).collect(),
@@ -30,11 +30,12 @@ fn yank_heading_includes_prefix() {
     let rls = render_turn_lines(&cx, turn);
     feed_lines(&mut a, &rls);
     let row = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| v.raw.as_ref().is_some_and(|r| r.source.contains("##")))
         .expect("heading row");
-    a.nav_cursor = row;
+    a.viewport.nav_cursor = row;
     assert_eq!(a.current_line_text().as_deref(), Some("## Hello World"));
 }
 
@@ -56,11 +57,12 @@ fn yank_blockquote_includes_prefix() {
     let rls = render_turn_lines(&cx, turn);
     feed_lines(&mut a, &rls);
     let row = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| v.raw.as_ref().is_some_and(|r| r.source.starts_with('>')))
         .expect("blockquote row");
-    a.nav_cursor = row;
+    a.viewport.nav_cursor = row;
     assert_eq!(a.current_line_text().as_deref(), Some("> A quoted line"));
 }
 
@@ -82,6 +84,7 @@ fn yank_table_row_returns_markdown() {
     let rls = render_turn_lines(&cx, turn);
     feed_lines(&mut a, &rls);
     let hdr = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| {
@@ -90,9 +93,10 @@ fn yank_table_row_returns_markdown() {
                 .is_some_and(|r| r.source.starts_with("| Name"))
         })
         .expect("header data row");
-    a.nav_cursor = hdr;
+    a.viewport.nav_cursor = hdr;
     assert_eq!(a.current_line_text().as_deref(), Some("| Name | Age |"));
     let data = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| {
@@ -101,7 +105,7 @@ fn yank_table_row_returns_markdown() {
                 .is_some_and(|r| r.source.starts_with("| Ada"))
         })
         .expect("data row");
-    a.nav_cursor = data;
+    a.viewport.nav_cursor = data;
     assert_eq!(a.current_line_text().as_deref(), Some("| Ada | 36 |"));
 }
 
@@ -123,6 +127,7 @@ fn yank_table_header_separator_returns_markdown() {
     let rls = render_turn_lines(&cx, turn);
     feed_lines(&mut a, &rls);
     let sep = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| {
@@ -131,7 +136,7 @@ fn yank_table_header_separator_returns_markdown() {
                 .is_some_and(|r| r.source.starts_with("|---") || r.source.starts_with("|--"))
         })
         .expect("separator border row");
-    a.nav_cursor = sep;
+    a.viewport.nav_cursor = sep;
     assert_eq!(a.current_line_text().as_deref(), Some("|------|-----|"));
 }
 
@@ -153,11 +158,12 @@ fn yank_table_border_returns_empty() {
     let rls = render_turn_lines(&cx, turn);
     feed_lines(&mut a, &rls);
     let border = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| v.raw.as_ref().is_some_and(|r| r.source.is_empty()))
         .expect("border row");
-    a.nav_cursor = border;
+    a.viewport.nav_cursor = border;
     assert_eq!(a.current_line_text(), None);
 }
 
@@ -179,11 +185,12 @@ fn yank_nested_list_preserves_indent() {
     let rls = render_turn_lines(&cx, turn);
     feed_lines(&mut a, &rls);
     let nested = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| v.raw.as_ref().is_some_and(|r| r.source.starts_with("  -")))
         .expect("nested item row");
-    a.nav_cursor = nested;
+    a.viewport.nav_cursor = nested;
     assert_eq!(a.current_line_text().as_deref(), Some("  - Nested item"));
 }
 
@@ -205,6 +212,7 @@ fn yank_code_block_preserves_indent() {
     let rls = render_turn_lines(&cx, turn);
     feed_lines(&mut a, &rls);
     let indented = a
+        .viewport
         .log_vis
         .iter()
         .position(|v| {
@@ -213,7 +221,7 @@ fn yank_code_block_preserves_indent() {
                 .is_some_and(|r| r.source.starts_with("  return"))
         })
         .expect("indented code line");
-    a.nav_cursor = indented;
+    a.viewport.nav_cursor = indented;
     assert_eq!(a.current_line_text().as_deref(), Some("  return 42;"));
 }
 
@@ -247,9 +255,9 @@ fn selection_blockquote_to_text_preserves_blank() {
     }
     let n = rls.len();
     feed_lines(&mut a, &rls);
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (2, 0),
-        end: (n - 1, a.log_vis[n - 1].rendered.chars().count()),
+        end: (n - 1, a.viewport.log_vis[n - 1].rendered.chars().count()),
     });
     let text = a.selection_text().expect("selection text");
     assert_eq!(text, "> Quote line.\n\nNormal text after.");
@@ -296,9 +304,9 @@ fn blockquote_renders_with_bar_and_empty_lines() {
     );
     let n = rls.len();
     feed_lines(&mut a, &rls);
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (2, 0),
-        end: (n - 1, a.log_vis[n - 1].rendered.chars().count()),
+        end: (n - 1, a.viewport.log_vis[n - 1].rendered.chars().count()),
     });
     let text = a.selection_text().expect("selection text");
     assert_eq!(text, "> Line one\n>\n> Line three");
@@ -322,9 +330,9 @@ fn selection_blank_line_between_paragraphs_preserved() {
     let rls = render_turn_lines(&cx, turn);
     let n = rls.len();
     feed_lines(&mut a, &rls);
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (2, 0),
-        end: (n - 1, a.log_vis[n - 1].rendered.chars().count()),
+        end: (n - 1, a.viewport.log_vis[n - 1].rendered.chars().count()),
     });
     let text = a.selection_text().expect("selection text");
     assert_eq!(text, "First paragraph.\n\nSecond paragraph.");
@@ -348,9 +356,9 @@ fn selection_nested_list_preserves_indent() {
     let rls = render_turn_lines(&cx, turn);
     let n = rls.len();
     feed_lines(&mut a, &rls);
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (0, 0),
-        end: (n - 1, a.log_vis[n - 1].rendered.chars().count()),
+        end: (n - 1, a.viewport.log_vis[n - 1].rendered.chars().count()),
     });
     let text = a.selection_text().expect("selection text");
     assert!(
@@ -377,9 +385,9 @@ fn selection_table_returns_markdown_not_grid() {
     let rls = render_turn_lines(&cx, turn);
     let n = rls.len();
     feed_lines(&mut a, &rls);
-    a.sel = Some(Selection {
+    a.viewport.sel = Some(Selection {
         start: (2, 0),
-        end: (n - 1, a.log_vis[n - 1].rendered.chars().count()),
+        end: (n - 1, a.viewport.log_vis[n - 1].rendered.chars().count()),
     });
     let text = a.selection_text().expect("selection text");
     assert_eq!(text, "| Name | Age |\n|------|-----|\n| Ada | 36 |");

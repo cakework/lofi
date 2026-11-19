@@ -408,7 +408,7 @@ fn auto_evaluation_dialog_renders_elapsed_ask_and_harm_reasons() {
         },
     ));
     let reason = req.reason.clone();
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     let mut term = Terminal::new(TestBackend::new(90, 28)).unwrap();
 
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();

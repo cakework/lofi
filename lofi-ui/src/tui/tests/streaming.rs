@@ -568,7 +568,7 @@ fn tall_frozen_turn_reuses_its_rendered_window() {
     });
     push_turn(&mut a); // turn[1] keeps turn[0] frozen.
     a.transcript.turn_byte_ranges[0] = Some((0, 1));
-    a.mode = Mode::Input;
+    a.viewport.mode = Mode::Input;
 
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();

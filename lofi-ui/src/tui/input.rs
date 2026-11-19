@@ -20,8 +20,8 @@ pub(super) fn handle_event(
         return;
     }
     if let Event::Paste(s) = ev {
-        if app.mode == Mode::Input && !app.modal_open() {
-            app.sel = None;
+        if app.viewport.mode == Mode::Input && !app.modal_open() {
+            app.viewport.sel = None;
             app.insert_str(s);
         }
         return;
@@ -52,16 +52,16 @@ pub(super) fn handle_event(
     // peels a mode layer instead (SELECT -> NAV -> input).
     if k.code == KeyCode::Esc
         && current_run.is_some()
-        && app.mode == Mode::Input
-        && app.slash_complete.is_none()
+        && app.viewport.mode == Mode::Input
+        && app.prompt.slash_complete.is_none()
     {
         interrupt_run(app, current_run);
         return;
     }
 
-    if app.mode != Mode::Input {
-        app.last_kill_was_kill = false;
-        match app.mode {
+    if app.viewport.mode != Mode::Input {
+        app.prompt.last_kill_was_kill = false;
+        match app.viewport.mode {
             Mode::Navigate => handle_nav_key(k, app),
             Mode::Select => handle_select_key(k, app),
             Mode::Input => {}
@@ -69,9 +69,9 @@ pub(super) fn handle_event(
         return;
     }
 
-    app.sel = None;
-    let append_kill = app.last_kill_was_kill;
-    app.last_kill_was_kill = false;
+    app.viewport.sel = None;
+    let append_kill = app.prompt.last_kill_was_kill;
+    app.prompt.last_kill_was_kill = false;
 
     if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::ALT) {
         app.insert_newline();
@@ -88,17 +88,17 @@ pub(super) fn handle_event(
     }
     match k.code {
         KeyCode::Enter
-            if (current_run.is_some() || app.lifecycle_busy) && !app.input.is_empty() =>
+            if (current_run.is_some() || app.lifecycle_busy) && !app.prompt.text.is_empty() =>
         {
             app.debug_mark_submit();
-            let prompt = std::mem::take(&mut app.input);
-            app.input_cursor = 0;
-            app.history_idx = None;
-            app.slash_complete = None;
+            let prompt = std::mem::take(&mut app.prompt.text);
+            app.prompt.cursor = 0;
+            app.prompt.history_idx = None;
+            app.prompt.slash_complete = None;
             if app.slash_command(&prompt) {
                 return;
             }
-            app.history_nav.push(prompt.clone());
+            app.prompt.history.push(prompt.clone());
             app.prompt_queue.push(QueuedPrompt {
                 text: prompt,
                 kind: lofi_types::PromptKind::User,
@@ -114,16 +114,16 @@ pub(super) fn handle_event(
             app.pin_to_latest();
             return;
         }
-        KeyCode::Enter if current_run.is_none() && !app.input.is_empty() => {
+        KeyCode::Enter if current_run.is_none() && !app.prompt.text.is_empty() => {
             app.debug_mark_submit();
-            let prompt = std::mem::take(&mut app.input);
-            app.input_cursor = 0;
-            app.history_idx = None;
-            app.slash_complete = None;
+            let prompt = std::mem::take(&mut app.prompt.text);
+            app.prompt.cursor = 0;
+            app.prompt.history_idx = None;
+            app.prompt.slash_complete = None;
             if app.slash_command(&prompt) {
                 return;
             }
-            app.history_nav.push(prompt.clone());
+            app.prompt.history.push(prompt.clone());
             if let Some((command, exclude_from_context)) = parse_user_shell(&prompt) {
                 spawn_user_shell(app, current_run, command, exclude_from_context);
                 return;
@@ -168,14 +168,14 @@ pub(super) fn handle_event(
             }
             if let Some(i) = user_idx {
                 let queued = app.prompt_queue.remove(i);
-                app.input = queued.text;
-                app.input_cursor = app.input.len();
-                app.history_idx = None;
+                app.prompt.text = queued.text;
+                app.prompt.cursor = app.prompt.text.len();
+                app.prompt.history_idx = None;
                 app.refresh_slash_complete();
             }
         }
-        KeyCode::Up if app.slash_complete.is_some() => app.slash_complete_up(),
-        KeyCode::Down if app.slash_complete.is_some() => app.slash_complete_down(),
+        KeyCode::Up if app.prompt.slash_complete.is_some() => app.slash_complete_up(),
+        KeyCode::Down if app.prompt.slash_complete.is_some() => app.slash_complete_down(),
         KeyCode::Up => app.cursor_up(),
         KeyCode::Down => app.cursor_down(),
         KeyCode::Tab => app.enter_nav(),
@@ -187,7 +187,7 @@ pub(super) fn handle_event(
         // ctrl+b opens the background dialog on an empty prompt, so the
         // readline binding still works while the user is typing.
         KeyCode::Char('b')
-            if k.modifiers.contains(KeyModifiers::CONTROL) && app.input.is_empty() =>
+            if k.modifiers.contains(KeyModifiers::CONTROL) && app.prompt.text.is_empty() =>
         {
             let tab = app.newest_background_tab();
             app.open_background_modal(tab);
@@ -206,12 +206,12 @@ pub(super) fn handle_event(
         KeyCode::Char('b') if k.modifiers.contains(KeyModifiers::ALT) => app.move_word_back(),
         KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::ALT) => app.move_word_fwd(),
         KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::ALT) => app.kill_word_fwd(),
-        KeyCode::Char('<') if k.modifiers.contains(KeyModifiers::ALT) => app.input_cursor = 0,
+        KeyCode::Char('<') if k.modifiers.contains(KeyModifiers::ALT) => app.prompt.cursor = 0,
         KeyCode::Char('>') if k.modifiers.contains(KeyModifiers::ALT) => {
-            app.input_cursor = app.input.len();
+            app.prompt.cursor = app.prompt.text.len();
         }
         KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.input.is_empty() {
+            if app.prompt.text.is_empty() {
                 request_quit(app, current_run);
             } else {
                 app.delete_forward_char();
@@ -608,14 +608,14 @@ pub(super) fn restore_queued_prompts(app: &mut App) {
         }
     });
     let queued = user_prompts.join("\n\n");
-    let draft = std::mem::take(&mut app.input);
-    app.input = [queued, draft]
+    let draft = std::mem::take(&mut app.prompt.text);
+    app.prompt.text = [queued, draft]
         .into_iter()
         .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    app.input_cursor = app.input.len();
-    app.history_idx = None;
+    app.prompt.cursor = app.prompt.text.len();
+    app.prompt.history_idx = None;
     app.refresh_slash_complete();
 }
 
@@ -655,7 +655,7 @@ pub(super) fn handle_ctrl_c(app: &mut App, current_run: &mut Option<RunHandle>) 
     // Navigate/Select: Ctrl-C is a "give me the prompt" key, not a cancel. It
     // drops the user onto the newest transcript line and focuses the editor
     // without ever interrupting the current turn.
-    if app.mode != Mode::Input {
+    if app.viewport.mode != Mode::Input {
         app.enter_input();
         app.pin_to_latest();
         app.ctrl_c_at = None;
@@ -664,7 +664,7 @@ pub(super) fn handle_ctrl_c(app: &mut App, current_run: &mut Option<RunHandle>) 
     // A non-empty prompt is the more immediate thing to dismiss; clearing it
     // also takes priority over cancelling the turn so a single Ctrl-C never
     // both wipes text and kills a run.
-    if !app.input.is_empty() {
+    if !app.prompt.text.is_empty() {
         app.clear_input();
         app.ctrl_c_at = None;
         return;
@@ -759,34 +759,34 @@ pub(super) fn handle_nav_key(k: &KeyEvent, app: &mut App) {
     }
     match k.code {
         KeyCode::Char('j') | KeyCode::Down => {
-            app.sel = None;
+            app.viewport.sel = None;
             app.nav_move(1);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.sel = None;
+            app.viewport.sel = None;
             app.nav_move(-1);
         }
         KeyCode::Char('h') | KeyCode::Left => {
-            app.sel = None;
+            app.viewport.sel = None;
             app.nav_col_delta(-1);
         }
         KeyCode::Char('l') | KeyCode::Right => {
-            app.sel = None;
+            app.viewport.sel = None;
             app.nav_col_delta(1);
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            app.sel = None;
+            app.viewport.sel = None;
             if !app.toggle_cursor_detail() && k.code == KeyCode::Enter {
                 app.yank_line();
                 app.enter_input();
             }
         }
         KeyCode::Char('g') => {
-            app.sel = None;
+            app.viewport.sel = None;
             app.nav_top();
         }
         KeyCode::Char('G') => {
-            app.sel = None;
+            app.viewport.sel = None;
             app.nav_bottom();
         }
         KeyCode::Char('v') => app.enter_select(),
@@ -828,8 +828,8 @@ pub(super) fn handle_select_key(k: &KeyEvent, app: &mut App) {
             app.enter_input();
         }
         KeyCode::Tab | KeyCode::Esc => {
-            app.mode = Mode::Navigate;
-            app.sel = None;
+            app.viewport.mode = Mode::Navigate;
+            app.viewport.sel = None;
         }
         KeyCode::Char('[') if app.detail_focus.is_none() => app.nav_jump_turn(-1),
         KeyCode::Char(']') if app.detail_focus.is_none() => app.nav_jump_turn(1),
@@ -840,14 +840,14 @@ pub(super) fn handle_select_key(k: &KeyEvent, app: &mut App) {
 }
 
 pub(super) fn handle_mouse(m: MouseEvent, app: &mut App) {
-    let in_log = m.row >= app.log_rect.y
-        && m.row < app.log_rect.y + app.log_rect.height
-        && m.column >= app.log_rect.x
-        && m.column < app.log_rect.x + app.log_rect.width;
-    let can_select = app.mode == Mode::Input || app.mode == Mode::Navigate;
+    let in_log = m.row >= app.viewport.log_rect.y
+        && m.row < app.viewport.log_rect.y + app.viewport.log_rect.height
+        && m.column >= app.viewport.log_rect.x
+        && m.column < app.viewport.log_rect.x + app.viewport.log_rect.width;
+    let can_select = app.viewport.mode == Mode::Input || app.viewport.mode == Mode::Navigate;
     let detail_at = |app: &App, row: u16| {
-        let rel = row.saturating_sub(app.log_rect.y) as usize;
-        app.log_details.get(rel)?.clone()
+        let rel = row.saturating_sub(app.viewport.log_rect.y) as usize;
+        app.viewport.log_details.get(rel)?.clone()
     };
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if in_log => {
@@ -857,9 +857,9 @@ pub(super) fn handle_mouse(m: MouseEvent, app: &mut App) {
                 1
             };
             let cell = log_cell(app, m.row, m.column);
-            app.nav_cursor = cell.0;
+            app.viewport.nav_cursor = cell.0;
             if let Some(detail) = detail_at(app, m.row) {
-                if app.mode == Mode::Navigate {
+                if app.viewport.mode == Mode::Navigate {
                     app.detail_focus = Some(DetailFocus::on(&detail, cell.1));
                 }
             } else {
@@ -870,14 +870,14 @@ pub(super) fn handle_mouse(m: MouseEvent, app: &mut App) {
             }
         }
         MouseEventKind::Down(MouseButton::Left) if can_select => {
-            app.sel = None;
+            app.viewport.sel = None;
             if in_log {
                 let cell = log_cell(app, m.row, m.column);
-                if app.mode == Mode::Navigate {
+                if app.viewport.mode == Mode::Navigate {
                     if let Some(detail) = detail_at(app, m.row) {
                         if detail.row.is_some() {
                             app.detail_focus = Some(DetailFocus::on(&detail, cell.1));
-                            app.sel = Some(Selection {
+                            app.viewport.sel = Some(Selection {
                                 start: cell,
                                 end: cell,
                             });
@@ -885,7 +885,7 @@ pub(super) fn handle_mouse(m: MouseEvent, app: &mut App) {
                         }
                     }
                 }
-                app.sel = Some(Selection {
+                app.viewport.sel = Some(Selection {
                     start: cell,
                     end: cell,
                 });
@@ -899,9 +899,9 @@ pub(super) fn handle_mouse(m: MouseEvent, app: &mut App) {
                         if let Some(row) = detail.row {
                             focus.cursor = row;
                             focus.col = cell.1;
-                            app.nav_cursor = cell.0;
-                            app.nav_col = cell.1;
-                            if let Some(sel) = app.sel.as_mut() {
+                            app.viewport.nav_cursor = cell.0;
+                            app.viewport.nav_col = cell.1;
+                            if let Some(sel) = app.viewport.sel.as_mut() {
                                 sel.end = cell;
                             }
                         }
@@ -911,7 +911,7 @@ pub(super) fn handle_mouse(m: MouseEvent, app: &mut App) {
         }
         MouseEventKind::Drag(MouseButton::Left) if in_log && can_select => {
             let cell = log_cell(app, m.row, m.column);
-            if let Some(sel) = app.sel.as_mut() {
+            if let Some(sel) = app.viewport.sel.as_mut() {
                 sel.end = cell;
             }
         }
@@ -931,10 +931,10 @@ pub(super) fn handle_mouse(m: MouseEvent, app: &mut App) {
 /// the gutter or padding snaps to the content edge — the selection never
 /// starts or ends in the decorative whitespace.
 pub(super) fn log_cell(app: &App, row: u16, column: u16) -> (usize, usize) {
-    let rel_y = row.saturating_sub(app.log_rect.y) as usize;
-    let rel_x = column.saturating_sub(app.log_rect.x) as usize;
-    let line_idx = app.log_off.saturating_add(rel_y);
-    let line = app.log_vis.get(rel_y);
+    let rel_y = row.saturating_sub(app.viewport.log_rect.y) as usize;
+    let rel_x = column.saturating_sub(app.viewport.log_rect.x) as usize;
+    let line_idx = app.viewport.log_off.saturating_add(rel_y);
+    let line = app.viewport.log_vis.get(rel_y);
     let col = line.map_or(rel_x, |vl| {
         let s = &vl.rendered;
         let (cstart, cend) = vl.content;

@@ -4,7 +4,7 @@ use super::*;
 fn tree_no_session_pushes_error() {
     let mut a = app();
     assert!(a.slash_command("/tree"));
-    assert!(a.tree_picker.is_none());
+    assert!(a.tree_picker().is_none());
     let (msg, kind) = a.notify_badge().expect("/tree notified");
     assert_eq!(kind, NotifyKind::Error);
     assert!(msg.contains("no session file"));
@@ -103,7 +103,7 @@ fn tree_opens_rolls_back_and_prefills_prompt() {
         store::SessionCursor::open(path).unwrap(),
     );
     assert!(a.slash_command("/tree"));
-    let picker = a.tree_picker.as_ref().expect("picker opened");
+    let picker = a.tree_picker().expect("picker opened");
     assert_eq!(picker.entries.len(), 4);
     assert_eq!(picker.selected, 3); // defaults to the last entry
     let edit_idx = picker
@@ -111,10 +111,10 @@ fn tree_opens_rolls_back_and_prefills_prompt() {
         .iter()
         .position(|e| e.prefill.as_ref() == "second")
         .unwrap();
-    a.tree_picker.as_mut().unwrap().selected = edit_idx;
+    a.tree_picker_mut().unwrap().selected = edit_idx;
     a.tree_picker_confirm();
-    assert!(a.tree_picker.is_none());
-    assert_eq!(a.input, "second");
+    assert!(a.tree_picker().is_none());
+    assert_eq!(a.prompt.text, "second");
     assert_eq!(
         a.session
             .cursor
@@ -311,14 +311,13 @@ fn tree_file_backing_excludes_physically_interleaved_sibling_events() {
     );
     assert!(a.slash_command("/tree"));
     let selected = a
-        .tree_picker
-        .as_ref()
+        .tree_picker()
         .unwrap()
         .entries
         .iter()
         .position(|entry| entry.branch_point.as_ref() == branch_b_end)
         .unwrap();
-    a.tree_picker.as_mut().unwrap().selected = selected;
+    a.tree_picker_mut().unwrap().selected = selected;
     a.tree_picker_confirm();
 
     assert_eq!(a.transcript.turns.len(), 2);
@@ -445,7 +444,7 @@ fn tree_shows_compaction_node_and_reverts_before_it() {
         store::SessionCursor::open(path).unwrap(),
     );
     assert!(a.slash_command("/tree"));
-    let picker = a.tree_picker.as_ref().expect("picker opened");
+    let picker = a.tree_picker().expect("picker opened");
     assert!(picker
         .entries
         .iter()
@@ -457,9 +456,9 @@ fn tree_shows_compaction_node_and_reverts_before_it() {
         .unwrap();
     assert_eq!(picker.entries[comp_idx].branch_point.as_ref(), turn_end1_id);
     assert!(picker.entries[comp_idx].prefill.is_empty());
-    a.tree_picker.as_mut().unwrap().selected = comp_idx;
+    a.tree_picker_mut().unwrap().selected = comp_idx;
     a.tree_picker_confirm();
-    assert!(a.tree_picker.is_none());
+    assert!(a.tree_picker().is_none());
     assert_eq!(
         a.session
             .cursor
@@ -529,23 +528,22 @@ fn tree_rollback_after_compacted_failed_turn_keeps_checkpoint_context() {
     );
     assert!(a.slash_command("/tree"));
     let edit_idx = a
-        .tree_picker
-        .as_ref()
+        .tree_picker()
         .unwrap()
         .entries
         .iter()
         .position(|entry| entry.prefill.as_ref() == "n+8")
         .expect("post-error prompt is selectable");
     assert_eq!(
-        a.tree_picker.as_ref().unwrap().entries[edit_idx]
+        a.tree_picker().unwrap().entries[edit_idx]
             .branch_point
             .as_ref(),
         failed_id
     );
-    a.tree_picker.as_mut().unwrap().selected = edit_idx;
+    a.tree_picker_mut().unwrap().selected = edit_idx;
     a.tree_picker_confirm();
 
-    assert_eq!(a.input, "n+8");
+    assert_eq!(a.prompt.text, "n+8");
     assert_eq!(
         a.session
             .cursor
@@ -632,7 +630,7 @@ fn tree_revert_to_cancelled_turn_drops_aborted_tail() {
         store::SessionCursor::open(path).unwrap(),
     );
     assert!(a.slash_command("/tree"));
-    let picker = a.tree_picker.as_ref().expect("picker opened");
+    let picker = a.tree_picker().expect("picker opened");
     let cancelled_idx = picker
         .entries
         .iter()
@@ -643,9 +641,9 @@ fn tree_revert_to_cancelled_turn_drops_aborted_tail() {
     let branch_point = &picker.entries[cancelled_idx].branch_point;
     assert_eq!(branch_point.as_ref(), partial_id);
     assert_ne!(branch_point.as_ref(), cancelled_id);
-    a.tree_picker.as_mut().unwrap().selected = cancelled_idx;
+    a.tree_picker_mut().unwrap().selected = cancelled_idx;
     a.tree_picker_confirm();
-    assert!(a.tree_picker.is_none());
+    assert!(a.tree_picker().is_none());
     assert_eq!(
         a.session
             .cursor
@@ -707,7 +705,7 @@ fn tree_hides_checkpoint_copies_and_reverts_to_pre_compaction_leaf() {
         store::SessionCursor::open(path).unwrap(),
     );
     assert!(a.slash_command("/tree"));
-    let picker = a.tree_picker.as_ref().unwrap();
+    let picker = a.tree_picker().unwrap();
     assert_eq!(
         picker
             .entries
@@ -801,16 +799,16 @@ fn modal_tab_cycles_with_wraparound() {
         store::SessionCursor::open(path).unwrap(),
     );
     assert!(a.slash_command("/tree"));
-    let len = a.tree_picker.as_ref().unwrap().entries.len();
+    let len = a.tree_picker().unwrap().entries.len();
     assert_eq!(len, 4);
-    assert_eq!(a.tree_picker.as_ref().unwrap().selected, 3);
+    assert_eq!(a.tree_picker().unwrap().selected, 3);
     let mut run = None;
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
-    assert_eq!(a.tree_picker.as_ref().unwrap().selected, 0);
+    assert_eq!(a.tree_picker().unwrap().selected, 0);
     handle_event(&plain_key(KeyCode::BackTab), &mut a, None, &mut run);
-    assert_eq!(a.tree_picker.as_ref().unwrap().selected, 3);
+    assert_eq!(a.tree_picker().unwrap().selected, 3);
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
-    assert_eq!(a.tree_picker.as_ref().unwrap().selected, 0);
+    assert_eq!(a.tree_picker().unwrap().selected, 0);
     handle_event(
         &Event::Key(crossterm::event::KeyEvent::new_with_kind(
             KeyCode::Char('n'),
@@ -821,7 +819,7 @@ fn modal_tab_cycles_with_wraparound() {
         None,
         &mut run,
     );
-    assert_eq!(a.tree_picker.as_ref().unwrap().selected, 1);
+    assert_eq!(a.tree_picker().unwrap().selected, 1);
 }
 
 #[test]
@@ -911,7 +909,7 @@ fn tree_revert_to_root_then_reopens() {
     // active path becomes just the system message — the transcript is
     // empty (no visible turns) but the cursor leaf is the system id.
     assert!(a.slash_command("/tree"));
-    a.tree_picker.as_mut().unwrap().selected = 0;
+    a.tree_picker_mut().unwrap().selected = 0;
     a.tree_picker_confirm();
     assert!(a
         .session
@@ -920,9 +918,9 @@ fn tree_revert_to_root_then_reopens() {
         .and_then(store::SessionCursor::leaf_id)
         .is_some());
     assert_eq!(a.transcript.turns.len(), 0); // rolled back to before any user turn
-    assert_eq!(a.input, "first");
+    assert_eq!(a.prompt.text, "first");
     assert!(a.slash_command("/tree"));
-    let picker = a.tree_picker.as_ref().expect("picker reopened");
+    let picker = a.tree_picker().expect("picker reopened");
     assert_eq!(picker.entries.len(), 4);
     assert!(picker.entries.iter().all(|e| !e.is_active));
 }
@@ -1007,7 +1005,7 @@ fn tree_shows_tool_result_nodes() {
         store::SessionCursor::open(path).unwrap(),
     );
     assert!(a.slash_command("/tree"));
-    let picker = a.tree_picker.as_ref().expect("picker opened");
+    let picker = a.tree_picker().expect("picker opened");
     assert_eq!(picker.entries.len(), 3);
     assert!(picker.entries[0].label.starts_with("user:"));
     assert!(
@@ -1141,7 +1139,7 @@ fn tree_exec_label_shows_native_tools() {
         store::SessionCursor::open(path).unwrap(),
     );
     assert!(a.slash_command("/tree"));
-    let picker = a.tree_picker.as_ref().expect("picker opened");
+    let picker = a.tree_picker().expect("picker opened");
     let exec_entry = picker
         .entries
         .iter()

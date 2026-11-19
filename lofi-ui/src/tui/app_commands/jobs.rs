@@ -6,7 +6,7 @@ impl App {
     /// notification area, so the caller must hand every one of these over
     /// before the next frame.
     pub(in crate::tui) fn take_job_notices(&mut self) -> Vec<QueuedPrompt> {
-        self.jobs.as_ref().map_or_else(Vec::new, |jobs| {
+        self.jobs().map_or_else(Vec::new, |jobs| {
             jobs.take_notices()
                 .into_iter()
                 .map(|notice| QueuedPrompt {
@@ -21,7 +21,7 @@ impl App {
     /// since the last tick, oldest first. Unlike job notices these carry no
     /// notification-area line, so nothing else changes when one is taken.
     pub(in crate::tui) fn take_timer_notices(&mut self) -> Vec<QueuedPrompt> {
-        self.timers.as_ref().map_or_else(Vec::new, |timers| {
+        self.timers().map_or_else(Vec::new, |timers| {
             timers
                 .take_notices()
                 .into_iter()
@@ -37,7 +37,7 @@ impl App {
     /// record. One snapshot per change is enough: the last one on the
     /// lineage is what a resume re-arms.
     pub(in crate::tui) fn record_timer_state(&mut self) {
-        let Some(timers) = &self.timers else {
+        let Some(timers) = self.timers() else {
             return;
         };
         let records = timers.records();
@@ -70,7 +70,7 @@ impl App {
 
     /// Fresh job snapshot for the dialog, newest first. Empty when no agent.
     pub(in crate::tui) fn jobs_snapshot(&self) -> Vec<lofi_core::JobInfo> {
-        self.jobs
+        self.jobs()
             .as_ref()
             .map_or_else(Vec::new, lofi_core::JobRegistry::snapshot)
     }
@@ -87,7 +87,7 @@ impl App {
     /// Fresh timer listing for the dialog, soonest first. Empty when no
     /// agent.
     pub(in crate::tui) fn timers_snapshot(&self) -> Vec<lofi_core::TimerInfo> {
-        self.timers
+        self.timers()
             .as_ref()
             .map_or_else(Vec::new, lofi_core::TimerRegistry::listing)
     }
@@ -95,7 +95,7 @@ impl App {
     /// Refresh the open output view. PTY jobs copy their latest parsed screen;
     /// plain jobs page a tail window capped at `JOB_LOG_WINDOW_BYTES`.
     pub(in crate::tui) fn refresh_job_output(&mut self, view: &mut JobOutputView) {
-        let Some(jobs) = &self.jobs else {
+        let Some(jobs) = self.jobs() else {
             return;
         };
         let id = view.id;

@@ -1362,7 +1362,10 @@ fn a_stored_mailbox_wake_is_dropped_when_no_wake_is_unclaimed() {
     assert!(a.mailbox_wake.is_none(), "a dropped wake must not linger");
 
     a.mailbox_wake = Some("pointer".to_string());
-    a.subagents = Some(lofi_core::SubagentRegistry::default());
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws")
+            .with_subagents(lofi_core::SubagentRegistry::default()),
+    );
     assert!(a.ready_mailbox_turn().is_none());
     assert!(a.mailbox_wake.is_none());
 }
@@ -1391,7 +1394,10 @@ fn a_busy_turn_keeps_the_mailbox_wake_for_later() {
 #[test]
 fn a_registry_without_mail_has_no_unclaimed_mailbox_wake() {
     let mut a = app();
-    a.subagents = Some(lofi_core::SubagentRegistry::default());
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws")
+            .with_subagents(lofi_core::SubagentRegistry::default()),
+    );
     assert!(!a.has_unclaimed_mailbox_wake());
 }
 
@@ -1433,7 +1439,7 @@ async fn new_session_clears_the_subagent_registry() {
     let id = out["id"].as_str().unwrap().to_string();
 
     let mut a = app();
-    a.subagents = Some(registry);
+    a.executor = Some(lofi_core::agent::ToolExecutor::in_memory("/ws").with_subagents(registry));
     a.start_new_session();
 
     // Ids from the replaced session must not resume into the new one.

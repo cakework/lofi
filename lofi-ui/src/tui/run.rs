@@ -412,21 +412,13 @@ pub(crate) async fn run_loop(
         tokio::sync::mpsc::unbounded_channel::<lofi_core::ConfirmRequest>();
     if let Some(a) = agent.take() {
         let a = a.with_confirm_tx(confirm_tx.clone());
-        // Session-scoped state, read through the executor both backends own.
         let executor = a.tool_executor();
-        app.jobs = Some(executor.jobs());
-        app.executor = Some(executor.clone());
         // A resumed timer keeps the id the transcript lists, so the dialog
         // and `notifyCancel` manage the same timer the previous run scheduled.
-        let timers = executor.timers();
-        timers.restore(&std::mem::take(&mut app.resumed_timers));
-        app.timers = Some(timers);
-        app.subagents = Some(a.subagents());
-        // The `/policy` dialog writes the choice here; every exec in the
-        // session reads it. Cloned (not moved) so model switches keep it.
-        app.policy_override = Some(executor.policy_override());
-        app.paths = Some(executor.paths());
-        app.auto_mode_configured = executor.has_auto_mode();
+        executor
+            .timers()
+            .restore(&std::mem::take(&mut app.resumed_timers));
+        app.executor = Some(executor);
         agent = Some(a);
     }
 
@@ -434,7 +426,7 @@ pub(crate) async fn run_loop(
     // taking one is also what drops the job from the notification area, so
     // the line and the notice prompt change in one frame.
     let mut subagent_notice_rx = app
-        .subagents
+        .subagents()
         .as_ref()
         .map(lofi_core::SubagentRegistry::subscribe_notices);
 
@@ -676,20 +668,15 @@ pub(crate) async fn run_loop(
                                     app.no_models_hint = None;
                                     app.system_prompt = new_agent.system_prompt().into();
                                     let executor = new_agent.tool_executor();
-                                    app.jobs = Some(executor.jobs());
-                                    app.executor = Some(executor.clone());
-                                    app.timers = Some(executor.timers());
-                                    app.policy_override = Some(executor.policy_override());
-                                    app.paths = Some(executor.paths());
-                                    app.auto_mode_configured = executor.has_auto_mode();
-                                    let new_subagents = Some(new_agent.subagents());
+                                    let old_subagents = app.subagents();
+                                    let new_subagents = executor.subagents();
                                     // A switch that swaps the registry
                                     // instance orphans the old one's runs:
                                     // settle their spend and cancel them,
                                     // then listen to the new instance. A
                                     // switch that keeps it must not cancel
                                     // its live runs.
-                                    let subagents_changed = match (&app.subagents, &new_subagents) {
+                                    let subagents_changed = match (&old_subagents, Some(&new_subagents)) {
                                         (Some(old), Some(new)) => !old.same_instance(new),
                                         (old, new) => old.is_some() != new.is_some(),
                                     };
@@ -697,10 +684,10 @@ pub(crate) async fn run_loop(
                                         app.record_subagent_spend();
                                         app.clear_subagents();
                                     }
-                                    app.subagents = new_subagents;
+                                    app.executor = Some(executor);
                                     if subagents_changed {
                                         subagent_notice_rx = app
-                                            .subagents
+                                            .subagents()
                                             .as_ref()
                                             .map(lofi_core::SubagentRegistry::subscribe_notices);
                                     }
@@ -807,7 +794,7 @@ pub(crate) async fn run_loop(
                 // have scheduled or cancelled one: the tick is where the
                 // transcript's copy catches up.
                 app.record_timer_state();
-                if app.refresh_confirmations() || !app.pending_confirms.is_empty() {
+                if app.refresh_confirmations() || !app.confirms.pending.is_empty() {
                     dirty = true;
                 }
                 if app.run.is_some() {
@@ -833,7 +820,7 @@ pub(crate) async fn run_loop(
                 // An open background dialog redraws on every tick: the
                 // drill-in and the live cost columns both move on their
                 // own.
-                if app.background_modal.is_some() {
+                if app.background_modal().is_some() {
                     dirty = true;
                 }
                 // The only path that starts a mailbox turn: every other
@@ -998,10 +985,10 @@ pub(crate) async fn run_loop(
             break;
         }
     }
-    if let Some(jobs) = &app.jobs {
+    if let Some(jobs) = app.jobs() {
         jobs.shutdown();
     }
-    if let Some(subagents) = &app.subagents {
+    if let Some(subagents) = app.subagents() {
         // Cancel and abort any surviving background runs; their residue
         // spend is dropped with the process.
         let _ = subagents.clear();

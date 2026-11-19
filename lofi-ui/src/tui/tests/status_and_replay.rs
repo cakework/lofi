@@ -667,8 +667,8 @@ fn interrupt_run_restores_user_prompts_and_keeps_notices_queued() {
         kind: lofi_types::PromptKind::Notice,
     });
     restore_queued_prompts(&mut a);
-    assert_eq!(a.input, "user follow-up");
-    assert!(!a.input.contains("job 1786"));
+    assert_eq!(a.prompt.text, "user follow-up");
+    assert!(!a.prompt.text.contains("job 1786"));
     assert_eq!(a.prompt_queue.len(), 1);
     assert_eq!(a.prompt_queue[0].kind, lofi_types::PromptKind::Notice);
     assert!(a.prompt_queue[0].text.contains("job 1786"));
@@ -720,7 +720,7 @@ fn select_mode_colors_cursor_cell_distinctly_from_navigate_mode() {
     a.enter_nav();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let buf = term.backend().buffer();
-    let nav_y = a.log_rect.y + (a.nav_cursor - a.log_off) as u16;
+    let nav_y = a.viewport.log_rect.y + (a.viewport.nav_cursor - a.viewport.log_off) as u16;
     assert!((0..60).any(|x| buf[(x, nav_y)].bg == a.theme.cursor_line));
     assert!((0..60).any(|x| buf[(x, nav_y)].bg == a.theme.select_cursor));
     assert!(!(0..60).any(|x| buf[(x, nav_y)].bg == a.theme.warn));
@@ -737,7 +737,8 @@ fn policy_override_renders_left_of_cost_in_footer() {
     let mut a = app();
     let policy = lofi_core::PolicyOverride::default();
     policy.set(Some(lofi_core::BashApprovalMode::DenyAll));
-    a.policy_override = Some(policy);
+    a.executor =
+        Some(lofi_core::agent::ToolExecutor::in_memory("/ws").with_policy_override(policy));
     let cost_line: String = a
         .render_footer_cost()
         .spans
@@ -765,10 +766,10 @@ fn alt_up_restores_queued_prompt_lifo() {
         KeyEventKind::Press,
     ));
     handle_event(&ev, &mut a, None, &mut run);
-    assert_eq!(a.input, "second prompt");
+    assert_eq!(a.prompt.text, "second prompt");
     assert_eq!(a.prompt_queue.len(), 1);
     handle_event(&ev, &mut a, None, &mut run);
-    assert_eq!(a.input, "first prompt");
+    assert_eq!(a.prompt.text, "first prompt");
     assert!(a.prompt_queue.is_empty());
 }
 
@@ -792,7 +793,7 @@ fn alt_up_skips_notices_when_restoring_queue() {
         KeyEventKind::Press,
     ));
     handle_event(&ev, &mut a, None, &mut run);
-    assert_eq!(a.input, "user text");
+    assert_eq!(a.prompt.text, "user text");
     // The Notice remains queued — only the User entry was popped.
     assert_eq!(a.prompt_queue.len(), 1);
     assert_eq!(a.prompt_queue[0].kind, lofi_types::PromptKind::Notice);
@@ -817,8 +818,8 @@ fn a_waiting_confirmation_outranks_the_running_turn() {
     let mut a = app();
     a.run = Some(0);
     let (request, _response) = confirm_request("touch status-ran");
-    a.pending_confirms.push(request);
-    a.confirm_waiting = Some((
+    a.confirms.pending.push(request);
+    a.confirms.waiting = Some((
         1,
         Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
     ));
@@ -835,8 +836,8 @@ fn a_fresh_policy_prompt_keeps_the_report_working() {
     let mut a = app();
     a.run = Some(0);
     let (request, _response) = confirm_request("touch status-ran");
-    a.pending_confirms.push(request);
-    a.confirm_waiting = Some((1, Instant::now()));
+    a.confirms.pending.push(request);
+    a.confirms.waiting = Some((1, Instant::now()));
     let settled = program_status::Settled::default();
     let report = program_status::report(&a, &settled);
     assert_eq!(report.phase, program_status::Phase::Working);
@@ -854,8 +855,8 @@ fn an_auto_evaluation_keeps_the_report_working() {
             started_at: Instant::now(),
         },
     ));
-    a.pending_confirms.push(request);
-    a.confirm_waiting = Some((
+    a.confirms.pending.push(request);
+    a.confirms.waiting = Some((
         1,
         Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
     ));
@@ -872,8 +873,8 @@ fn an_auto_decision_is_the_users_prompt_at_once() {
     request.reason = Arc::new(std::sync::Mutex::new(lofi_core::ConfirmReason::AutoAsk {
         reason: "needs a look".to_string(),
     }));
-    a.pending_confirms.push(request);
-    a.confirm_waiting = Some((1, Instant::now()));
+    a.confirms.pending.push(request);
+    a.confirms.waiting = Some((1, Instant::now()));
     let settled = program_status::Settled::default();
     let report = program_status::report(&a, &settled);
     assert_eq!(report.phase, program_status::Phase::Blocked);
@@ -893,7 +894,7 @@ fn a_launch_without_a_model_reports_the_reason() {
 fn no_model_submit_surfaces_hint_without_running() {
     let mut a = app();
     a.no_models_hint = Some("set OPENAI_API_KEY".to_string());
-    a.input = "hello".to_string();
+    a.prompt.text = "hello".to_string();
     let ev = Event::Key(crossterm::event::KeyEvent::new_with_kind(
         KeyCode::Enter,
         KeyModifiers::empty(),

@@ -177,6 +177,13 @@ impl PrintOptions {
 pub async fn run_interactive(opts: InteractiveOptions) -> Result<()> {
     let env = env_pairs(&opts.env)?;
     let session = resolve_session(&opts)?;
+    let bootstrap = lofi_core::backend::SessionBootstrap::prepare(
+        opts.config_path.clone(),
+        &opts.root,
+        env,
+        !opts.no_session,
+    )
+    .await?;
     // Restore the model, effort and tier the user last ran with unless
     // --model was given: the resumed session's final turn marker carries
     // them, so a fresh session falls through to the configured default.
@@ -189,22 +196,24 @@ pub async fn run_interactive(opts: InteractiveOptions) -> Result<()> {
         .model
         .clone()
         .or_else(|| restored.as_ref().map(lofi_types::RunModel::query));
-    let started = match startup(&opts, query.as_deref(), &env).await {
-        Ok(started) => Ok(started),
+    let opened = match bootstrap
+        .open(opts.backend.as_deref(), query.as_deref())
+        .await
+    {
+        Ok(backend) => Ok(backend),
         // A restored model that no longer resolves must not stop a resume.
-        Err(_) if restored.is_some() => startup(&opts, None, &env).await,
+        Err(_) if restored.is_some() => bootstrap.open(opts.backend.as_deref(), None).await,
         Err(error) => Err(error),
     };
-    let hint = match started {
-        Ok(started) => started,
-        Err(error) => return no_model_tui(&opts, error, session, env).await,
+    let backend = match opened {
+        Ok(backend) => backend,
+        Err(error) => return no_model_tui(bootstrap, error, session).await,
     };
-    let Startup {
-        backend,
+    let lofi_core::backend::SessionBootstrap {
+        config,
         factory,
-        compaction,
-        theme,
-    } = hint;
+        executor: _,
+    } = bootstrap;
     let selection = backend.selection();
     let choice = backend.choice();
     // A resumed session shows the label its last turn recorded, so a backend
@@ -222,109 +231,32 @@ pub async fn run_interactive(opts: InteractiveOptions) -> Result<()> {
         label,
         selection.thinking,
         selection.service_tier,
-        theme,
+        config.ui.theme,
         session,
         None,
         ctx_limit,
-        compaction,
+        config.compaction,
         Some(switcher),
         system_prompt,
     ))
     .await
 }
 
-/// What one open backend needs from its config.
-struct Startup {
-    backend: lofi_core::backend::BackendRef,
-    factory: lofi_core::backend::BackendFactory,
-    compaction: lofi_types::CompactionConfig,
-    theme: lofi_types::ThemeMode,
-}
-
-async fn startup(
-    opts: &InteractiveOptions,
-    query: Option<&str>,
-    env: &[(String, String)],
-) -> Result<Startup> {
-    let path = opts
-        .config_path
-        .clone()
-        .map_or_else(lofi_core::config_loader::user_config_path, Ok)?;
-    let config = lofi_core::config_loader::load_backend_config(&path)?;
-    let factory =
-        lofi_core::backend::BackendFactory::new(config.clone(), &opts.root, env.to_vec())?
-            .with_skills_dir(path.parent().map(|dir| dir.join("skills")))
-            .with_subagent_persistence(!opts.no_session);
-    let executor = factory
-        .executor()?
-        .with_skills_dir(path.parent().map(|dir| dir.join("skills")))
-        .with_auto_mode_config(&config, env)
-        .await?;
-    let query = constrain(&config, opts, query)?;
-    let backend = factory.open(query.as_deref(), executor).await?;
-    Ok(Startup {
-        backend,
-        factory,
-        compaction: config.compaction,
-        theme: config.ui.theme,
-    })
-}
-
-/// Honour --backend: the flag constrains the selection instead of silently
-/// switching the provider a qualified query named.
-fn constrain(
-    config: &lofi_types::Config,
-    opts: &InteractiveOptions,
-    query: Option<&str>,
-) -> Result<Option<String>> {
-    let Some(name) = opts.backend.as_deref() else {
-        return Ok(query.map(str::to_owned));
-    };
-    if let Some(query) = query {
-        return match query.split_once('/') {
-            Some((prefix, _)) if prefix == name => Ok(Some(query.to_owned())),
-            _ => Err(Error::Config(format!(
-                "model \"{query}\" conflicts with --backend \"{name}\""
-            ))),
-        };
-    }
-    // A backend that names its own default model leads with it.
-    let model = config
-        .backends
-        .get(name)
-        .and_then(|backend| {
-            backend
-                .model()
-                .or_else(|| backend.models().first().map(String::as_str))
-        })
-        .unwrap_or("default");
-    Ok(Some(format!("{name}/{model}")))
-}
-
 /// A missing-model launch is not fatal: the TUI still opens so the user can
 /// read transcripts, browse /resume and quit.
 async fn no_model_tui(
-    opts: &InteractiveOptions,
+    bootstrap: lofi_core::backend::SessionBootstrap,
     error: Error,
     session: tui::SessionConfig,
-    env: Vec<(String, String)>,
 ) -> Result<()> {
     let Error::NoModels(hint) = error else {
         return Err(error);
     };
-    let path = opts
-        .config_path
-        .clone()
-        .map_or_else(lofi_core::config_loader::user_config_path, Ok)?;
-    let config = lofi_core::config_loader::load_backend_config(&path)?;
-    let factory = lofi_core::backend::BackendFactory::new(config.clone(), &opts.root, env.clone())?
-        .with_skills_dir(path.parent().map(|dir| dir.join("skills")))
-        .with_subagent_persistence(!opts.no_session);
-    let executor = factory
-        .executor()?
-        .with_skills_dir(path.parent().map(|dir| dir.join("skills")))
-        .with_auto_mode_config(&config, &env)
-        .await?;
+    let lofi_core::backend::SessionBootstrap {
+        config,
+        factory,
+        executor,
+    } = bootstrap;
     let switcher = tui::ModelSwitcher::new(factory).with_tool_executor(executor);
     Box::pin(tui::run(
         None,
@@ -523,27 +455,18 @@ async fn run_print_turn(
     summary: &std::cell::RefCell<print_summary::PrintSummary>,
 ) -> Result<()> {
     let env = env_pairs(&opts.env)?;
-    let path = opts
-        .config_path
-        .clone()
-        .map_or_else(lofi_core::config_loader::user_config_path, Ok)?;
-    let config = lofi_core::config_loader::load_backend_config(&path)?;
     // A subagent started by this run keeps no transcript of its own: the
     // parent's record carries its spend, and no one resumes a child.
-    let factory = lofi_core::backend::BackendFactory::new(config.clone(), &opts.root, env.clone())?
-        .with_skills_dir(path.parent().map(|dir| dir.join("skills")))
-        .with_subagent_persistence(false);
-    let executor = factory
-        .executor()?
-        .with_skills_dir(path.parent().map(|dir| dir.join("skills")))
-        .with_auto_mode_config(&config, &env)
+    let bootstrap = lofi_core::backend::SessionBootstrap::prepare(
+        opts.config_path.clone(),
+        &opts.root,
+        env,
+        false,
+    )
+    .await?;
+    let agent = bootstrap
+        .open(opts.backend.as_deref(), opts.model.as_deref())
         .await?;
-    let query = opts.model.clone().or_else(|| {
-        opts.backend
-            .as_deref()
-            .map(|name| format!("{name}/default"))
-    });
-    let agent = factory.open(query.as_deref(), executor).await?;
     // The record names the model the agent settled on even when the run
     // fails before its first round reports one.
     summary.borrow_mut().set_model(agent.run_model());
@@ -747,9 +670,20 @@ b1 = {}
             .with_config_path(&cfg)
             .with_model("beta/b1");
         let env = env_pairs(&opts.env).unwrap();
-        let started = startup(&opts, opts.model.as_deref(), &env).await.unwrap();
-        assert_eq!(started.backend.name(), "beta");
-        assert_eq!(started.backend.selection().model, "b1");
+        let bootstrap = lofi_core::backend::SessionBootstrap::prepare(
+            opts.config_path.clone(),
+            &opts.root,
+            env,
+            !opts.no_session,
+        )
+        .await
+        .unwrap();
+        let backend = bootstrap
+            .open(opts.backend.as_deref(), opts.model.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(backend.name(), "beta");
+        assert_eq!(backend.selection().model, "b1");
     }
 
     #[tokio::test]
@@ -758,8 +692,16 @@ b1 = {}
         let cfg = dual_provider_config(tmp.path());
         let opts = InteractiveOptions::new(tmp.path()).with_config_path(&cfg);
         let env = env_pairs(&opts.env).unwrap();
-        let started = startup(&opts, None, &env).await.unwrap();
-        assert_eq!(started.backend.name(), "alpha");
-        assert_eq!(started.backend.selection().model, "a1");
+        let bootstrap = lofi_core::backend::SessionBootstrap::prepare(
+            opts.config_path.clone(),
+            &opts.root,
+            env,
+            !opts.no_session,
+        )
+        .await
+        .unwrap();
+        let backend = bootstrap.open(opts.backend.as_deref(), None).await.unwrap();
+        assert_eq!(backend.name(), "alpha");
+        assert_eq!(backend.selection().model, "a1");
     }
 }

@@ -12,7 +12,7 @@ mod session;
 
 pub use contract::{Backend, BackendRef, Completion, CompletionRequest, ModelSelection};
 pub use native::NativeSource;
-pub use resolve::BackendFactory;
+pub use resolve::{constrain_backend_query, BackendFactory, SessionBootstrap};
 pub(crate) use resolve::{parse_query, ParsedQuery};
 pub use session::configured_models;
 

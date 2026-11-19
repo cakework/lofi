@@ -730,13 +730,13 @@ fn render_tree_smoke() {
 fn current_line_text_excludes_decoration() {
     let mut a = app();
     push_turn(&mut a);
-    a.log_off = 0;
-    a.log_vis = vec![view::VisLine {
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = vec![view::VisLine {
         rendered: "  hello world   ".to_string(),
         content: (2, 13),
         raw: None,
     }]; // "hello world"
-    a.nav_cursor = 0;
+    a.viewport.nav_cursor = 0;
     assert_eq!(a.current_line_text().as_deref(), Some("hello world"));
 }
 
@@ -744,22 +744,22 @@ fn current_line_text_excludes_decoration() {
 fn vim_motions_move_within_content() {
     let mut a = app();
     push_turn(&mut a);
-    a.log_off = 0;
-    a.log_vis = vec![view::VisLine {
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = vec![view::VisLine {
         rendered: "  aa bb cc".to_string(),
         content: (2, 10),
         raw: None,
     }]; // "aa bb cc"
-    a.nav_cursor = 0;
-    a.nav_col = 2;
+    a.viewport.nav_cursor = 0;
+    a.viewport.nav_col = 2;
     assert_eq!(a.first_nonblank_col(), 2);
     a.nav_set_col(usize::MAX);
-    assert_eq!(a.nav_col, 9);
-    a.nav_col = 2;
+    assert_eq!(a.viewport.nav_col, 9);
+    a.viewport.nav_col = 2;
     assert_eq!(a.nav_word_target(WordMotion::NextStart { big: false }), 5);
-    a.nav_col = 2;
+    a.viewport.nav_col = 2;
     assert_eq!(a.nav_word_target(WordMotion::NextEnd { big: false }), 3);
-    a.nav_col = 5;
+    a.viewport.nav_col = 5;
     assert_eq!(a.nav_word_target(WordMotion::PrevStart { big: false }), 2);
 }
 
@@ -767,14 +767,14 @@ fn vim_motions_move_within_content() {
 fn vim_word_motion_skips_punctuation() {
     let mut a = app();
     push_turn(&mut a);
-    a.log_off = 0;
-    a.log_vis = vec![view::VisLine {
+    a.viewport.log_off = 0;
+    a.viewport.log_vis = vec![view::VisLine {
         rendered: "  a.b c".to_string(),
         content: (2, 7),
         raw: None,
     }]; // "a.b c"
-    a.nav_cursor = 0;
-    a.nav_col = 2;
+    a.viewport.nav_cursor = 0;
+    a.viewport.nav_col = 2;
     assert_eq!(a.nav_word_target(WordMotion::NextStart { big: false }), 3);
     assert_eq!(a.nav_word_target(WordMotion::NextStart { big: true }), 6);
 }

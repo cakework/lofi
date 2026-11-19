@@ -185,26 +185,29 @@ fn resize_reanchors_scrolled_up_view_instead_of_snapping_to_bottom() {
 
     let mut term = Terminal::new(TestBackend::new(30, 20)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    let base_narrow = a.last_base;
+    let base_narrow = a.viewport.last_base;
     assert!(
         base_narrow > 0,
         "narrow transcript should overflow the viewport"
     );
-    a.pinned = false;
-    a.top_line = base_narrow / 2;
+    a.viewport.pinned = false;
+    a.viewport.top_line = base_narrow / 2;
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    assert!(!a.pinned, "scrolled up, not following the tail");
-    assert_eq!(a.log_off, a.top_line);
-    assert!(a.log_off < a.last_base, "scrolled up, not at the bottom");
+    assert!(!a.viewport.pinned, "scrolled up, not following the tail");
+    assert_eq!(a.viewport.log_off, a.viewport.top_line);
+    assert!(
+        a.viewport.log_off < a.viewport.last_base,
+        "scrolled up, not at the bottom"
+    );
 
     let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     assert!(
-        !a.pinned,
+        !a.viewport.pinned,
         "resize should not snap a scrolled-up view to the bottom"
     );
     assert!(
-        a.log_off < a.last_base,
+        a.viewport.log_off < a.viewport.last_base,
         "view should remain scrolled up after resize, not pinned to the bottom"
     );
 }
@@ -223,7 +226,7 @@ fn resize_keeps_nav_cursor_on_same_content_line() {
         blocks: Vec::new(),
     });
     push_turn(&mut a); // turn[1] keeps turn[0] frozen.
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
 
     let mut term = Terminal::new(TestBackend::new(28, 24)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
@@ -237,7 +240,7 @@ fn resize_keeps_nav_cursor_on_same_content_line() {
             .sum();
         (intra, c)
     };
-    a.nav_cursor = a.turn_start_line(0) + intra;
+    a.viewport.nav_cursor = a.turn_start_line(0) + intra;
     a.nav_show_cursor();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
 
@@ -247,7 +250,7 @@ fn resize_keeps_nav_cursor_on_same_content_line() {
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let (start, len, on_screen) = {
         let wide = a.layout.frozen_render.get(0).expect("turn 0 frozen");
-        let new_intra = a.nav_cursor - a.turn_start_line(0);
+        let new_intra = a.viewport.nav_cursor - a.turn_start_line(0);
         assert!(new_intra < wide.len(), "cursor should land within turn 0");
         let start: usize = wide
             .iter()
@@ -255,7 +258,8 @@ fn resize_keeps_nav_cursor_on_same_content_line() {
             .map(view::RenderLine::content_len)
             .sum();
         let len = wide[new_intra].content_len();
-        let on_screen = a.nav_cursor >= a.log_off && a.nav_cursor < a.log_off + a.log_view_h;
+        let on_screen = a.viewport.nav_cursor >= a.viewport.log_off
+            && a.viewport.nav_cursor < a.viewport.log_off + a.viewport.log_view_h;
         (start, len, on_screen)
     };
     assert!(
@@ -280,7 +284,7 @@ fn resize_keeps_nav_cursor_cell_on_same_content_char() {
         blocks: Vec::new(),
     });
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
 
     let mut term = Terminal::new(TestBackend::new(28, 24)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
@@ -292,8 +296,8 @@ fn resize_keeps_nav_cursor_cell_on_same_content_char() {
         let char_pos = app_nav::cursor_char_pos(narrow, intra, nav_col);
         (intra, nav_col, char_pos)
     };
-    a.nav_cursor = a.turn_start_line(0) + intra;
-    a.nav_col = nav_col;
+    a.viewport.nav_cursor = a.turn_start_line(0) + intra;
+    a.viewport.nav_col = nav_col;
     a.nav_show_cursor();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
 
@@ -301,9 +305,9 @@ fn resize_keeps_nav_cursor_cell_on_same_content_char() {
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let new_char_pos = {
         let wide = a.layout.frozen_render.get(0).expect("turn 0 frozen");
-        let new_intra = a.nav_cursor - a.turn_start_line(0);
+        let new_intra = a.viewport.nav_cursor - a.turn_start_line(0);
         assert!(new_intra < wide.len(), "cursor should land within turn 0");
-        app_nav::cursor_char_pos(wide, new_intra, a.nav_col)
+        app_nav::cursor_char_pos(wide, new_intra, a.viewport.nav_col)
     };
     assert_eq!(
         new_char_pos, char_pos,
@@ -342,11 +346,11 @@ fn resize_keeps_select_anchor_on_same_content_char() {
         let col = rl.content.0 + (rl.content_len() / 2).max(1);
         (intra, col, app_nav::cursor_char_pos(narrow, intra, col))
     };
-    a.mode = Mode::Select;
-    a.select_anchor = (a.turn_start_line(0) + anchor_intra, anchor_col);
-    a.nav_cursor = a.turn_start_line(0) + cur_intra;
-    a.nav_col = cur_col;
-    a.sel = Some(a.select_sel());
+    a.viewport.mode = Mode::Select;
+    a.viewport.select_anchor = (a.turn_start_line(0) + anchor_intra, anchor_col);
+    a.viewport.nav_cursor = a.turn_start_line(0) + cur_intra;
+    a.viewport.nav_col = cur_col;
+    a.viewport.sel = Some(a.select_sel());
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
 
     let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
@@ -354,14 +358,14 @@ fn resize_keeps_select_anchor_on_same_content_char() {
     let wide = a.layout.frozen_render.get(0).expect("turn 0 frozen");
 
     let new_anchor_char = {
-        let intra = a.select_anchor.0 - a.turn_start_line(0);
+        let intra = a.viewport.select_anchor.0 - a.turn_start_line(0);
         assert!(intra < wide.len(), "anchor should land within turn 0");
-        app_nav::cursor_char_pos(wide, intra, a.select_anchor.1)
+        app_nav::cursor_char_pos(wide, intra, a.viewport.select_anchor.1)
     };
     let new_cur_char = {
-        let intra = a.nav_cursor - a.turn_start_line(0);
+        let intra = a.viewport.nav_cursor - a.turn_start_line(0);
         assert!(intra < wide.len(), "cursor should land within turn 0");
-        app_nav::cursor_char_pos(wide, intra, a.nav_col)
+        app_nav::cursor_char_pos(wide, intra, a.viewport.nav_col)
     };
     assert_eq!(
         new_anchor_char, anchor_char,
@@ -389,15 +393,15 @@ fn resize_keeps_nav_cursor_at_its_viewport_row() {
         });
         push_turn(&mut a);
     }
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
     // `enter_nav` always leaves the tail; the fixture must too, or the view
     // keeps following the bottom and never materializes the turns it scrolls to.
-    a.pinned = false;
+    a.viewport.pinned = false;
 
     let mut term = Terminal::new(TestBackend::new(28, 24)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     assert!(
-        a.log_total > a.log_view_h,
+        a.viewport.log_total > a.viewport.log_view_h,
         "transcript overflows the viewport"
     );
     // Place the cursor on a content line near the top (turn 2) and park the
@@ -411,20 +415,23 @@ fn resize_keeps_nav_cursor_at_its_viewport_row() {
             .len()
             .saturating_sub(1),
     );
-    a.nav_cursor = a.turn_start_line(k) + intra;
-    a.pinned = false;
-    a.top_line = a.nav_cursor.saturating_sub(4);
+    a.viewport.nav_cursor = a.turn_start_line(k) + intra;
+    a.viewport.pinned = false;
+    a.viewport.top_line = a.viewport.nav_cursor.saturating_sub(4);
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    let row = a.nav_cursor - a.log_off;
+    let row = a.viewport.nav_cursor - a.viewport.log_off;
     assert_eq!(row, 4);
 
     // Widen: the intervening lines re-wrap, but the cursor stays on its
     // previous viewport row — the viewport follows it instead of drifting.
     let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    assert!(a.log_total > a.log_view_h, "still overflows after widen");
+    assert!(
+        a.viewport.log_total > a.viewport.log_view_h,
+        "still overflows after widen"
+    );
     assert_eq!(
-        a.nav_cursor - a.log_off,
+        a.viewport.nav_cursor - a.viewport.log_off,
         row,
         "cursor viewport row should be preserved across a re-wrap"
     );
@@ -441,28 +448,28 @@ fn resize_clamps_nav_cursor_to_edge_on_height_shrink() {
         blocks: Vec::new(),
     });
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    let h_tall = a.log_view_h;
+    let h_tall = a.viewport.log_view_h;
     assert!(h_tall > 12, "tall viewport");
     let row = h_tall - 2;
-    a.nav_cursor = a.log_off + row;
+    a.viewport.nav_cursor = a.viewport.log_off + row;
     a.nav_show_cursor();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    assert_eq!(a.nav_cursor - a.log_off, row);
+    assert_eq!(a.viewport.nav_cursor - a.viewport.log_off, row);
 
     // Shrink the height (same width) so the old row no longer fits.
     let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     assert!(
-        a.log_view_h <= row,
+        a.viewport.log_view_h <= row,
         "new viewport shorter than the old cursor row"
     );
     assert_eq!(
-        a.nav_cursor,
-        a.log_off + a.log_view_h - 1,
+        a.viewport.nav_cursor,
+        a.viewport.log_off + a.viewport.log_view_h - 1,
         "cursor should clamp to the bottom edge on height shrink"
     );
 }
@@ -523,7 +530,7 @@ fn resize_keeps_nav_cursor_on_exec_header_across_wrap() {
     });
     // A second turn so the first is frozen (exercises the frozen-render path).
     push_turn(&mut a);
-    a.mode = Mode::Navigate;
+    a.viewport.mode = Mode::Navigate;
 
     let line_text = |a: &App, abs: usize| -> String {
         let n = a.transcript.turns.len();
@@ -572,25 +579,25 @@ fn resize_keeps_nav_cursor_on_exec_header_across_wrap() {
 
     let mut term = Terminal::new(TestBackend::new(64, 57)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
-    let exec_idx = (0..a.log_total)
+    let exec_idx = (0..a.viewport.log_total)
         .rev()
         .find(|&i| line_text(&a, i).starts_with("Exec"))
         .expect("an Exec header");
-    a.nav_cursor = exec_idx;
-    a.nav_col = 4;
+    a.viewport.nav_cursor = exec_idx;
+    a.viewport.nav_col = 4;
     a.nav_show_cursor();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
 
     // Widen: the cursor must stay on the exact same Exec header (same content
     // char), not drift to the other Exec header, the text, or the code lines.
-    let before = line_text(&a, a.nav_cursor);
+    let before = line_text(&a, a.viewport.nav_cursor);
     let mut term = Terminal::new(TestBackend::new(98, 57)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     assert_eq!(
-        line_text(&a, a.nav_cursor),
+        line_text(&a, a.viewport.nav_cursor),
         before,
         "cursor drifted to: {:?}",
-        line_text(&a, a.nav_cursor)
+        line_text(&a, a.viewport.nav_cursor)
     );
 }
 
@@ -677,18 +684,18 @@ fn permission_dialog_caps_height_and_scrolls_command_preview() {
 ",
         );
     let (req, _response) = confirm_request(&command);
-    a.pending_confirms.push(req);
+    a.confirms.pending.push(req);
     let mut term = Terminal::new(TestBackend::new(90, 50)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     assert_eq!(
-        (a.confirm_total, a.confirm_view_h, a.confirm_scroll),
+        (a.confirms.total, a.confirms.view_h, a.confirms.scroll),
         (30, 12, 0)
     );
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(a.confirm_scroll, 2);
+    assert_eq!(a.confirms.scroll, 2);
     a.handle_confirm_key(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-    assert_eq!(a.confirm_scroll, 18);
+    assert_eq!(a.confirms.scroll, 18);
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let buf = term.backend().buffer();
     let screen = (0..50)
@@ -701,8 +708,8 @@ fn permission_dialog_caps_height_and_scrolls_command_preview() {
     assert!(screen.contains("command-line-29"), "{screen}");
     assert!(!screen.contains("command-line-00"), "{screen}");
     a.handle_confirm_key(&KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-    assert_eq!(a.confirm_scroll, 17);
-    assert_eq!(a.pending_confirms.len(), 1);
+    assert_eq!(a.confirms.scroll, 17);
+    assert_eq!(a.confirms.pending.len(), 1);
 }
 
 // Write five "old" messages, then a zero-tail compaction marker folding them

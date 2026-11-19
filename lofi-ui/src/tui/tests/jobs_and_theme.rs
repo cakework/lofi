@@ -6,12 +6,12 @@ fn background_modal_opens_on_the_requested_tab() {
     // No session yet: the dialog still opens, and its empty state says
     // there is nothing running.
     a.open_background_modal(BackgroundTab::Jobs);
-    let modal = a.background_modal.as_ref().expect("background modal");
+    let modal = a.background_modal().expect("background modal");
     assert_eq!(modal.tab, BackgroundTab::Jobs);
     assert!(a.modal_open());
     a.open_background_modal(BackgroundTab::Subagents);
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Subagents)
     );
 }
@@ -19,30 +19,31 @@ fn background_modal_opens_on_the_requested_tab() {
 #[test]
 fn background_modal_esc_closes() {
     let mut a = app();
-    a.jobs = Some(lofi_core::JobRegistry::new());
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws").with_jobs(lofi_core::JobRegistry::new()),
+    );
     a.open_background_modal(BackgroundTab::Jobs);
     let esc = crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Esc,
         crossterm::event::KeyModifiers::NONE,
     );
     a.handle_modal_key(&esc);
-    assert!(a.background_modal.is_none());
+    assert!(a.background_modal().is_none());
 }
 
 #[test]
 fn background_modal_empty_list_no_underflow() {
     let mut a = app();
-    a.jobs = Some(lofi_core::JobRegistry::new());
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws").with_jobs(lofi_core::JobRegistry::new()),
+    );
     a.open_background_modal(BackgroundTab::Jobs);
     let down = crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Down,
         crossterm::event::KeyModifiers::NONE,
     );
     a.handle_modal_key(&down);
-    assert_eq!(
-        a.background_modal.as_ref().map(|m| m.jobs.selected),
-        Some(0)
-    );
+    assert_eq!(a.background_modal().map(|m| m.jobs.selected), Some(0));
 }
 
 #[test]
@@ -50,7 +51,7 @@ fn jobs_terminal_view_clips_to_the_available_viewport() {
     use ratatui::Terminal;
 
     let mut a = app();
-    a.background_modal = Some(BackgroundModalState {
+    a.open_modal(ActiveModal::Background(Box::new(BackgroundModalState {
         tab: BackgroundTab::Jobs,
         jobs: JobsModalState { selected: 0 },
         subagents: SubagentsModalState {
@@ -77,7 +78,7 @@ fn jobs_terminal_view_clips_to_the_available_viewport() {
             }),
         })),
         confirm: None,
-    });
+    })));
     let mut term = Terminal::new(TestBackend::new(32, 12)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let buf = term.backend().buffer();
@@ -99,7 +100,7 @@ fn jobs_terminal_view_preserves_cell_colors_and_attributes() {
     use ratatui::{style::Color, Terminal};
 
     let mut a = app();
-    a.background_modal = Some(BackgroundModalState {
+    a.open_modal(ActiveModal::Background(Box::new(BackgroundModalState {
         tab: BackgroundTab::Jobs,
         jobs: JobsModalState { selected: 0 },
         subagents: SubagentsModalState {
@@ -131,7 +132,7 @@ fn jobs_terminal_view_preserves_cell_colors_and_attributes() {
             }),
         })),
         confirm: None,
-    });
+    })));
     let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
     term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
     let cell = term
@@ -156,7 +157,7 @@ fn theme_picker_opens_preselected_on_current_mode() {
     let mut a = app();
     a.update_theme(theme::ThemeEvent::SetMode(ThemeMode::Dark));
     a.open_theme_picker();
-    let picker = a.theme_picker.as_ref().unwrap();
+    let picker = a.theme_picker().unwrap();
     assert_eq!(picker.modes.len(), 3);
     assert_eq!(picker.modes[picker.selected], ThemeMode::Dark);
     assert!(a.modal_open());
@@ -172,9 +173,9 @@ fn theme_picker_confirm_updates_mode_and_clears_frozen_cache() {
     assert!(a.layout.frozen_render.contains(0));
     a.open_theme_picker();
     // Move from Dark (idx 2) to Light (idx 1).
-    a.theme_picker.as_mut().unwrap().selected = 1;
+    a.theme_picker_mut().unwrap().selected = 1;
     a.theme_picker_confirm();
-    assert!(a.theme_picker.is_none());
+    assert!(a.theme_picker().is_none());
     assert_eq!(a.theme_manager.mode(), ThemeMode::Light);
     assert!(!a.layout.frozen_render.contains(0));
 }
@@ -248,7 +249,7 @@ fn inverted_palette_updates_input_and_cached_transcript() {
         .draw(|f| crate::tui::view::render(f, &mut a))
         .unwrap();
     let buffer = terminal.backend().buffer();
-    let input = &buffer[(a.input_rect.x, a.input_rect.y)];
+    let input = &buffer[(a.prompt.rect.x, a.prompt.rect.y)];
     assert_eq!(input.symbol(), "i");
     assert_eq!(input.bg, Color::Indexed(232));
     assert_eq!(input.fg, Color::Indexed(231));
@@ -373,7 +374,7 @@ fn selected_picker_item_preserves_contrast_after_palette_changes() {
             } else {
                 (1, "l")
             };
-            a.theme_picker.as_mut().unwrap().selected = selected;
+            a.theme_picker_mut().unwrap().selected = selected;
             let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
             terminal
                 .draw(|f| crate::tui::view::render(f, &mut a))

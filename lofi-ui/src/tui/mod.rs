@@ -83,6 +83,7 @@ use tokio::task::{JoinHandle, LocalSet};
 use tokio::time::MissedTickBehavior;
 #[allow(clippy::wildcard_imports)]
 pub(crate) use types::*;
+pub(crate) use {app_input::PromptEditor, app_nav::ViewportState};
 
 use crate::tui::view::HStack;
 use lofi_core::backend::{BackendFactory, BackendRef};
@@ -206,17 +207,16 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 pub(crate) struct App {
     transcript: Transcript,
     layout: TranscriptLayout,
-    input: String,
-    input_cursor: usize,
+    prompt: PromptEditor,
+    viewport: ViewportState,
+    modal: Option<ActiveModal>,
+    confirms: ConfirmQueue,
     lifecycle: AgentLifecycle,
     /// The system prompt the agent was built with; pinned onto the durable
     /// transcript at each context boundary so a resumed or compacted history
     /// replays the exact governing prompt rather than what today's config
     /// would produce.
     system_prompt: String,
-    history_nav: Vec<String>,
-    history_idx: Option<usize>,
-    input_stash: String,
     model_label: String,
     /// The `provider/model` the user picked, kept while a turn reports the id
     /// it actually ran so the header can show both.
@@ -270,81 +270,17 @@ pub(crate) struct App {
     lifecycle_tx: Option<tokio::sync::mpsc::UnboundedSender<LifecycleResult>>,
     lifecycle_busy: bool,
     continue_after_hard_compact: bool,
-    pinned: bool,
-    top_line: usize,
-    last_base: usize,
-    /// Top visible row as content: (turn index, row within that turn). Frozen
-    /// heights converge from estimates after a resume, which shifts absolute
-    /// line numbers; this pair keeps the same content at the top row.
-    view_anchor: Option<(usize, usize)>,
-    /// The `top_line` that produced `view_anchor`. Any other value means the
-    /// view moved since, so the anchor is stale.
-    view_anchor_line: usize,
-    /// The Navigate/Select cursor as content: (turn index, row within that
-    /// turn). Same reason as `view_anchor`, and more urgent: the viewport
-    /// follows the cursor, so a cursor dragged by a shrinking prefix estimate
-    /// takes the whole transcript with it.
-    nav_anchor: Option<(usize, usize)>,
-    /// The `nav_cursor` that produced `nav_anchor`. Any other value means the
-    /// user moved the cursor since.
-    nav_anchor_line: usize,
-    /// The cursor's screen row when `nav_anchor` was recorded, when it was on
-    /// screen at all. Re-deriving the cursor from its content puts it back on
-    /// this row; a cursor that was already off screen stays where the scroll
-    /// handlers put the viewport.
-    nav_anchor_row: Option<usize>,
-    /// Scrollbar geometry (offset, extent) as of the last frame whose extent
-    /// was final. Estimated heights converge by an order of magnitude, and a
-    /// thumb drawn from a moving extent slides and stretches with no input.
-    scroll_gauge: Option<(usize, usize)>,
-    /// Turn count and live turn height when `scroll_gauge` was adopted. Both
-    /// change only when content changes, never when an estimate converges, so
-    /// a difference means the extent moved for real and must reach the thumb.
-    scroll_gauge_stamp: Option<(usize, usize)>,
     expanded_details: HashMap<DetailKey, DetailState>,
     detail_focus: Option<DetailFocus>,
     debug_after_draw: Option<&'static str>,
     debug: Option<debug_stats::DebugState>,
     should_quit: bool,
     session: SessionState,
-    picker: Option<PickerState>,
-    tree_picker: Option<TreePickerState>,
-    tree_picker_snapshot: Option<u64>,
-    tree_picker_pending: std::collections::HashSet<usize>,
     picker_load_tx: Option<tokio::sync::mpsc::UnboundedSender<PickerLoad>>,
     picker_generation: Arc<AtomicU64>,
-    model_picker: Option<ModelPickerState>,
-    thinking_picker: Option<ThinkingPickerState>,
-    policy_picker: Option<PolicyPickerState>,
-    /// `/paths` allowed-paths manager, reading and editing through the
-    /// session's paths handle.
-    paths_picker: Option<PathsPickerState>,
-    /// The session's tool executor, cloned from the agent at startup. `/new`
-    /// arms its budget again, so a new conversation is not stuck on a spent
-    /// one.
+    /// The session's tool executor, cloned from the agent at startup. Owns
+    /// jobs, timers, subagents, allowed-paths, and bash approval overrides.
     executor: Option<lofi_core::agent::ToolExecutor>,
-    /// Allowed-paths view shared with the agent, wired when the session
-    /// starts.
-    paths: Option<lofi_core::paths::PathsHandle>,
-    /// Shared handle to the session's bash approval override; written on
-    /// `/policy` confirm. None until the startup agent is wired in.
-    policy_override: Option<lofi_core::PolicyOverride>,
-    /// Whether auto-mode evaluation is configured; gates the `ask (auto)`
-    /// choice in the `/policy` dialog.
-    auto_mode_configured: bool,
-    service_picker: Option<ServicePickerState>,
-    theme_picker: Option<ThemePickerState>,
-    /// The session's background-job registry, cloned from the agent at
-    /// startup. `None` when no agent is configured. Backs the `/job` modal
-    /// and the persistent running-jobs badge.
-    jobs: Option<lofi_core::JobRegistry>,
-    /// The session's wake-up timer registry, cloned from the agent
-    /// alongside `jobs`. Fired notices leave here as notice prompts.
-    timers: Option<lofi_core::TimerRegistry>,
-    /// The session's subagent registry, cloned from the agent alongside
-    /// `jobs`. `/new` clears it so old subagent ids cannot resume into the
-    /// new session.
-    subagents: Option<lofi_core::SubagentRegistry>,
     /// The timer set the transcript already holds. A tick that sees a
     /// different set appends one `TimerState`, so a resumed session
     /// re-arms what was still pending.
@@ -355,77 +291,59 @@ pub(crate) struct App {
     /// Jobs a resumed transcript opened but never closed. They are gone
     /// with the previous process, so the jobs tab lists them as stale.
     stale_jobs: Vec<OutstandingJob>,
-    /// One dialog for every kind of running work: subagents, jobs, timers.
-    background_modal: Option<BackgroundModalState>,
     model_choices: Vec<lofi_types::ModelChoice>,
     pending_model_switch: Option<String>,
-    info: Option<InfoModal>,
-    slash_complete: Option<SlashComplete>,
     no_models_hint: Option<String>,
     /// Rendering snapshot, updated only through `update_theme`.
     theme: Theme,
     theme_manager: theme::ThemeManager,
-    kill_ring: String,
-    /// True when the previous command was `C-k` so a consecutive `C-k`
-    /// appends to the kill ring instead of replacing it.
-    last_kill_was_kill: bool,
     ctrl_c_at: Option<Instant>,
-    /// When the user first asked the current run to stop. Cancellation is
-    /// cooperative — the turn polls the flag — so this alone cannot settle a
-    /// run that stopped listening; see `cancel_unacknowledged`.
+    /// When the user first asked the current run to stop.
     cancel_at: Option<Instant>,
-    /// When the current run last delivered an event. A cancel that lands while
-    /// a slow step still reports is not a stall.
+    /// When the current run last delivered an event.
     run_event_at: Option<Instant>,
-    log_rect: Rect,
-    input_rect: Rect,
-    log_vis: Vec<view::VisLine>,
-    log_details: Vec<Option<view::DetailTarget>>,
-    log_off: usize,
-    input_scroll: usize,
-    sel: Option<Selection>,
-    mode: Mode,
-    pending_confirms: Vec<lofi_core::ConfirmRequest>,
-    deferred_confirms: Vec<lofi_core::ConfirmRequest>,
-    /// The front confirmation and when it became the user's to answer. The
-    /// terminal report debounces a plain policy prompt against it, so an
-    /// approval that takes a moment never leaves a `blocked` record behind.
-    confirm_waiting: Option<(u64, Instant)>,
-    confirm_selected: usize,
-    /// Whether the front directory grant answers for the requested directory
-    /// instead of the project root the prompt offers by default.
-    confirm_narrow: bool,
-    confirm_scroll: usize,
-    confirm_total: usize,
-    confirm_view_h: usize,
     yank_notify: Option<Instant>,
-    /// Cursor position saved at yank time so the next `enter_nav` can jump
-    /// back to it instead of the bottom of the viewport. `None` when the
-    /// cursor was on the last line (follow transcript) or no yank happened.
-    yank_cursor: Option<(usize, usize)>,
-    /// Transient status/error notification from a slash command (e.g.
-    /// `/session` with no session, `/tree` with no session file, an unknown
-    /// command). Surfaced on the rule line's left edge instead of as a chat
-    /// turn so command feedback doesn't pollute the transcript.
+    /// Transient status/error notification from a slash command.
     notify: Option<Notify>,
-    nav_cursor: usize,
-    nav_col: usize,
-    select_anchor: (usize, usize),
-    /// The selection's free end as content: (turn index, row within that
-    /// turn), and the `select_anchor` line that produced it. The same
-    /// convergence shift moves it, and a drifting endpoint highlights the
-    /// wrong text.
-    sel_anchor: Option<(usize, usize)>,
-    sel_anchor_line: usize,
-    /// Total transcript line count (frozen + last turn + separators), stashed
-    /// at render time so the Navigate cursor can be clamped between events.
-    log_total: usize,
-    last_turn_height: usize,
-    log_view_h: usize,
     render_profile: Box<RenderProfile>,
 }
 
 impl App {
+    pub(crate) fn jobs(&self) -> Option<lofi_core::JobRegistry> {
+        self.executor
+            .as_ref()
+            .map(lofi_core::agent::ToolExecutor::jobs)
+    }
+
+    pub(crate) fn timers(&self) -> Option<lofi_core::TimerRegistry> {
+        self.executor
+            .as_ref()
+            .map(lofi_core::agent::ToolExecutor::timers)
+    }
+
+    pub(crate) fn subagents(&self) -> Option<lofi_core::SubagentRegistry> {
+        self.executor
+            .as_ref()
+            .map(lofi_core::agent::ToolExecutor::subagents)
+    }
+
+    pub(crate) fn paths(&self) -> Option<lofi_core::paths::PathsHandle> {
+        self.executor
+            .as_ref()
+            .map(lofi_core::agent::ToolExecutor::paths)
+    }
+
+    pub(crate) fn policy_override(&self) -> Option<lofi_core::PolicyOverride> {
+        self.executor
+            .as_ref()
+            .map(lofi_core::agent::ToolExecutor::policy_override)
+    }
+
+    pub(crate) fn auto_mode_configured(&self) -> bool {
+        self.executor
+            .as_ref()
+            .is_some_and(lofi_core::agent::ToolExecutor::has_auto_mode)
+    }
     fn restore_indexed_session(
         &mut self,
         cursor: &store::SessionCursor,
@@ -463,7 +381,7 @@ impl App {
     ) -> Result<Vec<OutstandingJob>> {
         let stale = lofi_core::session::replay::outstanding_jobs_at(cursor, index)?;
         let timers = lofi_core::session::replay::timer_records_at(cursor, index)?;
-        if let Some(registry) = &self.timers {
+        if let Some(registry) = self.timers() {
             registry.restore(&timers);
         }
         self.timers_recorded.clone_from(&timers);

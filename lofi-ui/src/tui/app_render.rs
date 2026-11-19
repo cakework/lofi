@@ -113,20 +113,20 @@ impl App {
     /// finished job stays listed while its terminal notice waits to be
     /// taken, and drops in the call that takes it.
     pub(crate) fn running_jobs(&self) -> Vec<lofi_core::JobInfo> {
-        self.jobs
+        self.jobs()
             .as_ref()
             .map_or_else(Vec::new, lofi_core::JobRegistry::active_items)
     }
 
     pub(crate) fn running_subagents(&self) -> Vec<lofi_core::SubagentRunning> {
-        self.subagents
+        self.subagents()
             .as_ref()
             .map(lofi_core::SubagentRegistry::running)
             .unwrap_or_default()
     }
 
     pub(crate) fn has_running_subagents(&self) -> bool {
-        self.subagents
+        self.subagents()
             .as_ref()
             .is_some_and(lofi_core::SubagentRegistry::has_running_background)
     }
@@ -199,8 +199,8 @@ impl App {
 
     /// Persistent chip while `/policy` set a non-default approval mode.
     pub(crate) fn policy_badge(&self) -> Option<String> {
-        let mode = self.policy_override.as_ref()?.current()?;
-        if mode == lofi_core::default_approval_mode(self.auto_mode_configured) {
+        let mode = self.policy_override()?.current()?;
+        if mode == lofi_core::default_approval_mode(self.auto_mode_configured()) {
             return None;
         }
         Some(policy_mode_label(mode).to_string())

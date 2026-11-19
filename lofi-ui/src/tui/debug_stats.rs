@@ -226,17 +226,25 @@ impl App {
                 .sum::<usize>();
         let collapsed_turn_cache = self.transcript.collapsed_turns.borrow();
         let collapsed_turn_cache_bytes = collapsed_turn_cache.retained_bytes
-            + collapsed_turn_cache.map.capacity() * (size_of::<usize>() + size_of::<Box<[u8]>>());
-        let visible_log_bytes = self.log_vis.capacity() * size_of::<view::VisLine>()
+            + collapsed_turn_cache.map.capacity()
+                * (size_of::<usize>() + size_of::<(u64, Box<[u8]>)>())
+            + collapsed_turn_cache.order.len() * size_of::<(u64, usize)>();
+        let visible_log_bytes = self.viewport.log_vis.capacity() * size_of::<view::VisLine>()
             + self
+                .viewport
                 .log_vis
                 .iter()
                 .map(|line| line.rendered.capacity())
                 .sum::<usize>();
-        let input_bytes = self.input.capacity()
-            + self.input_stash.capacity()
-            + self.kill_ring.capacity()
-            + self.history_nav.iter().map(String::capacity).sum::<usize>()
+        let input_bytes = self.prompt.text.capacity()
+            + self.prompt.stash.capacity()
+            + self.prompt.kill_ring.capacity()
+            + self
+                .prompt
+                .history
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
             + self
                 .prompt_queue
                 .iter()
@@ -251,6 +259,15 @@ impl App {
                 .iter()
                 .flatten()
                 .map(|offsets| offsets.capacity() * size_of::<u64>())
+                .sum::<usize>()
+            + self.transcript.turn_compactions.capacity()
+                * size_of::<Vec<transcript::CompactionMarker>>()
+            + self
+                .transcript
+                .turn_compactions
+                .iter()
+                .flat_map(|markers| markers.iter())
+                .map(|marker| marker.summary.capacity() + size_of::<transcript::CompactionMarker>())
                 .sum::<usize>()
             + self.layout.frozen_heights.capacity() * size_of::<usize>();
         let estimated_total = history_bytes
@@ -568,18 +585,18 @@ impl DebugState {
                 "turns": app.transcript.turns.len(),
                 "resident_turn_blocks": app.transcript.turns.iter().filter(|turn| !turn.blocks.is_empty()).count(),
                 "render_cache_entries": app.layout.frozen_render.map.len(),
-                "visible_log_lines": app.log_vis.len(),
+                "visible_log_lines": app.viewport.log_vis.len(),
                 "queued_prompts": app.prompt_queue.len(),
                 "context_tokens": context_tokens,
                 "context_limit": app.ctx_limit,
                 "compacted": app.compacted,
                 "expanded_details": app.expanded_details.len(),
-                "pinned": app.pinned,
-                "top_line": app.top_line,
-                "log_off": app.log_off,
-                "log_total": app.log_total,
-                "log_view_h": app.log_view_h,
-                "last_turn_height": app.last_turn_height,
+                "pinned": app.viewport.pinned,
+                "top_line": app.viewport.top_line,
+                "log_off": app.viewport.log_off,
+                "log_total": app.viewport.log_total,
+                "log_view_h": app.viewport.log_view_h,
+                "last_turn_height": app.viewport.last_turn_height,
                 "pending_prompt_start": app.pending_prompt_start,
                 "height_remeasure_from": app.layout.height_remeasure_from,
                 "live_turn_blocks": app.transcript.turns.last().map_or(0, |turn| turn.blocks.len()),

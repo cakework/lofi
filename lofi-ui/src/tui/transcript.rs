@@ -8,6 +8,16 @@ use super::*;
 /// keeps swapping one turn for another.
 const MAX_WINDOW_MEASURE_PASSES: usize = 4;
 
+/// Compaction summary attached after a turn's committed byte range so the
+/// turn can release its uncompressed live blocks without losing the marker.
+#[derive(Debug, Clone)]
+pub(super) struct CompactionMarker {
+    pub(super) after_byte: u64,
+    pub(super) summarized: usize,
+    pub(super) kept: usize,
+    pub(super) summary: String,
+}
+
 /// Retains compressed, width-independent display models so scrolling back
 /// into a resumed transcript does not rescan its JSONL file. Successful
 /// native results are reduced to their collapsed previews before insertion;
@@ -17,9 +27,10 @@ const MAX_WINDOW_MEASURE_PASSES: usize = 4;
 /// parses without caching, so the cache stays proportional to what the user
 /// has actually looked at, not to the whole transcript.
 pub(super) struct CollapsedTurnCache {
-    pub(super) map: HashMap<usize, Box<[u8]>>,
-    /// LRU order: front is the least recently used turn index.
-    pub(super) order: VecDeque<usize>,
+    pub(super) map: HashMap<usize, (u64, Box<[u8]>)>,
+    /// Monotonic access-stamp index: smallest stamp is least recently used.
+    pub(super) order: std::collections::BTreeMap<u64, usize>,
+    next_stamp: u64,
     pub(super) retained_bytes: usize,
     pub(super) frame_hits: usize,
     pub(super) frame_misses: usize,
@@ -35,7 +46,8 @@ impl CollapsedTurnCache {
     pub(super) fn new() -> Self {
         Self {
             map: HashMap::new(),
-            order: VecDeque::new(),
+            order: std::collections::BTreeMap::new(),
+            next_stamp: 0,
             retained_bytes: 0,
             frame_hits: 0,
             frame_misses: 0,
@@ -44,21 +56,25 @@ impl CollapsedTurnCache {
     }
 
     pub(super) fn get(&mut self, idx: usize) -> Option<Arc<Turn>> {
-        let turn = self.map.get(&idx).and_then(|data| {
+        let mut hit_stamp = None;
+        let turn = self.map.get_mut(&idx).and_then(|(stamp, data)| {
             lz4_flex::decompress_size_prepended(data)
                 .ok()
                 .and_then(|json| serde_json::from_slice(&json).ok())
                 .map(|mut turn| {
                     assign_detail_ids(&mut turn, idx);
+                    let old = *stamp;
+                    let next = self.next_stamp;
+                    self.next_stamp = next.wrapping_add(1);
+                    *stamp = next;
+                    hit_stamp = Some((old, next));
                     Arc::new(turn)
                 })
         });
-        if turn.is_some() {
+        if let Some((old, next)) = hit_stamp {
             self.frame_hits += 1;
-            if let Some(pos) = self.order.iter().position(|entry| *entry == idx) {
-                self.order.remove(pos);
-            }
-            self.order.push_back(idx);
+            self.order.remove(&old);
+            self.order.insert(next, idx);
         } else {
             self.frame_misses += 1;
         }
@@ -87,31 +103,32 @@ impl CollapsedTurnCache {
         if bytes > Self::MAX_ENTRY_BYTES {
             return;
         }
+        let stamp = self.next_stamp;
+        self.next_stamp = stamp.wrapping_add(1);
         self.retained_bytes += bytes;
-        self.order.push_back(idx);
-        self.map.insert(idx, data);
+        self.order.insert(stamp, idx);
+        self.map.insert(idx, (stamp, data));
         while self.retained_bytes > Self::MAX_RETAINED_BYTES {
-            let Some(victim) = self.order.pop_front() else {
+            let Some((_, victim)) = self.order.pop_first() else {
                 break;
             };
-            if let Some(data) = self.map.remove(&victim) {
+            if let Some((_, data)) = self.map.remove(&victim) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(data.len());
             }
         }
     }
 
     pub(super) fn remove(&mut self, idx: usize) {
-        if let Some(data) = self.map.remove(&idx) {
+        if let Some((stamp, data)) = self.map.remove(&idx) {
             self.retained_bytes = self.retained_bytes.saturating_sub(data.len());
-            if let Some(pos) = self.order.iter().position(|entry| *entry == idx) {
-                self.order.remove(pos);
-            }
+            self.order.remove(&stamp);
         }
     }
 
     pub(super) fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.next_stamp = 0;
         self.retained_bytes = 0;
         self.reset_frame_profile();
     }
@@ -198,6 +215,7 @@ pub(super) struct Transcript {
     /// viewport, not the session length.
     pub(super) turn_byte_ranges: Vec<Option<(u64, u64)>>,
     pub(super) turn_event_offsets: Vec<Option<Vec<u64>>>,
+    pub(super) turn_compactions: Vec<Vec<CompactionMarker>>,
     pub(super) collapsed_turns: Box<RefCell<CollapsedTurnCache>>,
     /// Frozen turns whose blocks wait for the frame that renders them from
     /// memory. Dropping them at freeze time made that frame re-read the turn
@@ -246,6 +264,7 @@ impl Transcript {
             turns: Vec::new(),
             turn_byte_ranges: Vec::new(),
             turn_event_offsets: Vec::new(),
+            turn_compactions: Vec::new(),
             collapsed_turns: Box::new(RefCell::new(CollapsedTurnCache::new())),
             pending_release: Vec::new(),
             alert: RefCell::new(None),
@@ -287,17 +306,9 @@ impl Transcript {
             .turn_byte_ranges
             .get(previous)
             .is_some_and(Option::is_some)
+            && !self.turns[previous].blocks.is_empty()
         {
-            // A compaction marker lands after the turn's committed byte range,
-            // so re-materializing this turn from disk would drop it. Keep the
-            // live blocks that carry it; the turn then renders from memory.
-            let carries_marker = self.turns[previous]
-                .blocks
-                .iter()
-                .any(|block| matches!(block, Block::Compaction { .. }));
-            if !carries_marker && !self.turns[previous].blocks.is_empty() {
-                self.pending_release.push(previous);
-            }
+            self.pending_release.push(previous);
         }
     }
 
@@ -326,6 +337,9 @@ impl Transcript {
             return;
         }
         *range = Some(merged);
+        if let Some(markers) = self.turn_compactions.get_mut(idx) {
+            markers.retain(|marker| marker.after_byte >= merged.1);
+        }
         // The turn grew on disk. A materialization taken from the earlier,
         // shorter range holds only the rows committed by then, so a live turn
         // that had no blocks yet would keep rendering that stale shell.
@@ -336,6 +350,7 @@ impl Transcript {
         self.turns.push(turn);
         self.turn_byte_ranges.push(None);
         self.turn_event_offsets.push(None);
+        self.turn_compactions.push(Vec::new());
     }
 
     pub(super) fn insert_turn(&mut self, idx: usize, turn: Turn) {
@@ -344,6 +359,7 @@ impl Transcript {
         self.turns.insert(idx, turn);
         self.turn_byte_ranges.insert(idx, None);
         self.turn_event_offsets.insert(idx, None);
+        self.turn_compactions.insert(idx, Vec::new());
     }
 
     pub(super) fn restore_last_turn(
@@ -374,6 +390,7 @@ impl Transcript {
         self.pending_release.clear();
         self.turn_byte_ranges.clear();
         self.turn_event_offsets.clear();
+        self.turn_compactions.clear();
     }
 }
 
@@ -387,11 +404,11 @@ impl App {
         // Wholesale content replacement makes both the drawn scrollbar extent
         // and the viewport's content anchor meaningless: adopt the next
         // frame's.
-        self.scroll_gauge = None;
-        self.scroll_gauge_stamp = None;
-        self.view_anchor = None;
-        self.nav_anchor = None;
-        self.sel_anchor = None;
+        self.viewport.scroll_gauge = None;
+        self.viewport.scroll_gauge_stamp = None;
+        self.viewport.view_anchor = None;
+        self.viewport.nav_anchor = None;
+        self.viewport.sel_anchor = None;
     }
 
     /// Scrollbar geometry to draw: the offset and extent of the last frame
@@ -402,12 +419,14 @@ impl App {
     /// because that extent moved for real: holding it hid a submitted prompt
     /// from the thumb until the last estimate converged.
     pub(super) fn scrollbar_gauge(&mut self, off: usize, total: usize) -> (usize, usize) {
-        let stamp = (self.transcript.turns.len(), self.last_turn_height);
-        if self.scroll_gauge_stamp != Some(stamp) || self.layout.height_remeasure_from.is_none() {
-            self.scroll_gauge = Some((off, total));
-            self.scroll_gauge_stamp = Some(stamp);
+        let stamp = (self.transcript.turns.len(), self.viewport.last_turn_height);
+        if self.viewport.scroll_gauge_stamp != Some(stamp)
+            || self.layout.height_remeasure_from.is_none()
+        {
+            self.viewport.scroll_gauge = Some((off, total));
+            self.viewport.scroll_gauge_stamp = Some(stamp);
         }
-        self.scroll_gauge.unwrap_or((off, total))
+        self.viewport.scroll_gauge.unwrap_or((off, total))
     }
 
     pub(super) fn turn_has_expanded_detail(&self, idx: usize) -> bool {
@@ -954,6 +973,15 @@ impl Transcript {
             turns_from_session_events(&events)
         };
         let mut turn = turns.into_iter().next().unwrap_or(empty);
+        if let Some(markers) = self.turn_compactions.get(idx) {
+            for marker in markers {
+                turn.blocks.push(Block::Compaction {
+                    summarized: marker.summarized,
+                    kept: marker.kept,
+                    summary: marker.summary.clone(),
+                });
+            }
+        }
         assign_detail_ids(&mut turn, idx);
         Self::restore_result_availability(&mut turn, &available_exec_results);
         if !expanded {

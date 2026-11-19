@@ -183,9 +183,8 @@ pub(super) fn char_index_to_byte(s: &str, row: usize, col: usize) -> usize {
 
 /// Word-wrap a single logical line of input to `content_w` display cells,
 /// returning the char-index range `[start, end)` of each visual row. This is
-/// the shared core for [`App::input_select_rows`], [`count_wrapped_rows`],
-/// and [`wrap_cursor_pos`], which must agree so the cursor lands exactly
-/// where the text breaks.
+/// the shared core for [`App::prompt_layout`] and [`cursor_pos_in_ranges`],
+/// which must agree so the cursor lands exactly where the text breaks.
 pub(super) fn wrap_input_ranges(chars: &[char], content_w: usize) -> Vec<(usize, usize)> {
     let n = chars.len();
     if n == 0 || content_w == 0 {
@@ -228,22 +227,17 @@ pub(super) fn wrap_input_ranges(chars: &[char], content_w: usize) -> Vec<(usize,
     ranges
 }
 
-/// Number of select rows a single logical line occupies when soft-wrapped.
-/// Delegates to [`wrap_input_ranges`] so the count can never drift from the
-/// wrap loop the renderer uses.
-pub(super) fn count_wrapped_rows(line: &str, content_w: usize) -> usize {
-    let chars: Vec<char> = line.chars().collect();
-    wrap_input_ranges(&chars, content_w).len().max(1)
-}
-
-/// Map a cursor char column on a logical line to `(select_row, x)` by
-/// wrapping the *full* line with the same rules as the renderer. Wrapping
-/// the full line (not just the prefix before the cursor) is required
-/// because a word boundary can fall past the cursor: the cursor sitting on
-/// the first letter of a word that won't fit must already be on the next
-/// row, which a prefix-only wrap cannot know.
-pub(super) fn wrap_cursor_pos(line: &str, col: usize, content_w: usize) -> (usize, usize) {
-    let chars: Vec<char> = line.chars().collect();
+/// Map a cursor char column on a logical line to `(select_row, x)` using the
+/// full line's `ranges` produced by [`wrap_input_ranges`]. Wrapping the full
+/// line (not just the prefix before the cursor) is required because a word
+/// boundary can fall past the cursor: the cursor sitting on the first letter
+/// of a word that won't fit must already be on the next row.
+pub(super) fn cursor_pos_in_ranges(
+    chars: &[char],
+    ranges: &[(usize, usize)],
+    col: usize,
+    content_w: usize,
+) -> (usize, usize) {
     let n = chars.len();
     if content_w == 0 {
         let x = chars
@@ -254,7 +248,6 @@ pub(super) fn wrap_cursor_pos(line: &str, col: usize, content_w: usize) -> (usiz
             .sum();
         return (0, x);
     }
-    let ranges = wrap_input_ranges(&chars, content_w);
     for (sub, &(s, e)) in ranges.iter().enumerate() {
         // `col <= e` (not `<`) so a cursor at a row's right edge stays on
         // that row rather than jumping to the next; the next row begins at

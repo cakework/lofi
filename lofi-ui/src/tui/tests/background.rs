@@ -10,7 +10,10 @@ fn stale_job(id: u64, cmd: Option<&str>) -> lofi_core::session::replay::Outstand
 
 fn app_with_timers() -> App {
     let mut a = app();
-    a.timers = Some(lofi_core::TimerRegistry::new());
+    a.executor = Some(
+        lofi_core::agent::ToolExecutor::in_memory("/ws")
+            .with_timers(lofi_core::TimerRegistry::new()),
+    );
     a
 }
 
@@ -38,16 +41,13 @@ fn a_pending_timer_shows_a_row_above_the_input() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    a.timers
-        .as_ref()
-        .unwrap()
-        .restore(&[lofi_types::TimerRecord {
-            id: 3,
-            due_ms: now + 7 * 3_600_000,
-            every_ms: Some(12 * 3_600_000),
-            message: Some("stand up".to_string()),
-            owner: None,
-        }]);
+    a.timers().unwrap().restore(&[lofi_types::TimerRecord {
+        id: 3,
+        due_ms: now + 7 * 3_600_000,
+        every_ms: Some(12 * 3_600_000),
+        message: Some("stand up".to_string()),
+        owner: None,
+    }]);
     let screen = screen(&mut a);
     let rows: Vec<&str> = screen.lines().collect();
     let row = rows
@@ -68,17 +68,17 @@ fn the_dialog_opens_on_the_tab_its_command_names() {
     let mut a = app_with_timers();
     assert!(a.slash_command("/job"));
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Jobs)
     );
     assert!(a.slash_command("/subagent"));
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Subagents)
     );
     assert!(a.slash_command("/timer"));
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Timers)
     );
 }
@@ -90,23 +90,23 @@ fn tab_keys_cycle_and_numbers_jump() {
     let mut run = None;
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Jobs)
     );
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Timers)
     );
     // Wrapping past the last tab returns to the first.
     handle_event(&plain_key(KeyCode::Tab), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Subagents)
     );
     handle_event(&plain_key(KeyCode::Char('3')), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Timers)
     );
 }
@@ -114,7 +114,7 @@ fn tab_keys_cycle_and_numbers_jump() {
 #[test]
 fn j_and_k_move_the_row_and_leave_the_tab_alone() {
     let mut a = app_with_timers();
-    let timers = a.timers.clone().unwrap();
+    let timers = a.timers().unwrap();
     for _ in 0..3 {
         timers.schedule_every(None, std::time::Duration::from_mins(1), None);
     }
@@ -124,22 +124,18 @@ fn j_and_k_move_the_row_and_leave_the_tab_alone() {
     handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
     handle_event(&plain_key(KeyCode::Char('j')), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal
-            .as_ref()
-            .map(|modal| modal.timers.selected),
+        a.background_modal().map(|modal| modal.timers.selected),
         Some(2),
         "j walks down the rows"
     );
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Timers),
         "j must not jump to the jobs tab"
     );
     handle_event(&plain_key(KeyCode::Char('k')), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal
-            .as_ref()
-            .map(|modal| modal.timers.selected),
+        a.background_modal().map(|modal| modal.timers.selected),
         Some(1),
         "k walks back up"
     );
@@ -149,7 +145,7 @@ fn j_and_k_move_the_row_and_leave_the_tab_alone() {
 fn switching_tabs_keeps_each_tabs_selection() {
     let mut a = app_with_timers();
     a.open_background_modal(BackgroundTab::Timers);
-    let timers = a.timers.clone().unwrap();
+    let timers = a.timers().unwrap();
     for _ in 0..3 {
         timers.schedule_every(None, std::time::Duration::from_mins(1), None);
     }
@@ -158,26 +154,22 @@ fn switching_tabs_keeps_each_tabs_selection() {
     handle_event(&plain_key(KeyCode::Down), &mut a, None, &mut run);
     handle_event(&plain_key(KeyCode::Down), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal
-            .as_ref()
-            .map(|modal| modal.timers.selected),
+        a.background_modal().map(|modal| modal.timers.selected),
         Some(2)
     );
     // A digit jumps to its tab, and the row list keeps its own selection.
     handle_event(&plain_key(KeyCode::Char('2')), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.tab),
+        a.background_modal().map(|modal| modal.tab),
         Some(BackgroundTab::Jobs)
     );
     assert_eq!(
-        a.background_modal.as_ref().map(|modal| modal.jobs.selected),
+        a.background_modal().map(|modal| modal.jobs.selected),
         Some(0)
     );
     handle_event(&plain_key(KeyCode::Char('3')), &mut a, None, &mut run);
     assert_eq!(
-        a.background_modal
-            .as_ref()
-            .map(|modal| modal.timers.selected),
+        a.background_modal().map(|modal| modal.timers.selected),
         Some(2)
     );
 }
@@ -185,15 +177,14 @@ fn switching_tabs_keeps_each_tabs_selection() {
 #[test]
 fn x_stops_the_selected_timer_after_a_confirm() {
     let mut a = app_with_timers();
-    let timers = a.timers.clone().unwrap();
+    let timers = a.timers().unwrap();
     timers.schedule_every(None, std::time::Duration::from_mins(1), None);
     a.open_background_modal(BackgroundTab::Timers);
     a.refresh_background_modal();
     let mut run = None;
     handle_event(&plain_key(KeyCode::Char('x')), &mut a, None, &mut run);
     assert!(
-        a.background_modal
-            .as_ref()
+        a.background_modal()
             .is_some_and(|modal| modal.confirm.is_some()),
         "x arms a confirm"
     );
@@ -208,7 +199,7 @@ fn x_stops_the_selected_timer_after_a_confirm() {
 #[test]
 fn shift_x_asks_before_stopping_every_row_of_the_tab() {
     let mut a = app_with_timers();
-    let timers = a.timers.clone().unwrap();
+    let timers = a.timers().unwrap();
     timers.schedule_every(None, std::time::Duration::from_mins(1), None);
     timers.schedule_every(None, std::time::Duration::from_secs(90), None);
     a.open_background_modal(BackgroundTab::Timers);
@@ -226,16 +217,19 @@ fn ctrl_b_opens_the_dialog_only_on_an_empty_prompt() {
     let mut run = None;
     a.set_input("typing".to_string());
     handle_event(&ctrl_key(KeyCode::Char('b')), &mut a, None, &mut run);
-    assert!(a.background_modal.is_none(), "the readline binding keeps b");
+    assert!(
+        a.background_modal().is_none(),
+        "the readline binding keeps b"
+    );
     a.set_input(String::new());
     handle_event(&ctrl_key(KeyCode::Char('b')), &mut a, None, &mut run);
-    assert!(a.background_modal.is_some(), "ctrl+b opens the dialog");
+    assert!(a.background_modal().is_some(), "ctrl+b opens the dialog");
 }
 
 #[test]
 fn the_dialog_names_every_tab_and_lists_the_active_ones_rows() {
     let mut a = app_with_timers();
-    let timers = a.timers.clone().unwrap();
+    let timers = a.timers().unwrap();
     timers.schedule_at(
         None,
         std::time::SystemTime::now() + std::time::Duration::from_mins(2),
@@ -257,8 +251,7 @@ fn the_dialog_names_every_tab_and_lists_the_active_ones_rows() {
 #[test]
 fn an_empty_tab_says_so_while_the_others_keep_their_counts() {
     let mut a = app_with_timers();
-    a.timers
-        .as_ref()
+    a.timers()
         .unwrap()
         .schedule_every(None, std::time::Duration::from_mins(1), None);
     a.open_background_modal(BackgroundTab::Jobs);
@@ -301,7 +294,7 @@ fn a_changed_timer_set_reaches_the_transcript_once() {
     let path = session_file(&dir);
     let mut a = app_with_timers();
     a.session.cursor = Some(store::SessionCursor::new(path.clone(), None));
-    a.timers.as_ref().unwrap().schedule_at(
+    a.timers().unwrap().schedule_at(
         None,
         SystemTime::now() + Duration::from_mins(1),
         Some("check the build".into()),
@@ -324,16 +317,13 @@ fn a_repeating_timer_does_not_record_every_fire() {
     let path = session_file(&dir);
     let mut a = app_with_timers();
     a.session.cursor = Some(store::SessionCursor::new(path.clone(), None));
-    a.timers
-        .as_ref()
-        .unwrap()
-        .restore(&[lofi_types::TimerRecord {
-            id: 2,
-            due_ms: 1,
-            every_ms: Some(1_000),
-            message: Some("tick".into()),
-            owner: None,
-        }]);
+    a.timers().unwrap().restore(&[lofi_types::TimerRecord {
+        id: 2,
+        due_ms: 1,
+        every_ms: Some(1_000),
+        message: Some("tick".into()),
+        owner: None,
+    }]);
     a.record_timer_state();
     assert_eq!(
         a.take_timer_notices().len(),
@@ -396,7 +386,7 @@ fn a_failed_timer_record_is_retried() {
         dir.path().join("gone").join("session.jsonl"),
         None,
     ));
-    a.timers.as_ref().unwrap().schedule_at(
+    a.timers().unwrap().schedule_at(
         None,
         SystemTime::now() + Duration::from_mins(1),
         Some("wake".into()),
@@ -419,7 +409,7 @@ fn a_new_session_records_the_empty_set() {
     let path = session_file(&dir);
     let mut a = app_with_timers();
     a.session.cursor = Some(store::SessionCursor::new(path.clone(), None));
-    a.timers.as_ref().unwrap().schedule_at(
+    a.timers().unwrap().schedule_at(
         None,
         SystemTime::now() + Duration::from_mins(1),
         Some("wake".into()),
@@ -466,7 +456,7 @@ fn a_switch_adopts_the_recorded_work() {
     let snapshot = cursor.snapshot().unwrap();
     let mut a = app_with_timers();
     // A timer the outgoing session still held must not survive the switch.
-    a.timers.as_ref().unwrap().schedule_at(
+    a.timers().unwrap().schedule_at(
         None,
         std::time::SystemTime::now() + std::time::Duration::from_mins(1),
         Some("outgoing".into()),
@@ -476,11 +466,11 @@ fn a_switch_adopts_the_recorded_work() {
     assert_eq!(stale, vec![stale_job(9, Some("cargo watch"))]);
     assert_eq!(a.stale_jobs, stale);
     assert_eq!(
-        a.timers.as_ref().unwrap().records().len(),
+        a.timers().unwrap().records().len(),
         1,
         "a switch replaces the outgoing set instead of merging with it"
     );
-    assert_eq!(a.timers.as_ref().unwrap().listing()[0].id, 4);
+    assert_eq!(a.timers().unwrap().listing()[0].id, 4);
     assert_eq!(a.timers_recorded.len(), 1);
 }
 
@@ -511,7 +501,7 @@ fn a_branch_switch_restores_an_overdue_timer_as_recorded() {
 
     // A wake-up that came due while the other branch was showing was never
     // delivered, so selecting this branch owes it and restores it whole.
-    let timers = a.timers.as_ref().unwrap();
+    let timers = a.timers().unwrap();
     assert_eq!(timers.records(), vec![recorded.clone()], "restored as is");
     assert_eq!(
         a.timers_recorded,
@@ -722,7 +712,7 @@ fn a_new_session_reports_a_dropped_set_it_could_not_record() {
         dir.path().join("gone").join("session.jsonl"),
         None,
     ));
-    let timers = a.timers.as_ref().unwrap();
+    let timers = a.timers().unwrap();
     timers.schedule_at(
         None,
         SystemTime::now() + Duration::from_mins(1),
@@ -735,6 +725,6 @@ fn a_new_session_reports_a_dropped_set_it_could_not_record() {
     );
     // `/new` sheds the timers either way; the warning is the transcript's.
     a.reset_session_jobs();
-    assert!(a.timers.as_ref().unwrap().records().is_empty());
+    assert!(a.timers().unwrap().records().is_empty());
     assert!(a.timers_recorded.is_empty());
 }
