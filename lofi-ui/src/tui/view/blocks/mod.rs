@@ -158,6 +158,139 @@ pub fn render_turn_window(cx: &Cx, turn: &Turn, range: std::ops::Range<usize>) -
     turn_stack(turn).lines_window(cx, range)
 }
 
+pub(in crate::tui) fn render_prompt_lines(cx: &Cx, turn: &Turn) -> Vec<RenderLine> {
+    match turn.kind {
+        lofi_types::PromptKind::User | lofi_types::PromptKind::Task => UserMessage {
+            prompt: &turn.prompt,
+        }
+        .lines(cx),
+        lofi_types::PromptKind::Notice => NoticeMessage {
+            prompt: &turn.prompt,
+        }
+        .lines(cx),
+    }
+}
+
+pub(in crate::tui) fn render_prompt_height(cx: &Cx, turn: &Turn) -> usize {
+    match turn.kind {
+        lofi_types::PromptKind::User | lofi_types::PromptKind::Task => UserMessage {
+            prompt: &turn.prompt,
+        }
+        .height(cx),
+        lofi_types::PromptKind::Notice => NoticeMessage {
+            prompt: &turn.prompt,
+        }
+        .height(cx),
+    }
+}
+
+pub(in crate::tui) fn render_prompt_window(
+    cx: &Cx,
+    turn: &Turn,
+    range: std::ops::Range<usize>,
+) -> Vec<RenderLine> {
+    match turn.kind {
+        lofi_types::PromptKind::User | lofi_types::PromptKind::Task => UserMessage {
+            prompt: &turn.prompt,
+        }
+        .lines_window(cx, range),
+        lofi_types::PromptKind::Notice => NoticeMessage {
+            prompt: &turn.prompt,
+        }
+        .lines_window(cx, range),
+    }
+}
+
+pub(in crate::tui) fn render_single_block_lines(
+    cx: &Cx,
+    block: &Block,
+    has_fatal: bool,
+) -> Vec<RenderLine> {
+    with_block_component(block, has_fatal, |comp| comp.lines(cx))
+}
+
+pub(in crate::tui) fn render_single_block_height(cx: &Cx, block: &Block, has_fatal: bool) -> usize {
+    with_block_component(block, has_fatal, |comp| comp.height(cx))
+}
+
+pub(in crate::tui) fn render_single_block_window(
+    cx: &Cx,
+    block: &Block,
+    has_fatal: bool,
+    range: std::ops::Range<usize>,
+) -> Vec<RenderLine> {
+    with_block_component(block, has_fatal, |comp| comp.lines_window(cx, range))
+}
+
+fn with_block_component<R>(
+    block: &Block,
+    has_fatal: bool,
+    f: impl FnOnce(&dyn Component) -> R,
+) -> R {
+    match block {
+        Block::Text(text) => f(&AssistantText { text }),
+        Block::Thinking(tb) => f(&Thinking { block: tb }),
+        Block::Tool(tool) => {
+            if tool.name == "exec" {
+                f(&ExecBlock { tool })
+            } else {
+                f(&ToolLine { tool })
+            }
+        }
+        Block::UserShell {
+            id,
+            command,
+            output,
+            exit_code,
+            signal,
+            duration,
+            truncated,
+            cancelled,
+            running,
+            exclude_from_context,
+        } => f(&UserShellLine {
+            id: *id,
+            command,
+            output,
+            exit_code: *exit_code,
+            signal: *signal,
+            duration: *duration,
+            truncated: *truncated,
+            cancelled: *cancelled,
+            running: *running,
+            exclude_from_context: *exclude_from_context,
+        }),
+        Block::Error(msg) => f(&ErrorLine { msg }),
+        Block::TurnEnd { label, elapsed } => f(&TurnEnd {
+            label: label.clone(),
+            elapsed: *elapsed,
+        }),
+        Block::TurnFailed {
+            label,
+            elapsed,
+            error,
+        } => f(&TurnFailed {
+            label: label.clone(),
+            elapsed: *elapsed,
+            error: if has_fatal {
+                String::new()
+            } else {
+                error.clone()
+            },
+        }),
+        Block::TurnCancelled { label, elapsed } => f(&TurnCancelled {
+            label: label.clone(),
+            elapsed: *elapsed,
+        }),
+        Block::Compaction {
+            summarized, kept, ..
+        } => f(&CompactionLine {
+            summarized: *summarized,
+            kept: *kept,
+        }),
+    }
+}
+
 fn turn_stack(turn: &Turn) -> Stack<'_> {
     let mut stack = Stack::new();
     if !turn.prompt.is_empty() {

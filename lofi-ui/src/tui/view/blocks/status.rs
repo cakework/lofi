@@ -281,11 +281,15 @@ impl Component for UserShellLine<'_> {
             ));
         }
 
-        let lines = split_lines(self.output);
         let key = DetailKey::UserShell(self.id);
         let deco = vec![Span::raw("  "), Span::styled("  ", t.subtle_style())];
-        let total = detail_row_count(&lines, cx.width, &deco);
         let has_detail = !self.output.is_empty();
+        let expanded = has_detail && cx.app.expanded_details.contains_key(&key);
+        let lines = expanded.then(|| split_lines(self.output));
+        let total = lines.as_deref().map_or_else(
+            || super::detail::detail_str_row_count(self.output, cx.width, &deco),
+            |lines| detail_row_count(lines, cx.width, &deco),
+        );
         let status = if self.running {
             "Running".to_string()
         } else {
@@ -326,7 +330,7 @@ impl Component for UserShellLine<'_> {
             header = header.with_detail(key.clone(), total, true);
         }
         out.push(header);
-        if has_detail {
+        if let Some(lines) = lines {
             out.extend(detail_box(
                 &lines,
                 &key,

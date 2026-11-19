@@ -312,11 +312,11 @@ impl App {
         // content range so a soft-wrapped row yields its raw fragment.
         if let Some(rl) = self.viewport.log_vis.get(rel).and_then(|v| v.raw.as_ref()) {
             if rl.map.len() >= 2 {
-                let end = *rl.map.last()?;
+                let end = rl.map.last()?;
                 if rl.hard_break && end > 0 {
                     return Some(rl.source[..end].to_string());
                 }
-                let start = *rl.map.first()?;
+                let start = rl.map.first()?;
                 if start < end {
                     return Some(rl.source[start..end].to_string());
                 }

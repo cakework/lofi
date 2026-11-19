@@ -23,26 +23,42 @@ fn detail_visual_rows(lines: &[String], inner: usize) -> Vec<DetailVisualRow> {
             .count();
         let indent_chars = line[..indent_len].chars().count();
         let body = &line[indent_len..];
-        let body_offsets = std::iter::once(0)
-            .chain(body.char_indices().map(|(byte, c)| byte + c.len_utf8()))
-            .collect::<Vec<_>>();
+        let ascii_body = body.is_ascii();
+        let body_offsets = if ascii_body {
+            Vec::new()
+        } else {
+            std::iter::once(0)
+                .chain(body.char_indices().map(|(byte, c)| byte + c.len_utf8()))
+                .collect::<Vec<_>>()
+        };
         let segments = prim::wrap_pre(line, inner.max(1));
         let mut consumed = 0usize;
         for (index, segment) in segments.into_iter().enumerate() {
             let body_chars = segment.chars().count().saturating_sub(indent_chars);
-            let map = (0..=body_chars)
-                .map(|offset| {
-                    indent_len
-                        + body_offsets
-                            .get(consumed + offset)
-                            .copied()
-                            .unwrap_or(body.len())
-                })
-                .collect();
-            rows.push(DetailVisualRow {
-                text: segment,
-                raw: RawLine::new(source.clone(), map, index == 0),
-            });
+            let raw = if ascii_body && consumed + body_chars <= body.len() {
+                RawLine::linear(
+                    source.clone(),
+                    indent_len + consumed,
+                    body_chars,
+                    index == 0,
+                )
+            } else {
+                let map = (0..=body_chars)
+                    .map(|offset| {
+                        indent_len
+                            + if ascii_body {
+                                (consumed + offset).min(body.len())
+                            } else {
+                                body_offsets
+                                    .get(consumed + offset)
+                                    .copied()
+                                    .unwrap_or(body.len())
+                            }
+                    })
+                    .collect();
+                RawLine::new(source.clone(), map, index == 0)
+            };
+            rows.push(DetailVisualRow { text: segment, raw });
             consumed += body_chars;
         }
     }
@@ -50,8 +66,26 @@ fn detail_visual_rows(lines: &[String], inner: usize) -> Vec<DetailVisualRow> {
 }
 
 pub(super) fn detail_row_count(lines: &[String], width: usize, deco: &[Span<'static>]) -> usize {
-    let inner = width.saturating_sub(prim::span_width(deco) + 2);
-    detail_visual_rows(lines, inner).len()
+    if lines.is_empty() {
+        return 0;
+    }
+    let inner = width.saturating_sub(prim::span_width(deco) + 3).max(1);
+    lines
+        .iter()
+        .map(|line| prim::wrap_pre_count(line, inner))
+        .sum()
+}
+
+pub(super) fn detail_str_row_count(text: &str, width: usize, deco: &[Span<'static>]) -> usize {
+    let trimmed = text.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let inner = width.saturating_sub(prim::span_width(deco) + 3).max(1);
+    trimmed
+        .split('\n')
+        .map(|line| prim::wrap_pre_count(line, inner))
+        .sum()
 }
 
 pub(super) fn detail_box(

@@ -260,11 +260,11 @@ fn raw_map_snaps_to_markers_for_bold() {
         })
         .expect("a line with a raw map");
     let raw = rl.raw.as_ref().unwrap();
-    let start = *raw.map.first().unwrap();
-    let end = *raw.map.last().unwrap();
+    let start = raw.map.first().unwrap();
+    let end = raw.map.last().unwrap();
     assert_eq!(&raw.source[start..end], "**bold** text");
-    let s = raw.map[0];
-    let e = raw.map[4];
+    let s = raw.map.at(0);
+    let e = raw.map.at(4);
     assert_eq!(&raw.source[s..e], "**bold**");
 }
 

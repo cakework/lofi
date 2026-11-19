@@ -69,8 +69,10 @@ pub(super) fn abbrev_component(c: &str) -> String {
 /// Every path shown in the UI goes through this so home paths read the
 /// same everywhere.
 pub(super) fn tilde_path(path: &std::path::Path) -> String {
-    match dirs::home_dir() {
-        Some(h) if path.starts_with(&h) => match path.strip_prefix(&h) {
+    static HOME_DIR: std::sync::LazyLock<Option<std::path::PathBuf>> =
+        std::sync::LazyLock::new(dirs::home_dir);
+    match HOME_DIR.as_deref() {
+        Some(h) if path.starts_with(h) => match path.strip_prefix(h) {
             Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
             Ok(rest) => format!("~/{}", rest.to_string_lossy()),
             Err(_) => path.to_string_lossy().to_string(),

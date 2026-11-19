@@ -87,7 +87,7 @@ pub(super) fn render_table(
         // Border rows carry an empty-source raw so they are suppressed
         // in SELECT yank (no corresponding markdown source line).
         let mut rl = prim::render(lead_fn(r), vec![Span::styled(s, border)], pad.clone());
-        rl.raw = Some(RawLine::new(Arc::from(""), Vec::new(), true));
+        rl.raw = Some(RawLine::empty(Arc::from(""), true));
         rl
     };
 
@@ -103,14 +103,14 @@ pub(super) fn render_table(
     let mut hdr_rows = hdr_rows;
     if let Some(first) = hdr_rows.first_mut() {
         if let Some(src) = src_lines.first() {
-            first.raw = Some(RawLine::new(Arc::from(*src), Vec::new(), true));
+            first.raw = Some(RawLine::empty(Arc::from(*src), true));
         }
     }
     out.extend(hdr_rows);
     tr += hdr_len;
     let mut sep = border_row('├', '┼', '┤', tr);
     if let Some(src) = src_lines.get(1) {
-        sep.raw = Some(RawLine::new(Arc::from(*src), Vec::new(), true));
+        sep.raw = Some(RawLine::empty(Arc::from(*src), true));
     }
     out.push(sep);
     tr += 1;
@@ -122,7 +122,7 @@ pub(super) fn render_table(
         let mut rows = rows;
         if let Some(first) = rows.first_mut() {
             if let Some(src) = src_lines.get(2 + i) {
-                first.raw = Some(RawLine::new(Arc::from(*src), Vec::new(), true));
+                first.raw = Some(RawLine::empty(Arc::from(*src), true));
             }
         }
         out.extend(rows);

@@ -194,6 +194,67 @@ impl Component for Thinking<'_> {
             md
         }
     }
+
+    fn lines_window(&self, cx: &Cx, range: std::ops::Range<usize>) -> Vec<RenderLine> {
+        if range.start >= range.end {
+            return Vec::new();
+        }
+        let t = cx.theme;
+        let body = t.annotation_style();
+        let content_w = cx.width.saturating_sub(2);
+        let text = trim_reasoning_summary(&self.block.text);
+        let working = self.block.elapsed.is_none() && cx.active_turn;
+        if text.is_empty() && !working {
+            return Vec::new();
+        }
+        let md_h = if text.is_empty() {
+            0
+        } else {
+            markdown_body_height(&text, content_w)
+        };
+        let mut out = if range.start < md_h {
+            render_markdown_body_window(
+                &text,
+                t,
+                cx.width,
+                content_w,
+                body,
+                |_| vec![Span::raw("  ")],
+                range.start..range.end.min(md_h),
+            )
+        } else {
+            Vec::new()
+        };
+        let footer = if working {
+            Some(prim::rline(
+                vec![Span::raw("  ")],
+                vec![Span::styled("Thinking...", body)],
+            ))
+        } else {
+            self.block.elapsed.filter(|d| !d.is_zero()).map(|d| {
+                prim::rline(
+                    vec![Span::raw("  "), Span::styled("◇ ", t.subtle_style())],
+                    vec![Span::styled(
+                        format!("Thought for {}", prim::fmt_duration(d)),
+                        t.subtle_style(),
+                    )],
+                )
+            })
+        };
+        if let Some(footer_line) = footer {
+            let mut pos = md_h;
+            if md_h > 0 {
+                if range.contains(&pos) {
+                    out.push(prim::rblank());
+                }
+                pos += 1;
+            }
+            if range.contains(&pos) {
+                out.push(footer_line);
+            }
+        }
+        out
+    }
 }
 
 /// Remove standalone empty reasoning-summary parts from display. `OpenAI` uses

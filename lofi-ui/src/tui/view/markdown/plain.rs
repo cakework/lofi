@@ -75,21 +75,22 @@ pub(super) fn render_plain_paragraph_window(
     let mut out = Vec::with_capacity(range.end.saturating_sub(range.start).min(256));
     for_each_plain_row(text, content_w, |start, end| {
         if range.contains(&row) {
-            let source: Arc<str> = Arc::from(&text[start..end]);
-            let display_len = text[start..end].chars().count();
-            let map = if source.is_ascii() {
-                (0..=display_len).collect()
+            let slice = &text[start..end];
+            let source: Arc<str> = Arc::from(slice);
+            let raw = if slice.is_ascii() {
+                RawLine::linear(source, 0, slice.len(), row == 0)
             } else {
-                std::iter::once(0)
+                let map = std::iter::once(0)
                     .chain(source.char_indices().map(|(byte, ch)| byte + ch.len_utf8()))
-                    .collect()
+                    .collect();
+                RawLine::new(source, map, row == 0)
             };
             out.push(
                 prim::rline(
                     lead_fn(row),
-                    vec![Span::styled(text[start..end].to_string(), base_style)],
+                    vec![Span::styled(slice.to_string(), base_style)],
                 )
-                .with_raw(RawLine::new(source, map, row == 0)),
+                .with_raw(raw),
             );
         }
         row += 1;

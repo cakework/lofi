@@ -19,7 +19,7 @@ pub(crate) mod blocks;
 pub(crate) mod component;
 mod markdown;
 mod modals;
-mod prim;
+pub(super) mod prim;
 use modals::{
     render_background_modal, render_confirm_modal, render_info_modal, render_model_picker,
     render_paths_picker, render_picker, render_policy_picker, render_service_picker,
@@ -125,7 +125,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         render_log(f, r, app);
     }
     if let Some(r) = rects[4] {
-        paint_work_block(f, r, &block);
+        paint_work_block(f, r, block);
     }
     if let Some(r) = rects[6] {
         render_footer_block(f, r, app);
@@ -174,9 +174,9 @@ fn work_block(app: &App, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn paint_work_block(f: &mut Frame, area: Rect, block: &[Line<'static>]) {
+fn paint_work_block(f: &mut Frame, area: Rect, block: Vec<Line<'static>>) {
     let content = prim::scroll_area(area).content;
-    f.render_widget(Paragraph::new(block.to_vec()), content);
+    f.render_widget(Paragraph::new(block), content);
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
@@ -280,18 +280,7 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
     let live_idx = n_turns.saturating_sub(1);
     let phase_started = std::time::Instant::now();
     let last_h = if has_live_turn {
-        let cx = component::Cx {
-            app,
-            theme,
-            width: w,
-            active_turn: running,
-        };
-        if app.needs_durable_materialize(live_idx) {
-            let turn = app.materialize_turn(live_idx);
-            blocks::render_turn_height(&cx, &turn)
-        } else {
-            blocks::render_turn_height(&cx, &app.transcript.turns[live_idx])
-        }
+        app.live_turn_height(live_idx, w, running)
     } else {
         0
     };
@@ -522,23 +511,8 @@ fn render_log(f: &mut Frame, area: Rect, app: &mut App) {
                 } else {
                     let start = off.saturating_sub(turn_start);
                     let stop = start.saturating_add(want).min(last_h);
-                    let cx = component::Cx {
-                        app,
-                        theme,
-                        width: w,
-                        active_turn: running,
-                    };
                     let phase_started = std::time::Instant::now();
-                    let lines = if app.needs_durable_materialize(live_idx) {
-                        let turn = app.materialize_turn(live_idx);
-                        blocks::render_turn_window(&cx, &turn, start..stop)
-                    } else {
-                        blocks::render_turn_window(
-                            &cx,
-                            &app.transcript.turns[live_idx],
-                            start..stop,
-                        )
-                    };
+                    let lines = app.live_turn_window(live_idx, w, running, start..stop);
                     app.render_profile.live_window_us += phase_started.elapsed().as_micros();
                     pos = turn_start + start;
                     feed_segment(

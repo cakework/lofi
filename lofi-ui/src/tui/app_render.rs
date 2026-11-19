@@ -35,13 +35,9 @@ impl App {
     /// token-io counts.
     pub(crate) fn render_footer_left(&self, width: usize) -> Line<'static> {
         let t = self.theme;
-        let usage = [
-            self.footer_left_segments(true, true),
-            self.footer_left_segments(false, true),
-            self.footer_left_segments(false, false),
-        ];
-        let segments = usage
+        let segments = [(true, true), (false, true), (false, false)]
             .into_iter()
+            .map(|(labels, io)| self.footer_left_segments(labels, io))
             .find(|segments| footer_segments_width(segments) <= width)
             .unwrap_or_default();
         Line::from(Span::styled(segments.join(" · "), t.muted_style()))

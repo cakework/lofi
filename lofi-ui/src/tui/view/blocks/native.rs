@@ -895,34 +895,7 @@ fn native_header_suffix(name: &str, result: Option<&str>) -> Option<String> {
             None => format!("({status})"),
         });
     }
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    match name {
-        "read" | "view" | "bash_read" => {
-            let start = v.get("start_line").and_then(serde_json::Value::as_u64)?;
-            if start == 0 {
-                return None;
-            }
-            let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
-            let count = content.split('\n').count();
-            if count == 0 {
-                return None;
-            }
-            let end = start + count as u64 - 1;
-            if end <= start {
-                return None;
-            }
-            Some(format!("(lines {start}-{end})"))
-        }
-        "bash" => {
-            let ms = v.get("duration_ms").and_then(serde_json::Value::as_u64)?;
-            if ms == 0 {
-                return None;
-            }
-            let dur = std::time::Duration::from_millis(ms);
-            Some(format!("(took {})", prim::fmt_duration(dur)))
-        }
-        _ => None,
-    }
+    None
 }
 
 /// One mailbox message as a preview line: `from: first body line`.

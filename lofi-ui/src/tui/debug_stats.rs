@@ -163,6 +163,9 @@ impl App {
         draw_us: u128,
         render_us: u128,
     ) {
+        if self.debug.is_none() {
+            return;
+        }
         let sample = RenderTimingSample {
             frame_width,
             frame_height,
@@ -213,22 +216,17 @@ impl App {
                 .iter()
                 .map(turn_heap_bytes)
                 .sum::<usize>();
-        let render_cache_bytes = self.layout.frozen_render.order.capacity() * size_of::<usize>()
-            + self
-                .layout
-                .frozen_render
-                .map
-                .values()
-                .map(|lines| {
-                    lines.capacity() * size_of::<view::RenderLine>()
-                        + lines.iter().map(render_line_heap_bytes).sum::<usize>()
-                })
-                .sum::<usize>();
+        let render_cache_bytes = self.render_cache_heap_bytes();
         let collapsed_turn_cache = self.transcript.collapsed_turns.borrow();
         let collapsed_turn_cache_bytes = collapsed_turn_cache.retained_bytes
             + collapsed_turn_cache.map.capacity()
                 * (size_of::<usize>() + size_of::<(u64, Box<[u8]>)>())
-            + collapsed_turn_cache.order.len() * size_of::<(u64, usize)>();
+            + collapsed_turn_cache.order.len() * size_of::<(u64, usize)>()
+            + collapsed_turn_cache
+                .hot
+                .iter()
+                .map(|(_, turn)| turn_heap_bytes(turn))
+                .sum::<usize>();
         let visible_log_bytes = self.viewport.log_vis.capacity() * size_of::<view::VisLine>()
             + self
                 .viewport
@@ -288,6 +286,49 @@ impl App {
             "indexes_bytes": index_bytes,
             "estimated_total_bytes": estimated_total,
         })
+    }
+
+    fn render_cache_heap_bytes(&self) -> usize {
+        let render_lines_bytes = |lines: &Vec<view::RenderLine>| {
+            lines.capacity() * size_of::<view::RenderLine>()
+                + lines.iter().map(render_line_heap_bytes).sum::<usize>()
+        };
+        let live_child_bytes = |child: &transcript::CachedLiveChild| {
+            child.lines.as_ref().map_or(0, render_lines_bytes)
+                + child
+                    .window
+                    .as_ref()
+                    .map_or(0, |(_, _, lines)| render_lines_bytes(lines))
+        };
+        self.layout.frozen_render.order.capacity() * size_of::<usize>()
+            + self
+                .layout
+                .frozen_render
+                .map
+                .values()
+                .map(render_lines_bytes)
+                .sum::<usize>()
+            + self
+                .layout
+                .frozen_render
+                .windows
+                .values()
+                .map(|(_, lines)| render_lines_bytes(lines))
+                .sum::<usize>()
+            + self.layout.live_render.blocks.capacity() * size_of::<transcript::CachedLiveChild>()
+            + self
+                .layout
+                .live_render
+                .prompt
+                .as_ref()
+                .map_or(0, live_child_bytes)
+            + self
+                .layout
+                .live_render
+                .blocks
+                .iter()
+                .map(live_child_bytes)
+                .sum::<usize>()
     }
 }
 
@@ -674,14 +715,19 @@ fn block_heap_bytes(block: &Block) -> usize {
 }
 
 fn render_line_heap_bytes(line: &view::RenderLine) -> usize {
-    line.line
+    let spans_heap: usize = line
+        .line
         .spans
         .iter()
         .map(|span| match &span.content {
             std::borrow::Cow::Owned(text) => text.capacity(),
             std::borrow::Cow::Borrowed(_) => 0,
         })
-        .sum()
+        .sum();
+    line.line.spans.capacity() * size_of::<Span<'static>>()
+        + spans_heap
+        + line.links.capacity() * size_of::<view::prim::Hyperlink>()
+        + line.raw.as_ref().map_or(0, view::RawLine::heap_bytes)
 }
 
 fn mapping_json(mapping: &MappingMemory) -> serde_json::Value {

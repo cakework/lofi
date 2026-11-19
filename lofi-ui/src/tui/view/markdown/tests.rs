@@ -34,7 +34,7 @@ fn raw_map_stays_monotonic_across_formatting_runs() {
     for line in &lines {
         if let Some(raw) = &line.raw {
             assert!(
-                raw.map.windows(2).all(|w| w[0] <= w[1]),
+                raw.map.is_monotonic(),
                 "raw map must be monotonic: {:?}",
                 raw.map
             );

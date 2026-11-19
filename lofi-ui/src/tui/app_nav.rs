@@ -1196,9 +1196,9 @@ impl App {
                         let start = if start_rel == 0 && rl.hard_break {
                             0
                         } else {
-                            rl.map[start_rel]
+                            rl.map.at(start_rel)
                         };
-                        let end = rl.map[end_rel];
+                        let end = rl.map.at(end_rel);
                         let cont = !rl.hard_break && prev_src.is_some();
                         if !cont && !out.is_empty() {
                             out.push('\n');

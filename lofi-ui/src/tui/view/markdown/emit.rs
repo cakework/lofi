@@ -25,9 +25,10 @@ pub(super) fn emit_blank(
     out.push(RenderLine {
         line: Line::from(lead),
         content: (deco_len, deco_len),
-        raw: Some(RawLine::new(
+        raw: Some(RawLine::two_point(
             Arc::from(raw_src),
-            vec![0, raw_src.len()],
+            0,
+            raw_src.len(),
             true,
         )),
         links: Vec::new(),
@@ -84,28 +85,42 @@ pub(super) fn emit_code(
             .take_while(|&b| b == b' ' || b == b'\t')
             .count();
         let body = &line_text[indent_len..];
+        let indent_chars = line_text[..indent_len].chars().count();
+        let segments = prim::wrap_pre(line_text, avail);
+        let ascii_body = body.is_ascii();
         // Byte offsets of every char boundary within `body`, including the end.
         // Indexing past the recorded boundary (a wrap segment wider than the
         // remaining body) clamps to `body.len()`, a valid boundary, so the map
         // never yields a mid-UTF8 or out-of-range source offset.
-        let body_offs: Vec<usize> = std::iter::once(0)
-            .chain(body.char_indices().map(|(b, c)| b + c.len_utf8()))
-            .collect();
-        let indent_chars = line_text[..indent_len].chars().count();
-        let segments = prim::wrap_pre(line_text, avail);
+        let body_offs: Vec<usize> = if ascii_body {
+            Vec::new()
+        } else {
+            std::iter::once(0)
+                .chain(body.char_indices().map(|(b, c)| b + c.len_utf8()))
+                .collect()
+        };
         let mut cum = 0usize;
         for (i, seg) in segments.into_iter().enumerate() {
             let body_chars = seg.chars().count().saturating_sub(indent_chars);
-            let map: Vec<usize> = (0..=body_chars)
-                .map(|k| {
-                    let byte = body_offs
-                        .get(cum + k)
-                        .copied()
-                        .unwrap_or(body.len())
-                        .min(body.len());
-                    indent_len + byte
-                })
-                .collect();
+            let raw = if ascii_body && cum + body_chars <= body.len() {
+                RawLine::linear(src.clone(), indent_len + cum, body_chars, i == 0)
+            } else {
+                let map: Vec<usize> = (0..=body_chars)
+                    .map(|k| {
+                        let byte = if ascii_body {
+                            (cum + k).min(body.len())
+                        } else {
+                            body_offs
+                                .get(cum + k)
+                                .copied()
+                                .unwrap_or(body.len())
+                                .min(body.len())
+                        };
+                        indent_len + byte
+                    })
+                    .collect();
+                RawLine::new(src.clone(), map, i == 0)
+            };
             out.push(
                 prim::rtile(
                     lead_fn(*row),
@@ -113,7 +128,7 @@ pub(super) fn emit_code(
                     t.surface,
                     w,
                 )
-                .with_raw(RawLine::new(src.clone(), map, i == 0)),
+                .with_raw(raw),
             );
             *row += 1;
             cum += body_chars;
@@ -239,7 +254,7 @@ pub(super) fn emit_quote(
         if ql.spans.is_empty() {
             // Bare `>` line: just the bar with a thin-space content span so
             // selection yanks the raw `>` markdown.
-            let map = vec![0, src_arc.len()];
+            let end = src_arc.len();
             let mut lead = lead_fn(*row);
             lead.push(bar.clone());
             let deco_len: usize = lead.iter().map(|s| s.content.chars().count()).sum();
@@ -250,7 +265,7 @@ pub(super) fn emit_quote(
             out.push(RenderLine {
                 line: Line::from(all),
                 content: (deco_len, deco_len + content_len),
-                raw: Some(RawLine::new(src_arc, map, true)),
+                raw: Some(RawLine::two_point(src_arc, 0, end, true)),
                 links: Vec::new(),
                 detail: None,
             });

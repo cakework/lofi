@@ -334,16 +334,46 @@ fn wrapped(sequence: &str) -> String {
     format!("\x1bPtmux;{payload}\x1b\\")
 }
 
+#[derive(PartialEq, Eq)]
+struct ReportKey {
+    phase: Phase,
+    kind: Option<String>,
+    title: Option<String>,
+    msg: Option<String>,
+}
+
+impl ReportKey {
+    fn matches(&self, report: &Report<'_>) -> bool {
+        self.phase == report.phase
+            && self.kind.as_deref() == report.kind
+            && self.title.as_deref() == report.title
+            && self.msg.as_deref() == report.msg.as_deref()
+    }
+
+    fn from_report(report: &Report<'_>) -> Self {
+        Self {
+            phase: report.phase,
+            kind: report.kind.map(str::to_owned),
+            title: report.title.map(str::to_owned),
+            msg: report.msg.as_deref().map(str::to_owned),
+        }
+    }
+}
+
 /// Reports each record change to the terminal: the root record, then the
 /// children that hang below it.
 pub(crate) struct ProgramStatus {
+    /// Last input key that produced a valid root report, avoiding repeated
+    /// base64 encoding when nothing changed.
+    last_key: Option<ReportKey>,
     /// The last sequence written for the root. Two reports can share a state
     /// and still change the record — a second command that waits for approval,
     /// a retried attempt — so the comparison covers the whole sequence.
     last: Option<String>,
-    /// The child records the terminal holds, by id. Nothing replaces a child
-    /// that stops running, so the set is compared and cleared by name.
-    held: BTreeMap<String, String>,
+    /// The child records the terminal holds, by id (`(title, sequence)`).
+    /// Nothing replaces a child that stops running, so the set is compared and
+    /// cleared by name.
+    held: BTreeMap<String, (String, String)>,
     /// A redirected stdout gets no report: print mode and piped output stay
     /// clean, and an escape sequence written to a file is only noise.
     enabled: bool,
@@ -354,6 +384,7 @@ pub(crate) struct ProgramStatus {
 impl ProgramStatus {
     pub(crate) fn new() -> Self {
         Self {
+            last_key: None,
             last: None,
             held: BTreeMap::new(),
             enabled: io::stdout().is_terminal(),
@@ -378,10 +409,17 @@ impl ProgramStatus {
     /// still leaves the next comparison honest.
     fn sequences(&mut self, report: &Report<'_>, children: &[Child]) -> String {
         let mut batch = String::new();
-        if let Some(sequence) = encode(report) {
-            if self.last.as_deref() != Some(sequence.as_str()) {
-                self.push(&mut batch, &sequence);
-                self.last = Some(sequence);
+        if !self
+            .last_key
+            .as_ref()
+            .is_some_and(|key| key.matches(report))
+        {
+            if let Some(sequence) = encode(report) {
+                if self.last.as_deref() != Some(sequence.as_str()) {
+                    self.push(&mut batch, &sequence);
+                    self.last = Some(sequence);
+                }
+                self.last_key = Some(ReportKey::from_report(report));
             }
         }
         let live: Vec<&str> = children.iter().map(|child| child.id.as_str()).collect();
@@ -396,12 +434,20 @@ impl ProgramStatus {
             self.held.remove(&id);
         }
         for child in children {
+            if self
+                .held
+                .get(&child.id)
+                .is_some_and(|(prev_title, _)| prev_title == &child.title)
+            {
+                continue;
+            }
             let Some(sequence) = encode_child(child) else {
                 continue;
             };
-            if self.held.get(&child.id).map(String::as_str) != Some(sequence.as_str()) {
+            if self.held.get(&child.id).map(|(_, seq)| seq.as_str()) != Some(sequence.as_str()) {
                 self.push(&mut batch, &sequence);
-                self.held.insert(child.id.clone(), sequence);
+                self.held
+                    .insert(child.id.clone(), (child.title.clone(), sequence));
             }
         }
         batch
@@ -648,6 +694,7 @@ mod tests {
         // keeps the state and changes the record. Comparing states alone
         // would leave the first command on screen.
         let mut status = ProgramStatus {
+            last_key: None,
             last: None,
             held: BTreeMap::new(),
             enabled: false,
@@ -781,6 +828,7 @@ mod tests {
         // Nothing replaces a child that stops running, so the only way the
         // terminal learns it is gone is a clear by id.
         let mut status = ProgramStatus {
+            last_key: None,
             last: None,
             held: BTreeMap::new(),
             enabled: false,

@@ -12,7 +12,9 @@ impl App {
             self.theme = next;
             self.layout.frozen_render.clear();
         }
-        self.debug_sample(&format!("theme:{event:?}"));
+        if self.debug.is_some() {
+            self.debug_sample(&format!("theme:{event:?}"));
+        }
         changed
     }
 }

@@ -4,7 +4,7 @@ use ratatui::text::Span;
 use crate::tui::theme::active_indicator;
 use crate::tui::{DetailKey, ResultAvailability, ToolCall};
 
-use super::detail::{detail_box, detail_row_count};
+use super::detail::{detail_box, detail_row_count, detail_str_row_count};
 use super::native::{split_lines, ExecBlockBranch};
 use super::RenderWindow;
 use crate::tui::view::component::{Component, Cx};
@@ -134,10 +134,14 @@ fn exec_result_lines(tool: &ToolCall, cx: &Cx) -> Vec<RenderLine> {
         .as_deref()
         .map(|result| lofi_core::exec_result_display(result, tool.is_error))
         .unwrap_or_default();
-    let lines = split_lines(&display);
     let key = DetailKey::ExecResult(tool.detail_id);
     let deco = vec![Span::raw("  "), Span::raw("  "), Span::raw("  ")];
-    let total = detail_row_count(&lines, cx.width, &deco);
+    let expanded = cx.app.expanded_details.contains_key(&key);
+    let lines = expanded.then(|| split_lines(&display));
+    let total = lines.as_deref().map_or_else(
+        || detail_str_row_count(&display, cx.width, &deco),
+        |lines| detail_row_count(lines, cx.width, &deco),
+    );
     let has_detail =
         matches!(tool.result_availability, ResultAvailability::Available) || !display.is_empty();
     let mut header = prim::rline(
@@ -152,7 +156,7 @@ fn exec_result_lines(tool: &ToolCall, cx: &Cx) -> Vec<RenderLine> {
         header = header.with_detail(key.clone(), total, true);
     }
     let mut out = vec![header];
-    if has_detail {
+    if let Some(lines) = lines.filter(|_| has_detail) {
         out.extend(detail_box(
             &lines,
             &key,

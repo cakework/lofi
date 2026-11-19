@@ -15,6 +15,7 @@ fn split_thinking_suffix(query: &str) -> (&str, Option<ThinkingLevel>) {
 
 /// How many events one wake drains before it yields to the select loop.
 pub(super) const RUN_BATCH: usize = 64;
+const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Dispatch at most `RUN_BATCH` events, the one that woke the loop included.
 /// Returns the last outcome the batch ended a run with, or `None` when none
@@ -453,6 +454,9 @@ pub(crate) async fn run_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(TICK_MS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dirty = true;
+    let mut status_dirty = true;
+    let mut last_draw_at: Option<Instant> = None;
+    let mut stream_redraw_deadline: Option<tokio::time::Instant> = None;
     let mut resize = Box::<ResizeState>::default();
     // What the last drawn frame showed: a running background subagent's
     // line must leave the screen even when the settled run published no
@@ -465,12 +469,14 @@ pub(crate) async fn run_loop(
     // of the last frame against the registry to take the stale one off.
     let mut jobs_shown = false;
     loop {
-        if dirty && resize.deadline.is_none() {
+        status_dirty |= dirty;
+        if dirty && resize.deadline.is_none() && stream_redraw_deadline.is_none() {
             // Bracket the draw: a run that starts or settles while the
             // frame builds must still count as shown, or its status line
             // could stay on screen forever.
             let running_before = app.has_running_subagents();
             guard.draw(&mut app, resize.events, resize.started, resize.last)?;
+            last_draw_at = Some(Instant::now());
             subagents_shown = running_before || app.has_running_subagents();
             if resize.deadline.is_none() {
                 resize.started = None;
@@ -486,6 +492,7 @@ pub(crate) async fn run_loop(
             } else {
                 false
             };
+            status_dirty |= dirty;
         }
 
         tokio::select! {
@@ -495,44 +502,93 @@ pub(crate) async fn run_loop(
                     None => std::future::pending::<Option<AgentEvent>>().await,
                 }
             } => {
-                match ev {
-                    Some(e) => {
-                        app.run_event_at = Some(Instant::now());
-                        if let Some(run) = current_run.as_ref() {
-                            attach_run_cursor(&mut app, run);
-                        }
-                        if let Some(s) = drain_run_batch(&mut app, e, || {
-                            current_run
-                                .as_mut()
-                                .and_then(|run| run.rx.try_recv().ok())
-                        }) {
-                            settled = s;
-                        }
-                        // If there's a queued prompt, signal the agent to
-                        // exit its round loop after the current round so the
-                        // queued prompt is sent at the earliest opportunity.
-                        // The flag is only checked between rounds (after tool
-                        // results are in hand), so setting it during streaming
-                        // or tool execution is safe.
-                        if !app.prompt_queue.is_empty() {
-                            if let Some(r) = &current_run {
-                                r.preempt.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
+                if let Some(e) = ev {
+                    app.run_event_at = Some(Instant::now());
+                    if let Some(run) = current_run.as_ref() {
+                        attach_run_cursor(&mut app, run);
+                    }
+                    let batch_settled = drain_run_batch(&mut app, e, || {
+                        current_run
+                            .as_mut()
+                            .and_then(|run| run.rx.try_recv().ok())
+                    });
+                    if let Some(s) = batch_settled {
+                        settled = s;
+                        stream_redraw_deadline = None;
+                    } else if last_draw_at
+                        .is_some_and(|at| at.elapsed() < STREAM_FRAME_INTERVAL)
+                        && stream_redraw_deadline.is_none()
+                    {
+                        stream_redraw_deadline =
+                            Some(tokio::time::Instant::now() + STREAM_FRAME_INTERVAL);
+                    }
+                    // If there's a queued prompt, signal the agent to
+                    // exit its round loop after the current round so the
+                    // queued prompt is sent at the earliest opportunity.
+                    // The flag is only checked between rounds (after tool
+                    // results are in hand), so setting it during streaming
+                    // or tool execution is safe.
+                    if !app.prompt_queue.is_empty() {
+                        if let Some(r) = &current_run {
+                            r.preempt.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    None => {
-                        if let Some(r) = current_run.take() {
-                            attach_run_cursor(&mut app, &r);
-                            let was_user_shell = r.user_shell.is_some();
-                            if let Err(error) = r.handle.await {
-                                let text = format!("run task failed: {error}");
-                                app.apply_event(AgentEvent::Error(text.clone()));
-                                settled = program_status::Settled::failed(text);
-                            }
-                            app.run_finished();
-                            app.debug_sample(if was_user_shell { "user_shell_settled" } else { "agent_settled" });
-                            if !app.should_quit {
-                                if was_user_shell {
+                } else {
+                    stream_redraw_deadline = None;
+                    if let Some(r) = current_run.take() {
+                        attach_run_cursor(&mut app, &r);
+                        let was_user_shell = r.user_shell.is_some();
+                        if let Err(error) = r.handle.await {
+                            let text = format!("run task failed: {error}");
+                            app.apply_event(AgentEvent::Error(text.clone()));
+                            settled = program_status::Settled::failed(text);
+                        }
+                        app.run_finished();
+                        app.debug_sample(if was_user_shell { "user_shell_settled" } else { "agent_settled" });
+                        if !app.should_quit {
+                            if was_user_shell {
+                                if let Some(queued) = app.prompt_queue.first().cloned() {
+                                    app.prompt_queue.remove(0);
+                                    spawn_prompt(
+                                        &mut app,
+                                        agent.as_ref(),
+                                        &mut current_run,
+                                        queued.text,
+                                        queued.kind,
+                                    );
+                                }
+                            } else if let Some(resume) = app.context_pressure.take() {
+                                // Core owns hard-cap eligibility and
+                                // compaction; the UI only presents its outcome.
+                                // A turn that stopped on its own is not
+                                // resumed: the compaction only keeps the
+                                // round it stopped on out of the next prompt.
+                                app.continue_after_hard_compact = resume;
+                                if let Some(outcome) = app.hard_compact() {
+                                    app.continue_after_hard_compact = false;
+                                    match outcome {
+                                        HardCompactOutcome::Compacted(_) => {
+                                            if resume {
+                                                spawn_continue(
+                                                    &mut app,
+                                                    agent.as_ref(),
+                                                    &mut current_run,
+                                                );
+                                            }
+                                        }
+                                        HardCompactOutcome::Cooldown => app.notify(
+                                            NotifyKind::Warn,
+                                            "context exceeded the hard cap too soon after a compaction; cannot continue",
+                                        ),
+                                        HardCompactOutcome::NotEnoughHistory => app.notify(
+                                            NotifyKind::Warn,
+                                            "could not compact at the hard cap; cannot continue",
+                                        ),
+                                    }
+                                }
+                            } else {
+                                app.maybe_auto_compact();
+                                if !app.lifecycle_busy && app.run.is_none() {
                                     if let Some(queued) = app.prompt_queue.first().cloned() {
                                         app.prompt_queue.remove(0);
                                         spawn_prompt(
@@ -542,49 +598,6 @@ pub(crate) async fn run_loop(
                                             queued.text,
                                             queued.kind,
                                         );
-                                    }
-                                } else if let Some(resume) = app.context_pressure.take() {
-                                    // Core owns hard-cap eligibility and
-                                    // compaction; the UI only presents its outcome.
-                                    // A turn that stopped on its own is not
-                                    // resumed: the compaction only keeps the
-                                    // round it stopped on out of the next prompt.
-                                    app.continue_after_hard_compact = resume;
-                                    if let Some(outcome) = app.hard_compact() {
-                                        app.continue_after_hard_compact = false;
-                                        match outcome {
-                                            HardCompactOutcome::Compacted(_) => {
-                                                if resume {
-                                                    spawn_continue(
-                                                        &mut app,
-                                                        agent.as_ref(),
-                                                        &mut current_run,
-                                                    );
-                                                }
-                                            }
-                                            HardCompactOutcome::Cooldown => app.notify(
-                                                NotifyKind::Warn,
-                                                "context exceeded the hard cap too soon after a compaction; cannot continue",
-                                            ),
-                                            HardCompactOutcome::NotEnoughHistory => app.notify(
-                                                NotifyKind::Warn,
-                                                "could not compact at the hard cap; cannot continue",
-                                            ),
-                                        }
-                                    }
-                                } else {
-                                    app.maybe_auto_compact();
-                                    if !app.lifecycle_busy && app.run.is_none() {
-                                        if let Some(queued) = app.prompt_queue.first().cloned() {
-                                            app.prompt_queue.remove(0);
-                                            spawn_prompt(
-                                                &mut app,
-                                                agent.as_ref(),
-                                                &mut current_run,
-                                                queued.text,
-                                                queued.kind,
-                                            );
-                                        }
                                     }
                                 }
                             }
@@ -753,6 +766,7 @@ pub(crate) async fn run_loop(
                     // Explicit user input should never wait behind resize UI
                     // policy. Treat it as the end of the current resize burst.
                     resize.deadline = None;
+                    stream_redraw_deadline = None;
                     dirty = true;
                 }
             }
@@ -763,6 +777,15 @@ pub(crate) async fn run_loop(
                 }
             } => {
                 resize.deadline = None;
+                dirty = true;
+            }
+            () = async {
+                match stream_redraw_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                stream_redraw_deadline = None;
                 dirty = true;
             }
             _ = tick.tick() => {
@@ -951,16 +974,21 @@ pub(crate) async fn run_loop(
                 if let Some(req) = req {
                     if req.active.load(std::sync::atomic::Ordering::Relaxed) {
                         app.queue_confirmation(req);
+                        stream_redraw_deadline = None;
                         dirty = true;
                     }
                 }
             }
         }
 
-        status.publish(
-            &program_status::report(&app, &settled),
-            &program_status::children(&app),
-        );
+        status_dirty |= dirty;
+        if status_dirty || app.should_quit {
+            status.publish(
+                &program_status::report(&app, &settled),
+                &program_status::children(&app),
+            );
+            status_dirty = false;
+        }
 
         if app.should_quit {
             if let Some(r) = current_run.take() {

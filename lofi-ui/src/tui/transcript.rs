@@ -30,6 +30,9 @@ pub(super) struct CollapsedTurnCache {
     pub(super) map: HashMap<usize, (u64, Box<[u8]>)>,
     /// Monotonic access-stamp index: smallest stamp is least recently used.
     pub(super) order: std::collections::BTreeMap<u64, usize>,
+    /// Hot uncompressed turns (at most 2) so measure + render in the same
+    /// frame or scrolling inside a tall turn avoids repeated LZ4 + JSON parses.
+    pub(super) hot: VecDeque<(usize, Arc<Turn>)>,
     next_stamp: u64,
     pub(super) retained_bytes: usize,
     pub(super) frame_hits: usize,
@@ -42,11 +45,13 @@ impl CollapsedTurnCache {
     /// A single entry above this size is never retained; it reparses from the
     /// transcript on demand instead of flushing everyone else.
     const MAX_ENTRY_BYTES: usize = 1024 * 1024;
+    const MAX_HOT_TURNS: usize = 2;
 
     pub(super) fn new() -> Self {
         Self {
             map: HashMap::new(),
             order: std::collections::BTreeMap::new(),
+            hot: VecDeque::with_capacity(Self::MAX_HOT_TURNS),
             next_stamp: 0,
             retained_bytes: 0,
             frame_hits: 0,
@@ -55,7 +60,31 @@ impl CollapsedTurnCache {
         }
     }
 
+    pub(super) fn remember_hot(&mut self, idx: usize, turn: Arc<Turn>) {
+        self.hot.retain(|(existing, _)| *existing != idx);
+        if self.hot.len() >= Self::MAX_HOT_TURNS {
+            self.hot.pop_front();
+        }
+        self.hot.push_back((idx, turn));
+    }
+
     pub(super) fn get(&mut self, idx: usize) -> Option<Arc<Turn>> {
+        if let Some(pos) = self.hot.iter().position(|(existing, _)| *existing == idx) {
+            if let Some(entry) = self.hot.remove(pos) {
+                let turn = Arc::clone(&entry.1);
+                self.hot.push_back(entry);
+                if let Some((stamp, _)) = self.map.get_mut(&idx) {
+                    let old = *stamp;
+                    let next = self.next_stamp;
+                    self.next_stamp = next.wrapping_add(1);
+                    *stamp = next;
+                    self.order.remove(&old);
+                    self.order.insert(next, idx);
+                }
+                self.frame_hits += 1;
+                return Some(turn);
+            }
+        }
         let mut hit_stamp = None;
         let turn = self.map.get_mut(&idx).and_then(|(stamp, data)| {
             lz4_flex::decompress_size_prepended(data)
@@ -75,6 +104,9 @@ impl CollapsedTurnCache {
             self.frame_hits += 1;
             self.order.remove(&old);
             self.order.insert(next, idx);
+            if let Some(turn) = &turn {
+                self.remember_hot(idx, Arc::clone(turn));
+            }
         } else {
             self.frame_misses += 1;
         }
@@ -115,6 +147,7 @@ impl CollapsedTurnCache {
             if let Some((_, data)) = self.map.remove(&victim) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(data.len());
             }
+            self.hot.retain(|(existing, _)| *existing != victim);
         }
     }
 
@@ -123,11 +156,13 @@ impl CollapsedTurnCache {
             self.retained_bytes = self.retained_bytes.saturating_sub(data.len());
             self.order.remove(&stamp);
         }
+        self.hot.retain(|(existing, _)| *existing != idx);
     }
 
     pub(super) fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.hot.clear();
         self.next_stamp = 0;
         self.retained_bytes = 0;
         self.reset_frame_profile();
@@ -229,8 +264,80 @@ pub(super) struct Transcript {
     pub(super) alert: RefCell<Option<String>>,
 }
 
+const MAX_CACHED_LIVE_BLOCK_ROWS: usize = 512;
+const MAX_EAGER_LIVE_BLOCK_BYTES: usize = 32 * 1024;
+
+#[derive(Default)]
+pub(super) struct CachedLiveChild {
+    pub(super) height_stamp: u64,
+    pub(super) lines_stamp: u64,
+    pub(super) height: usize,
+    pub(super) lines: Option<Vec<view::RenderLine>>,
+    pub(super) window: Option<(u64, std::ops::Range<usize>, Vec<view::RenderLine>)>,
+}
+
+#[derive(Default)]
+pub(super) struct LiveTurnCache {
+    pub(super) valid: bool,
+    pub(super) turn_idx: usize,
+    pub(super) durable: bool,
+    pub(super) epoch: u64,
+    pub(super) width: usize,
+    pub(super) theme: Theme,
+    pub(super) detail_stamp: u64,
+    pub(super) prompt: Option<CachedLiveChild>,
+    pub(super) blocks: Vec<CachedLiveChild>,
+}
+
+impl LiveTurnCache {
+    pub(super) fn clear(&mut self) {
+        self.valid = false;
+        self.prompt = None;
+        self.blocks.clear();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sync_envelope(
+        &mut self,
+        turn_idx: usize,
+        durable: bool,
+        epoch: u64,
+        width: usize,
+        theme: Theme,
+        detail_stamp: u64,
+        blocks_len: usize,
+        has_prompt: bool,
+    ) {
+        if !self.valid
+            || self.turn_idx != turn_idx
+            || self.durable != durable
+            || self.epoch != epoch
+            || self.width != width
+            || self.theme != theme
+            || self.detail_stamp != detail_stamp
+        {
+            self.valid = true;
+            self.turn_idx = turn_idx;
+            self.durable = durable;
+            self.epoch = epoch;
+            self.width = width;
+            self.theme = theme;
+            self.detail_stamp = detail_stamp;
+            self.prompt = None;
+            self.blocks.clear();
+        }
+        if !has_prompt {
+            self.prompt = None;
+        }
+        if self.blocks.len() > blocks_len {
+            self.blocks.truncate(blocks_len);
+        }
+    }
+}
+
 pub(super) struct TranscriptLayout {
     pub(super) frozen_render: FrozenCache,
+    pub(super) live_render: LiveTurnCache,
     /// Line count per frozen turn (all of them), so the viewport can be
     /// located and `total` computed without fetching rendered lines. Synced
     /// to the file-backed prefix (which may be all turns) for the active mode.
@@ -275,6 +382,9 @@ impl Transcript {
 impl TranscriptLayout {
     pub(super) fn invalidate_turn(&mut self, turn: usize) {
         self.frozen_render.clear();
+        if self.live_render.valid && self.live_render.turn_idx == turn {
+            self.live_render.clear();
+        }
         if let Some(height) = self.frozen_heights_estimated.get_mut(turn) {
             *height = true;
             self.height_remeasure_from = Some(
@@ -288,6 +398,7 @@ impl TranscriptLayout {
     pub(super) fn new() -> Self {
         Self {
             frozen_render: FrozenCache::new(),
+            live_render: LiveTurnCache::default(),
             frozen_heights: Vec::new(),
             frozen_heights_estimated: Vec::new(),
             render_epoch: 0,
@@ -545,6 +656,7 @@ impl App {
             // drop and refill below. No incremental path here — the turns
             // themselves are different.
             self.layout.frozen_render.clear();
+            self.layout.live_render.clear();
             self.layout.frozen_heights.clear();
             self.layout.frozen_heights_estimated.clear();
             self.layout.frozen_epoch = self.layout.render_epoch;
@@ -558,6 +670,7 @@ impl App {
             // thumb stay put, and re-measure incrementally (visible window
             // now, the rest on the tick loop) instead of stalling this frame.
             self.layout.frozen_render.clear();
+            self.layout.live_render.clear();
             self.layout.frozen_width = width;
             // Stale heights are estimates at the new width: the tick loop
             // re-measures them.
@@ -661,8 +774,16 @@ impl App {
     /// Render-height of one frozen turn at `width`. Shared by the eager fill
     /// in `ensure_frozen` and the incremental resize re-measure.
     fn measure_turn_height(&self, idx: usize, width: usize) -> usize {
+        self.measure_turn_height_caching(idx, width, false)
+    }
+
+    fn measure_turn_height_caching(&self, idx: usize, width: usize, cache_insert: bool) -> usize {
         let theme = self.theme;
-        let turn = self.peek_transcript_turn(idx);
+        let turn = if cache_insert {
+            self.materialize_turn(idx)
+        } else {
+            self.peek_transcript_turn(idx)
+        };
         let cx = view::component::Cx {
             app: self,
             theme,
@@ -745,7 +866,8 @@ impl App {
             let mut measured = false;
             for idx in lo..=hi {
                 if self.layout.frozen_heights_estimated[idx] {
-                    self.layout.frozen_heights[idx] = self.measure_turn_height(idx, width);
+                    self.layout.frozen_heights[idx] =
+                        self.measure_turn_height_caching(idx, width, true);
                     self.layout.frozen_heights_estimated[idx] = false;
                     measured = true;
                 }
@@ -885,6 +1007,7 @@ impl Transcript {
         if cacheable && cache_insert {
             let mut cache = self.collapsed_turns.borrow_mut();
             cache.insert(idx, &turn);
+            cache.remember_hot(idx, Arc::clone(&turn));
             cache.finish_materialize(materialize_started.elapsed().as_micros());
         }
         turn
@@ -988,5 +1111,431 @@ impl Transcript {
             view::blocks::compact_native_previews(&mut turn);
         }
         Arc::new(turn)
+    }
+}
+
+fn non_zero_stamp(stamp: u64) -> u64 {
+    if stamp == 0 {
+        1
+    } else {
+        stamp
+    }
+}
+
+fn hash_sampled_bytes(hasher: &mut impl std::hash::Hasher, bytes: &[u8]) {
+    use std::hash::Hash;
+    if bytes.len() <= 4096 {
+        bytes.hash(hasher);
+        return;
+    }
+    let mid = bytes.len() / 2;
+    bytes.len().hash(hasher);
+    bytes[..64].hash(hasher);
+    bytes[mid.saturating_sub(32)..(mid + 32).min(bytes.len())].hash(hasher);
+    bytes[bytes.len() - 64..].hash(hasher);
+}
+
+fn prompt_stamp(turn: &Turn) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    0u8.hash(&mut h);
+    (turn.kind as u8).hash(&mut h);
+    hash_sampled_bytes(&mut h, turn.prompt.as_bytes());
+    non_zero_stamp(h.finish())
+}
+
+fn block_stamps(block: &Block, cx: &view::component::Cx, has_fatal: bool) -> (u64, u64, bool) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match block {
+        Block::Text(text) => {
+            1u8.hash(&mut h);
+            hash_sampled_bytes(&mut h, text.as_bytes());
+            let s = non_zero_stamp(h.finish());
+            (s, s, text.len() <= MAX_EAGER_LIVE_BLOCK_BYTES)
+        }
+        Block::Thinking(tb) => {
+            2u8.hash(&mut h);
+            let working = tb.elapsed.is_none() && cx.active_turn;
+            hash_sampled_bytes(&mut h, tb.text.as_bytes());
+            tb.elapsed.hash(&mut h);
+            working.hash(&mut h);
+            let s = non_zero_stamp(h.finish());
+            (s, s, tb.text.len() <= MAX_EAGER_LIVE_BLOCK_BYTES)
+        }
+        Block::Tool(tool) => tool_stamps(tool, cx),
+        Block::UserShell {
+            id,
+            command,
+            output,
+            exit_code,
+            signal,
+            duration,
+            truncated,
+            cancelled,
+            running,
+            exclude_from_context,
+        } => {
+            4u8.hash(&mut h);
+            id.hash(&mut h);
+            hash_sampled_bytes(&mut h, command.as_bytes());
+            hash_sampled_bytes(&mut h, output.as_bytes());
+            exit_code.hash(&mut h);
+            signal.hash(&mut h);
+            duration.hash(&mut h);
+            truncated.hash(&mut h);
+            cancelled.hash(&mut h);
+            running.hash(&mut h);
+            exclude_from_context.hash(&mut h);
+            let hs = non_zero_stamp(h.finish());
+            let ls = if *running {
+                cx.spinner().hash(&mut h);
+                non_zero_stamp(h.finish())
+            } else {
+                hs
+            };
+            (hs, ls, command.len() <= MAX_EAGER_LIVE_BLOCK_BYTES)
+        }
+        Block::Error(msg) => {
+            5u8.hash(&mut h);
+            msg.hash(&mut h);
+            let s = non_zero_stamp(h.finish());
+            (s, s, true)
+        }
+        Block::TurnEnd { label, elapsed } => {
+            6u8.hash(&mut h);
+            cx.active_turn.hash(&mut h);
+            label.hash(&mut h);
+            elapsed.hash(&mut h);
+            let s = non_zero_stamp(h.finish());
+            (s, s, true)
+        }
+        Block::TurnFailed {
+            label,
+            elapsed,
+            error,
+        } => {
+            7u8.hash(&mut h);
+            cx.active_turn.hash(&mut h);
+            label.hash(&mut h);
+            elapsed.hash(&mut h);
+            error.hash(&mut h);
+            has_fatal.hash(&mut h);
+            let s = non_zero_stamp(h.finish());
+            (s, s, true)
+        }
+        Block::TurnCancelled { label, elapsed } => {
+            8u8.hash(&mut h);
+            cx.active_turn.hash(&mut h);
+            label.hash(&mut h);
+            elapsed.hash(&mut h);
+            let s = non_zero_stamp(h.finish());
+            (s, s, true)
+        }
+        Block::Compaction {
+            summarized, kept, ..
+        } => {
+            9u8.hash(&mut h);
+            summarized.hash(&mut h);
+            kept.hash(&mut h);
+            let s = non_zero_stamp(h.finish());
+            (s, s, true)
+        }
+    }
+}
+
+fn tool_stamps(tool: &ToolCall, cx: &view::component::Cx) -> (u64, u64, bool) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    3u8.hash(&mut h);
+    tool.detail_id.hash(&mut h);
+    tool.id.hash(&mut h);
+    tool.name.hash(&mut h);
+    hash_sampled_bytes(&mut h, tool.input.as_bytes());
+    tool.label.hash(&mut h);
+    tool.done.hash(&mut h);
+    tool.is_error.hash(&mut h);
+    tool.elapsed.hash(&mut h);
+    (tool.result_availability as u8).hash(&mut h);
+    if let Some(res) = &tool.result {
+        hash_sampled_bytes(&mut h, res.as_bytes());
+    } else {
+        usize::MAX.hash(&mut h);
+    }
+    cx.active_turn.hash(&mut h);
+    tool.native.len().hash(&mut h);
+    let mut any_open_native = false;
+    for nt in &tool.native {
+        nt.id.hash(&mut h);
+        nt.name.hash(&mut h);
+        hash_sampled_bytes(&mut h, nt.args.as_bytes());
+        nt.done.hash(&mut h);
+        nt.is_error.hash(&mut h);
+        nt.result.as_ref().map(String::len).hash(&mut h);
+        nt.preview.is_some().hash(&mut h);
+        any_open_native |= !nt.done;
+    }
+    let hs = non_zero_stamp(h.finish());
+    let spinning = cx.active_turn && (!tool.done || any_open_native);
+    let ls = if spinning {
+        cx.spinner().hash(&mut h);
+        non_zero_stamp(h.finish())
+    } else {
+        hs
+    };
+    let eager = tool.native.len() <= 64 && tool.input.len() <= MAX_EAGER_LIVE_BLOCK_BYTES;
+    (hs, ls, eager)
+}
+
+fn live_detail_stamp(app: &App, turn_idx: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut acc = 0u64;
+    for (key, state) in &app.expanded_details {
+        if state.turn == turn_idx {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            state.scroll.hash(&mut h);
+            acc = acc.wrapping_add(h.finish());
+        }
+    }
+    if let Some(focus) = &app.detail_focus {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        focus.key.hash(&mut h);
+        acc ^= h.finish().rotate_left(17);
+    }
+    acc
+}
+
+fn sync_child_height(
+    slot: &mut CachedLiveChild,
+    hs: u64,
+    ls: u64,
+    eager: bool,
+    render_lines: impl FnOnce() -> Vec<view::RenderLine>,
+    render_height: impl FnOnce() -> usize,
+) {
+    if slot.height_stamp == hs {
+        return;
+    }
+    if eager {
+        let lines = render_lines();
+        slot.height = lines.len();
+        slot.height_stamp = hs;
+        slot.lines_stamp = ls;
+        slot.lines = (lines.len() <= MAX_CACHED_LIVE_BLOCK_ROWS).then_some(lines);
+        slot.window = None;
+    } else {
+        slot.height = render_height();
+        slot.height_stamp = hs;
+        slot.lines = None;
+        slot.window = None;
+    }
+}
+
+fn child_window_lines(
+    slot: &mut CachedLiveChild,
+    ls: u64,
+    eager: bool,
+    sub: std::ops::Range<usize>,
+    render_lines: impl FnOnce() -> Vec<view::RenderLine>,
+    render_window: impl FnOnce(std::ops::Range<usize>) -> Vec<view::RenderLine>,
+) -> Vec<view::RenderLine> {
+    if slot.lines_stamp == ls {
+        if let Some(lines) = &slot.lines {
+            let end = sub.end.min(lines.len());
+            let start = sub.start.min(end);
+            return lines[start..end].to_vec();
+        }
+        if let Some((win_stamp, cached_range, lines)) = &slot.window {
+            if *win_stamp == ls && *cached_range == sub {
+                return lines.clone();
+            }
+        }
+    }
+    if eager && slot.height <= MAX_CACHED_LIVE_BLOCK_ROWS {
+        let lines = render_lines();
+        slot.lines_stamp = ls;
+        let end = sub.end.min(lines.len());
+        let start = sub.start.min(end);
+        let sliced = lines[start..end].to_vec();
+        slot.lines = Some(lines);
+        slot.window = None;
+        sliced
+    } else {
+        let lines = render_window(sub.clone());
+        slot.lines_stamp = ls;
+        slot.window = Some((ls, sub, lines.clone()));
+        lines
+    }
+}
+
+impl App {
+    pub(super) fn live_turn_height(
+        &mut self,
+        idx: usize,
+        width: usize,
+        active_turn: bool,
+    ) -> usize {
+        let durable = self.needs_durable_materialize(idx);
+        let detail_stamp = live_detail_stamp(self, idx);
+        let epoch = self.layout.render_epoch;
+        let theme = self.theme;
+        let mut cache = std::mem::take(&mut self.layout.live_render);
+        let materialized = durable.then(|| self.materialize_turn(idx));
+        let height = {
+            let turn = materialized
+                .as_deref()
+                .unwrap_or(&self.transcript.turns[idx]);
+            cache.sync_envelope(
+                idx,
+                durable,
+                epoch,
+                width,
+                theme,
+                detail_stamp,
+                turn.blocks.len(),
+                !turn.prompt.is_empty(),
+            );
+            let cx = view::component::Cx {
+                app: self,
+                theme,
+                width,
+                active_turn,
+            };
+            let mut total = 0usize;
+            let mut first = true;
+            if !turn.prompt.is_empty() {
+                let ps = prompt_stamp(turn);
+                let eager = turn.prompt.len() <= MAX_EAGER_LIVE_BLOCK_BYTES;
+                let slot = cache.prompt.get_or_insert_with(CachedLiveChild::default);
+                sync_child_height(
+                    slot,
+                    ps,
+                    ps,
+                    eager,
+                    || view::blocks::render_prompt_lines(&cx, turn),
+                    || view::blocks::render_prompt_height(&cx, turn),
+                );
+                if slot.height > 0 {
+                    total = total.saturating_add(slot.height);
+                    first = false;
+                }
+            }
+            let has_fatal = turn.blocks.iter().any(|b| matches!(b, Block::Error(_)));
+            for (bi, block) in turn.blocks.iter().enumerate() {
+                if cache.blocks.len() <= bi {
+                    cache.blocks.push(CachedLiveChild::default());
+                }
+                let (hs, ls, eager) = block_stamps(block, &cx, has_fatal);
+                let slot = &mut cache.blocks[bi];
+                sync_child_height(
+                    slot,
+                    hs,
+                    ls,
+                    eager,
+                    || view::blocks::render_single_block_lines(&cx, block, has_fatal),
+                    || view::blocks::render_single_block_height(&cx, block, has_fatal),
+                );
+                if slot.height > 0 {
+                    total = total.saturating_add(slot.height + usize::from(!first));
+                    first = false;
+                }
+            }
+            total
+        };
+        self.layout.live_render = cache;
+        height
+    }
+
+    pub(super) fn live_turn_window(
+        &mut self,
+        idx: usize,
+        width: usize,
+        active_turn: bool,
+        range: std::ops::Range<usize>,
+    ) -> Vec<view::RenderLine> {
+        if range.start >= range.end {
+            return Vec::new();
+        }
+        let _ = self.live_turn_height(idx, width, active_turn);
+        let durable = self.needs_durable_materialize(idx);
+        let theme = self.theme;
+        let mut cache = std::mem::take(&mut self.layout.live_render);
+        let materialized = durable.then(|| self.materialize_turn(idx));
+        let out = {
+            let turn = materialized
+                .as_deref()
+                .unwrap_or(&self.transcript.turns[idx]);
+            let cx = view::component::Cx {
+                app: self,
+                theme,
+                width,
+                active_turn,
+            };
+            let mut out = Vec::with_capacity(range.end.saturating_sub(range.start).min(256));
+            let mut pos = 0usize;
+            let mut first = true;
+            if !turn.prompt.is_empty() {
+                if let Some(slot) = cache.prompt.as_mut() {
+                    let h = slot.height;
+                    if h > 0 {
+                        let end = pos.saturating_add(h);
+                        if end > range.start && pos < range.end {
+                            let ps = prompt_stamp(turn);
+                            let eager = turn.prompt.len() <= MAX_EAGER_LIVE_BLOCK_BYTES;
+                            let sub = range.start.saturating_sub(pos)
+                                ..range.end.saturating_sub(pos).min(h);
+                            out.extend(child_window_lines(
+                                slot,
+                                ps,
+                                eager,
+                                sub,
+                                || view::blocks::render_prompt_lines(&cx, turn),
+                                |r| view::blocks::render_prompt_window(&cx, turn, r),
+                            ));
+                        }
+                        pos = end;
+                        first = false;
+                    }
+                }
+            }
+            let has_fatal = turn.blocks.iter().any(|b| matches!(b, Block::Error(_)));
+            for (bi, block) in turn.blocks.iter().enumerate() {
+                if pos >= range.end {
+                    break;
+                }
+                let Some(slot) = cache.blocks.get_mut(bi) else {
+                    break;
+                };
+                let h = slot.height;
+                if h == 0 {
+                    continue;
+                }
+                if !first {
+                    if range.contains(&pos) {
+                        out.push(view::prim::rblank());
+                    }
+                    pos = pos.saturating_add(1);
+                }
+                let end = pos.saturating_add(h);
+                if end > range.start && pos < range.end {
+                    let (_, ls, eager) = block_stamps(block, &cx, has_fatal);
+                    let sub = range.start.saturating_sub(pos)..range.end.saturating_sub(pos).min(h);
+                    out.extend(child_window_lines(
+                        slot,
+                        ls,
+                        eager,
+                        sub,
+                        || view::blocks::render_single_block_lines(&cx, block, has_fatal),
+                        |r| view::blocks::render_single_block_window(&cx, block, has_fatal, r),
+                    ));
+                }
+                pos = end;
+                first = false;
+            }
+            out
+        };
+        self.layout.live_render = cache;
+        out
     }
 }

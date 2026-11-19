@@ -2,7 +2,6 @@ use super::analyze::analyze;
 use super::inline::{inline_spans_and_links, wrap_with_map};
 use super::model::{MdBlock, MdCell};
 use super::plain::{plain_paragraph, plain_paragraph_height};
-use super::split::line_spans;
 use super::table::{table_column_widths, Align};
 use crate::tui::theme::Theme;
 use crate::tui::view::prim;
@@ -29,68 +28,70 @@ pub(in crate::tui::view) fn markdown_body_height(text: &str, content_w: usize) -
     // a parallel line-scanner.
     let t = Theme::default();
     let base = Style::default();
-    let mut row = 0usize;
-    for block in analyze(text, t, base) {
-        match block {
-            MdBlock::Blank { .. } => row += 1,
-            MdBlock::Code { lines, .. } => {
-                // Opening fence + body rows + closing fence.
-                row += 1;
-                for (line_text, _) in &lines {
-                    row += prim::wrap_pre(line_text, content_w.saturating_sub(2)).len();
+    analyze(text, t, base)
+        .iter()
+        .map(|block| md_block_height(text, block, content_w))
+        .sum()
+}
+
+pub(super) fn md_block_height(text: &str, block: &MdBlock, content_w: usize) -> usize {
+    match block {
+        MdBlock::Blank { .. } => 1,
+        MdBlock::Code { lines, .. } => {
+            // Opening fence + body rows + closing fence.
+            let avail = content_w.saturating_sub(2);
+            1 + lines
+                .iter()
+                .map(|(line_text, _)| prim::wrap_pre_count(line_text, avail))
+                .sum::<usize>()
+                + 1
+        }
+        MdBlock::Table {
+            header,
+            aligns,
+            rows,
+            ..
+        } => {
+            let cell_text = |c: &MdCell| text[c.src.clone()].trim().to_string();
+            let header_txt: Vec<String> = header.iter().map(&cell_text).collect();
+            let data_txt: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| r.iter().map(&cell_text).collect())
+                .collect();
+            table_height_cells(&header_txt, &data_txt, aligns, content_w)
+        }
+        MdBlock::Heading {
+            content_start, src, ..
+        } => {
+            let trimmed = text[src.clone()].trim_end();
+            let h = text[*content_start..src.end].trim_end();
+            wrap_with_map(h, content_start - src.start, trimmed.len(), content_w).len()
+        }
+        MdBlock::Quote { lines, .. } => {
+            let mut row = 0usize;
+            for ql in lines {
+                if ql.spans.is_empty() {
+                    row += 1;
+                    continue;
                 }
-                row += 1;
+                let qtrimmed = text[ql.src.clone()].trim_end();
+                let body = &qtrimmed[ql.prefix_len..];
+                row += wrap_with_map(
+                    body,
+                    ql.prefix_len,
+                    qtrimmed.len(),
+                    content_w.saturating_sub(2),
+                )
+                .len();
             }
-            MdBlock::Table {
-                header,
-                aligns,
-                rows,
-                ..
-            } => {
-                let cell_text = |c: &MdCell| text[c.src.clone()].trim().to_string();
-                let header_txt: Vec<String> = header.iter().map(&cell_text).collect();
-                let data_txt: Vec<Vec<String>> = rows
-                    .iter()
-                    .map(|r| r.iter().map(&cell_text).collect())
-                    .collect();
-                row += table_height_cells(&header_txt, &data_txt, &aligns, content_w);
-            }
-            MdBlock::Heading {
-                content_start, src, ..
-            } => {
-                let trimmed = text[src.clone()].trim_end();
-                let h = text[content_start..src.end].trim_end();
-                row += wrap_with_map(h, content_start - src.start, trimmed.len(), content_w).len();
-            }
-            MdBlock::Quote { lines, .. } => {
-                for ql in &lines {
-                    if ql.spans.is_empty() {
-                        row += 1;
-                        continue;
-                    }
-                    let qtrimmed = text[ql.src.clone()].trim_end();
-                    let body = &qtrimmed[ql.prefix_len..];
-                    row += wrap_with_map(
-                        body,
-                        ql.prefix_len,
-                        qtrimmed.len(),
-                        content_w.saturating_sub(2),
-                    )
-                    .len();
-                }
-            }
-            MdBlock::Paragraph { src, .. } => {
-                let raw = text[src.clone()].trim_end();
-                // Match the render path exactly: `line_spans` keeps a leading
-                // list marker literal, so a list line wraps to the same width.
-                let mapped = line_spans(raw, t, base);
-                let spans: Vec<Span> = mapped.into_iter().map(|m| m.span).collect();
-                let line = Line::from(spans);
-                row += prim::wrap_line_styled(&line, content_w).len();
-            }
+            row
+        }
+        MdBlock::Paragraph { spans, .. } => {
+            let spans: Vec<Span> = spans.iter().map(|m| m.span.clone()).collect();
+            let line = Line::from(spans);
+            prim::wrap_line_styled(&line, content_w).len()
         }
     }
-    row
 }
 
 /// Count the visual rows a table would occupy, mirroring `render_table` +

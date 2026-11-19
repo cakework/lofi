@@ -99,15 +99,149 @@ pub fn blank() -> Line<'static> {
 /// maps are contiguous (`row[i].map[last] == row[i+1].map[0]`), so a
 /// multi-row selection within one source line is a single source slice,
 /// and a `\n` is inserted only at hard breaks (a new source line).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawMap {
+    Empty,
+    /// `map[0] = first`, and `map[i] = second + (i - 1)` for `1 <= i < len`.
+    /// Covers contiguous ASCII spans, 2-point whole-line maps (`[0, end]`),
+    /// and prefix-snapped first rows (`[0, prefix_len, prefix_len + 1, ...]`)
+    /// without heap allocation.
+    Linear {
+        first: u32,
+        second: u32,
+        len: u32,
+    },
+    Explicit(Arc<[u32]>),
+}
+
+impl RawMap {
+    #[must_use]
+    pub fn from_offsets(offsets: Vec<usize>) -> Self {
+        let len = offsets.len();
+        if len == 0 {
+            return Self::Empty;
+        }
+        if len == 1 {
+            if let Ok(first) = u32::try_from(offsets[0]) {
+                return Self::Linear {
+                    first,
+                    second: first,
+                    len: 1,
+                };
+            }
+        } else if let (Ok(first), Ok(second), Ok(len_u32)) = (
+            u32::try_from(offsets[0]),
+            u32::try_from(offsets[1]),
+            u32::try_from(len),
+        ) {
+            let linear_tail = offsets[1..]
+                .iter()
+                .enumerate()
+                .all(|(k, &v)| v == offsets[1].saturating_add(k));
+            if linear_tail && u32::try_from(offsets[1].saturating_add(len - 2)).is_ok() {
+                return Self::Linear {
+                    first,
+                    second,
+                    len: len_u32,
+                };
+            }
+        }
+        let compact: Arc<[u32]> = offsets
+            .into_iter()
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+            .collect();
+        Self::Explicit(compact)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Linear { len, .. } => *len as usize,
+            Self::Explicit(slice) => slice.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::Linear { first, second, len } => {
+                if index >= *len as usize {
+                    None
+                } else if index == 0 {
+                    Some(*first as usize)
+                } else {
+                    Some((*second as usize).saturating_add(index - 1))
+                }
+            }
+            Self::Explicit(slice) => slice.get(index).map(|&v| v as usize),
+        }
+    }
+
+    #[must_use]
+    pub fn at(&self, index: usize) -> usize {
+        self.get(index).unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn first(&self) -> Option<usize> {
+        self.get(0)
+    }
+
+    #[must_use]
+    pub fn last(&self) -> Option<usize> {
+        self.len().checked_sub(1).and_then(|i| self.get(i))
+    }
+
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Empty | Self::Linear { .. } => 0,
+            Self::Explicit(slice) => slice.len() * std::mem::size_of::<u32>(),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_monotonic(&self) -> bool {
+        (1..self.len()).all(|i| self.at(i - 1) <= self.at(i))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RawLine {
     pub source: Arc<str>,
-    pub map: Vec<usize>,
+    pub map: RawMap,
     pub hard_break: bool,
 }
 
 impl RawLine {
     pub fn new(source: Arc<str>, map: Vec<usize>, hard_break: bool) -> Self {
+        Self {
+            source,
+            map: RawMap::from_offsets(map),
+            hard_break,
+        }
+    }
+
+    pub fn empty(source: Arc<str>, hard_break: bool) -> Self {
+        Self {
+            source,
+            map: RawMap::Empty,
+            hard_break,
+        }
+    }
+
+    pub fn two_point(source: Arc<str>, start: usize, end: usize, hard_break: bool) -> Self {
+        let map = match (u32::try_from(start), u32::try_from(end)) {
+            (Ok(first), Ok(second)) => RawMap::Linear {
+                first,
+                second,
+                len: 2,
+            },
+            _ => RawMap::from_offsets(vec![start, end]),
+        };
         Self {
             source,
             map,
@@ -116,12 +250,30 @@ impl RawLine {
     }
 
     pub fn linear(source: Arc<str>, start: usize, display_len: usize, hard_break: bool) -> Self {
-        let map = (0..=display_len).map(|k| start + k).collect();
+        let len = display_len.saturating_add(1);
+        let map = match (
+            u32::try_from(start),
+            u32::try_from(start.saturating_add(1)),
+            u32::try_from(len),
+            u32::try_from(start.saturating_add(display_len)),
+        ) {
+            (Ok(first), Ok(second), Ok(len_u32), Ok(_)) => RawMap::Linear {
+                first,
+                second,
+                len: len_u32,
+            },
+            _ => RawMap::from_offsets((0..=display_len).map(|k| start + k).collect()),
+        };
         Self {
             source,
             map,
             hard_break,
         }
+    }
+
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.source.len() * usize::from(self.hard_break) + self.map.heap_bytes()
     }
 }
 
@@ -133,6 +285,7 @@ pub struct Hyperlink {
     pub url: Arc<str>,
 }
 
+#[derive(Clone)]
 pub struct RenderLine {
     pub line: Line<'static>,
     pub content: (usize, usize),
@@ -433,6 +586,81 @@ pub fn wrap_pre(s: &str, max_w: usize) -> Vec<String> {
         }
     }
     out
+}
+
+/// Count visual rows [`wrap_pre`] would emit for `s` without allocating
+/// per-row `String`s.
+#[must_use]
+pub fn wrap_pre_count(s: &str, max_w: usize) -> usize {
+    let mut total = 0usize;
+    for line in s.split('\n') {
+        if max_w == 0 || line.is_empty() {
+            total += 1;
+            continue;
+        }
+        if line.is_ascii() && line.len() <= max_w && !line.as_bytes().contains(&b'\t') {
+            total += 1;
+            continue;
+        }
+        let indent_len = line
+            .bytes()
+            .take_while(|&b| b == b' ' || b == b'\t')
+            .count();
+        let indent = &line[..indent_len];
+        let body = &line[indent_len..];
+        let content_w = max_w.saturating_sub(width(indent));
+        if content_w == 0 || body.is_empty() {
+            total += 1;
+            continue;
+        }
+        total += wrap_str_cells_count(body, content_w);
+    }
+    total
+}
+
+fn wrap_str_cells_count(body: &str, max_w: usize) -> usize {
+    if body.is_ascii() {
+        let bytes = body.as_bytes();
+        let n = bytes.len();
+        let mut count = 0usize;
+        let mut start = 0usize;
+        while start < n {
+            let mut w = 0usize;
+            let mut k = start;
+            let mut break_at = start;
+            while k < n {
+                let cw = usize::from(!bytes[k].is_ascii_control());
+                if w + cw > max_w {
+                    break;
+                }
+                w += cw;
+                if bytes[k] == b' ' {
+                    break_at = k;
+                }
+                k += 1;
+            }
+            let mut end = if k == n {
+                n
+            } else if bytes[k] == b' ' {
+                k + 1
+            } else if break_at > start {
+                break_at + 1
+            } else {
+                k
+            };
+            if end > n {
+                end = n;
+            }
+            if end <= start {
+                end = start + 1;
+            }
+            count += 1;
+            start = end;
+        }
+        return count.max(1);
+    }
+    let cells: Vec<(char, Style)> = body.chars().map(|c| (c, Style::default())).collect();
+    wrap_cells(&cells, max_w).len()
 }
 
 fn wrap_cells(cells: &[(char, Style)], max_w: usize) -> Vec<&[(char, Style)]> {
@@ -932,5 +1160,55 @@ mod tests {
         let content: String = chars[rl.content.0..rl.content.1].iter().collect();
         assert_eq!(content, "indented body");
         assert_eq!(rl.content_len(), "indented body".len());
+    }
+
+    #[test]
+    fn wrap_pre_count_matches_wrap_pre_across_cases() {
+        let cases = [
+            "",
+            "a\n\nb",
+            "short line",
+            "    indented code here with several words that wrap",
+            "\t\ttabbed indent and words",
+            "abcdefghijklmnopqrstuvwxyz",
+            "日本語のワイド文字を含むテキスト line with spaces",
+        ];
+        for sample in cases {
+            for w in [0, 1, 5, 10, 12, 24, 80] {
+                assert_eq!(
+                    wrap_pre_count(sample, w),
+                    wrap_pre(sample, w).len(),
+                    "sample={sample:?} w={w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_map_compresses_linear_and_snapped_prefixes() {
+        let linear = RawMap::from_offsets(vec![4, 5, 6, 7]);
+        assert_eq!(linear.heap_bytes(), 0);
+        assert_eq!(
+            (0..linear.len()).map(|i| linear.at(i)).collect::<Vec<_>>(),
+            vec![4, 5, 6, 7]
+        );
+
+        let snapped = RawMap::from_offsets(vec![0, 3, 4, 5]);
+        assert_eq!(snapped.heap_bytes(), 0);
+        assert_eq!(
+            (0..snapped.len())
+                .map(|i| snapped.at(i))
+                .collect::<Vec<_>>(),
+            vec![0, 3, 4, 5]
+        );
+
+        let explicit = RawMap::from_offsets(vec![0, 2, 5, 6]);
+        assert!(explicit.heap_bytes() > 0);
+        assert_eq!(
+            (0..explicit.len())
+                .map(|i| explicit.at(i))
+                .collect::<Vec<_>>(),
+            vec![0, 2, 5, 6]
+        );
     }
 }

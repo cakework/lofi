@@ -608,3 +608,56 @@ fn notify_lines_grows_with_a_long_message_and_caps_at_max() {
     assert!(lines_60 >= 2, "expected wrapping, got {lines_60}");
     assert_eq!(a.notify_lines(24), NOTIFY_MAX_LINES as u16);
 }
+
+#[test]
+fn live_turn_cache_reveals_terminal_banner_when_run_finishes() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    for (block, expected) in [
+        (
+            Block::TurnEnd {
+                label: "gpt-test".to_string(),
+                elapsed: Duration::from_secs(2),
+            },
+            "Done in 2.0s with gpt-test",
+        ),
+        (
+            Block::TurnCancelled {
+                label: "gpt-test".to_string(),
+                elapsed: Duration::from_secs(1),
+            },
+            "Cancelled after 1.0s with gpt-test",
+        ),
+    ] {
+        let mut a = app();
+        a.run = Some(0);
+        a.run_start = Some(Instant::now());
+        a.transcript.turns.push(Turn {
+            kind: lofi_types::PromptKind::User,
+            prompt: "hi".to_string(),
+            blocks: vec![Block::Text("reply".to_string()), block],
+        });
+        a.transcript.turn_byte_ranges.push(None);
+        a.transcript.turn_event_offsets.push(None);
+        a.transcript.turn_compactions.push(Vec::new());
+
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
+        a.run_finished();
+        term.draw(|f| crate::tui::view::render(f, &mut a)).unwrap();
+
+        let screen = (0..12)
+            .map(|y| {
+                (0..80)
+                    .map(|x| term.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains(expected),
+            "expected {expected:?} after run_finished, got:\n{screen}"
+        );
+    }
+}
