@@ -1,81 +1,24 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lofi_types::{
-    ContentBlock, Message, Model, NativeToolRecord, Role, RunModel, ServiceTier, ThinkingLevel,
-    Usage,
-};
+use lofi_types::{ContentBlock, Message, Model, Role, RunModel, ServiceTier, ThinkingLevel, Usage};
 use tokio::sync::mpsc::Sender;
 
 use crate::backend;
 use crate::models::ModelRegistry;
 use crate::state;
-use lofi_code::policy::ResolvedPolicy;
-use lofi_code::{BashEnv, ExecCtx, ExecOptions, RecallFn, ResultFn, ToolEvent};
 use lofi_error::{Error, Result};
 use lofi_providers::ToolSchema;
 use lofi_providers::{open, Provider};
 use lofi_types::BashConfig;
 #[cfg(test)]
 use lofi_types::StreamingEvent;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::time::Duration;
-use tokio::sync::oneshot;
-
-#[derive(Debug)]
-pub struct ConfirmRequest {
-    pub id: u64,
-    pub command: String,
-    pub reason: Arc<Mutex<lofi_code::ConfirmReason>>,
-    pub active: Arc<AtomicBool>,
-    /// When auto mode denies this prompt on its own. `None` on prompts the
-    /// auto-deny does not cover; the UI counts down to a set value.
-    pub deny_at: Arc<Mutex<Option<std::time::Instant>>>,
-    pub respond: oneshot::Sender<ConfirmResponse>,
-}
-
-/// One answer to a [`ConfirmRequest`]. Shell prompts take `Allow`/`Deny`;
-/// directory grants take `Grant` with the access the user chose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmResponse {
-    Allow,
-    Deny,
-    Grant {
-        access: lofi_types::Access,
-        /// Grant the requested directory rather than the project root offered
-        /// as the default.
-        narrow: bool,
-    },
-}
-
-impl ConfirmResponse {
-    /// Whether this answer grants write access to a directory.
-    #[must_use]
-    pub fn is_grant_write(self) -> bool {
-        matches!(
-            self,
-            Self::Grant {
-                access: lofi_types::Access::Write,
-                ..
-            }
-        )
-    }
-
-    /// Whether this answer grants read-only access to a directory.
-    #[must_use]
-    pub fn is_grant_read(self) -> bool {
-        matches!(
-            self,
-            Self::Grant {
-                access: lofi_types::Access::Read,
-                ..
-            }
-        )
-    }
-}
 
 mod agent_run;
 #[cfg(test)]
@@ -100,7 +43,7 @@ pub use subagent::{
     SubagentLive, SubagentNotice, SubagentNoticeKind, SubagentRegistry, SubagentRunning,
     SubagentSupport,
 };
-pub use tool_executor::{ToolCallContext, ToolExecutor};
+pub use tool_executor::{ConfirmRequest, ConfirmResponse, ToolCallContext, ToolExecutor};
 pub(crate) use turn_session::ToolRecorder;
 pub use turn_session::{RunControls, TurnInput, TurnRequest};
 
