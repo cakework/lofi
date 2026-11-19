@@ -77,11 +77,11 @@ impl App {
         if let Some(sink) = self.session.sink.as_ref() {
             sink.submit_io(Box::new(move |_state| {
                 drop(rows);
-                lofi_core::release_freed_memory();
+                lofi_types::memory::release_freed_memory();
             }));
         } else {
             drop(rows);
-            lofi_core::release_freed_memory();
+            lofi_types::memory::release_freed_memory();
         }
     }
 
@@ -99,12 +99,12 @@ impl App {
                 if let Some(id) = snapshot_id {
                     state.remove_tree_snapshot(id);
                 } else {
-                    lofi_core::release_freed_memory();
+                    lofi_types::memory::release_freed_memory();
                 }
             }));
         } else {
             drop(entries);
-            lofi_core::release_freed_memory();
+            lofi_types::memory::release_freed_memory();
         }
     }
 

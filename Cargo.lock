@@ -1578,11 +1578,17 @@ name = "lofi"
 version = "0.3.7"
 dependencies = [
  "anyhow",
+ "clap",
+ "jiff",
+ "lofi-core",
+ "lofi-error",
+ "lofi-types",
  "lofi-ui",
  "nix",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "unicode-width",
 ]
@@ -1682,10 +1688,8 @@ dependencies = [
 name = "lofi-ui"
 version = "0.3.7"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64",
- "clap",
  "crossterm",
  "dirs",
  "futures",

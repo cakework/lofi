@@ -110,7 +110,7 @@ pub async fn run(
     }
     // Rejected: trim from the TUI when the channel closes. The burst is
     // allocated and dropped on this task's return paths.
-    let _trim = lofi_code::memory::ReleaseFreedMemoryOnDrop;
+    let _trim = lofi_types::memory::ReleaseFreedMemoryOnDrop;
     let prev_len = messages.len();
     let TurnRequest { input, notices } = request;
     let (prompt_message, exchange_input) = match input {

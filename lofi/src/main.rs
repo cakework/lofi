@@ -1,17 +1,10 @@
+mod cli;
+mod print;
+mod print_summary;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    // glibc reads MALLOC_ARENA_MAX before main, so setting the environment
-    // here cannot limit arenas. Apply the limit before spawning workers to
-    // keep concurrent file reads from retaining an arena per thread.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
-        #[allow(unsafe_code)]
-        unsafe {
-            // SAFETY: mallopt locks the allocator while changing its arena
-            // limit. Existing allocations remain valid.
-            nix::libc::mallopt(nix::libc::M_ARENA_MAX, 2);
-        }
-    }
+    lofi_types::memory::limit_allocator_arenas();
 
     // The TUI owns the alternate screen, so tracing stays opt-in to avoid
     // interleaving log output with rendered frames.
@@ -24,5 +17,5 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    lofi_ui::run_cli().await
+    cli::run_cli().await
 }

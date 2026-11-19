@@ -172,6 +172,14 @@ pub fn parse_env_spec(spec: &str) -> Result<(String, String)> {
     Ok((name.to_string(), value.to_string()))
 }
 
+/// Parse a slice of `NAME[=VALUE]` specs into `(name, value)` pairs.
+/// # Errors
+/// Returns [`Error::Config`] from [`parse_env_spec`] on the first invalid or
+/// unset spec.
+pub fn parse_env_specs(specs: &[String]) -> Result<Vec<(String, String)>> {
+    specs.iter().map(|spec| parse_env_spec(spec)).collect()
+}
+
 /// Apply --env specs to the process environment, returning a guard that
 /// restores the prior values on drop. The specs are applied lazily (before
 /// config resolution) so env-based config values and the agent's bash

@@ -727,7 +727,7 @@ fn load_entry_history(
     })?;
     let mut messages = projection.finish();
     drop(snapshot);
-    lofi_code::memory::release_freed_memory();
+    lofi_types::memory::release_freed_memory();
     // The projection puts the latest system prompt first; the agent carries
     // it instead, matching entries that never reloaded.
     let system = if messages

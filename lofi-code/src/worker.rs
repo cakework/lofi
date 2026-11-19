@@ -1,7 +1,6 @@
 use lofi_error::{Error, Result};
 
 use crate::ctx::{ExecCtx, ExecOptions, ExecResult};
-use crate::memory;
 use crate::run::exec;
 
 /// Long-lived owner of the sandbox thread.
@@ -29,7 +28,7 @@ impl ExecWorker {
             {
                 rt.block_on(async {
                     while let Some(job) = rx.recv().await {
-                        let _release = memory::ReleaseFreedMemoryOnDrop;
+                        let _release = lofi_types::memory::ReleaseFreedMemoryOnDrop;
                         if job.done.is_closed() {
                             continue;
                         }

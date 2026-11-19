@@ -6,6 +6,7 @@ mod config;
 mod deadline;
 mod decision;
 mod id;
+pub mod memory;
 mod message;
 mod model;
 pub mod project;

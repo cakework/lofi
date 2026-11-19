@@ -182,7 +182,7 @@ impl App {
                 }));
             } else {
                 drop(entries);
-                lofi_core::release_freed_memory();
+                lofi_types::memory::release_freed_memory();
             }
             return;
         }

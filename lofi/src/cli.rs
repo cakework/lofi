@@ -1,9 +1,11 @@
 use std::io::{IsTerminal, Write};
 
-use crate::{InteractiveOptions, PrintOptions};
 use anyhow::Context;
 use clap::Parser;
 use lofi_core::ModelRegistry;
+use lofi_ui::{run_interactive, InteractiveOptions};
+
+use crate::print::{run_print, PrintOptions};
 
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)] // CLI flag struct
@@ -179,7 +181,7 @@ enum PolicyCommand {
 
 /// # Errors
 /// Returns command parsing, configuration, I/O, or agent startup failures.
-pub async fn run_cli() -> anyhow::Result<()> {
+pub(crate) async fn run_cli() -> anyhow::Result<()> {
     // A rebuild replaces this binary while it keeps running, and the kernel
     // then reports the path as gone. Pin the image before any work can race
     // the open.
@@ -191,11 +193,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
     // (informational commands, print, interactive) observes them, and a bare
     // NAME that is unset in the parent errors before any work begins. The
     // guard is held for the whole process and restores prior values on exit.
-    let env_pairs = cli
-        .env
-        .iter()
-        .map(|spec| lofi_core::config_loader::parse_env_spec(spec))
-        .collect::<Result<Vec<_>, lofi_error::Error>>();
+    let env_pairs = lofi_core::config_loader::parse_env_specs(&cli.env);
     // A print run records its own failure, so its spec error travels to the
     // driver that writes the record instead of returning here.
     let env_pairs = match (env_pairs, cli.print.is_some() && cli.command.is_none()) {
@@ -213,10 +211,10 @@ pub async fn run_cli() -> anyhow::Result<()> {
     }
     if let Some(prompt) = cli.print.clone() {
         let opts = build_print_opts(&cli, prompt, root)?;
-        Box::pin(crate::run_print(opts)).await?;
+        Box::pin(run_print(opts)).await?;
     } else {
         let opts = build_interactive_opts(&cli, root);
-        Box::pin(crate::run_interactive(opts)).await?;
+        Box::pin(run_interactive(opts)).await?;
     }
     Ok(())
 }

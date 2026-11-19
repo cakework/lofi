@@ -364,7 +364,7 @@ impl App {
         replay_indexed_session(self, cursor, index, file_size, contiguous)?;
         // Replay parses the whole transcript and drops most of it again; the
         // freed heap sits in the arena otherwise.
-        lofi_core::release_freed_memory();
+        lofi_types::memory::release_freed_memory();
 
         restore_compaction_from_index(self, cursor, index);
         Ok(())

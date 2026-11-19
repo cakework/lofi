@@ -138,7 +138,7 @@ impl SessionCursor {
         let cursor = Self::new(path, leaf);
         *cursor.lock_compaction_index() = Some(compaction_index_suffix(&cursor.path, &selected)?);
         drop(selected);
-        lofi_code::memory::release_freed_memory();
+        lofi_types::memory::release_freed_memory();
         Ok((
             cursor,
             SessionSnapshot {
@@ -237,7 +237,7 @@ impl SessionCursor {
         let (index, history_start) = session_index_from_lineage(&self.path, &lineage)?;
         *self.lock_compaction_index() = Some(compaction_index_suffix(&self.path, &lineage)?);
         drop(lineage);
-        lofi_code::memory::release_freed_memory();
+        lofi_types::memory::release_freed_memory();
         Ok(SessionSnapshot {
             meta,
             index,

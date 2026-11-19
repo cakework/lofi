@@ -13,7 +13,6 @@ mod contract;
 mod convert;
 mod ctx;
 pub mod docs;
-pub mod memory;
 pub mod policy;
 mod run;
 mod skill_metadata;

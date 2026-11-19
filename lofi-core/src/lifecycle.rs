@@ -402,7 +402,7 @@ impl AgentLifecycle {
         *history = new_history;
         drop(history);
         // /compact can finish with no following agent run.
-        crate::release_freed_memory();
+        lofi_types::memory::release_freed_memory();
         Ok(Some(compaction))
     }
 

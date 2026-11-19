@@ -384,6 +384,7 @@ mod tests {
         assert_eq!(record["status"], json!("completed"), "{record}");
         assert_eq!(record["error"], json!(null), "{record}");
     }
+
     #[test]
     fn a_run_that_never_settled_reports_incomplete() {
         let mut summary = summary();

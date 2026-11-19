@@ -385,7 +385,7 @@ pub(crate) async fn run_loop(
     // only for branch operations. Explicitly drop it before the event loop so
     // an async state-machine frame cannot retain thousands of ID strings.
     drop(index);
-    lofi_core::release_freed_memory();
+    lofi_types::memory::release_freed_memory();
     // Resume replay creates file-backed shells for every historical turn,
     // including the final one. Viewport materialization owns the bounded
     // display working set from this point onward.
