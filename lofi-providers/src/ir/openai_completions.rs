@@ -1,12 +1,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+#[cfg(test)]
+use lofi_types::ThinkingLevel;
 use lofi_types::{
-    ContentBlock, Message, Model, PartSignatureFormat, Role, ServiceTier, StreamingEvent,
-    ThinkingLevel, Usage,
+    ContentBlock, Message, Model, PartSignatureFormat, Role, ServiceTier, StreamingEvent, Usage,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
-use super::ProtocolIr;
+use super::{collect_text, openai_effort, ProtocolIr};
 use crate::ToolSchema;
 use lofi_error::{Error, Result};
 
@@ -22,16 +23,6 @@ const REASONING_FIELDS: [&str; 4] = [
     "reasoning",
     "reasoning_text",
 ];
-
-fn collect_text(blocks: &[ContentBlock]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        if let ContentBlock::Text { text } = b {
-            out.push_str(text);
-        }
-    }
-    out
-}
 
 fn push_system(m: &Message, out: &mut Vec<Value>) {
     let text = collect_text(&m.blocks);
@@ -255,48 +246,51 @@ fn build_openai_chat_request<'a>(
     tools: &[ToolSchema],
 ) -> Value {
     let msgs = to_openai_chat_messages(model, messages);
-    let mut req = json!({
-        "model": model.id,
-        "messages": msgs,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
+    let mut req = Map::with_capacity(8);
+    req.insert("model".to_string(), Value::String(model.id.clone()));
+    req.insert("messages".to_string(), Value::Array(msgs));
+    req.insert("stream".to_string(), Value::Bool(true));
+    req.insert("stream_options".to_string(), json!({"include_usage": true}));
     if let Some(mt) = model.max_tokens {
         // `max_completion_tokens` is the current Chat Completions field
         // (`max_tokens` is deprecated and rejected by newer models).
-        req["max_completion_tokens"] = json!(mt);
+        req.insert("max_completion_tokens".to_string(), json!(mt));
     }
     if !tools.is_empty() {
         let tools_arr: Vec<Value> = tools
             .iter()
             .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.input_schema,
-                    },
-                })
+                let mut func = Map::with_capacity(3);
+                func.insert("name".to_string(), Value::String(t.name.clone()));
+                func.insert(
+                    "description".to_string(),
+                    Value::String(t.description.clone()),
+                );
+                func.insert("parameters".to_string(), t.input_schema.clone());
+                let mut tool = Map::with_capacity(2);
+                tool.insert("type".to_string(), Value::String("function".to_string()));
+                tool.insert("function".to_string(), Value::Object(func));
+                Value::Object(tool)
             })
             .collect();
-        req["tools"] = json!(tools_arr);
+        req.insert("tools".to_string(), Value::Array(tools_arr));
     }
     if let Some(effort) = openai_effort(&model.thinking) {
         // Chat Completions exposes reasoning effort as a top-level field on
         // reasoning-capable models. `off` omits it entirely so the model's
         // default behavior applies.
-        req["reasoning_effort"] = json!(effort);
+        req.insert(
+            "reasoning_effort".to_string(),
+            Value::String(effort.to_string()),
+        );
     }
     if model.service_tier != ServiceTier::Auto {
-        req["service_tier"] = json!(model.service_tier.as_str());
+        req.insert(
+            "service_tier".to_string(),
+            Value::String(model.service_tier.as_str().to_string()),
+        );
     }
-    req
-}
-
-/// Return the configured effort verbatim, omitting only `off`.
-fn openai_effort(level: &ThinkingLevel) -> Option<&str> {
-    (level != &ThinkingLevel::Off).then(|| level.as_str())
+    Value::Object(req)
 }
 
 /// Retained mapper state is endpoint-controlled: an endpoint can send an id or

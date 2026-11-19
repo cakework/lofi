@@ -372,7 +372,7 @@ fn spawn_agent_run(
     let lifecycle = app.lifecycle.clone();
     let agent = agent.clone();
     let err_tx = tx.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = lofi_core::new_cancel_flag();
     let cancel_clone = cancel.clone();
     let preempt = Arc::new(AtomicBool::new(false));
     let preempt_clone = preempt.clone();
@@ -484,7 +484,7 @@ pub(super) fn spawn_user_shell(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     let cwd = app.session.cwd.clone();
     let command_for_run = command.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = lofi_core::new_cancel_flag();
     let cancel_for_run = Arc::clone(&cancel);
     let handle = tokio::task::spawn_local(async move {
         let _ = tx
@@ -637,7 +637,7 @@ fn interrupt_run(app: &mut App, current_run: &mut Option<RunHandle>) {
         // abort only detaches a running closure), and a turn that resumed
         // later would overwrite the shared history with its own snapshot and
         // append to the transcript off an old leaf.
-        r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        lofi_core::signal_cancel(&r.cancel);
         app.cancel_at.get_or_insert_with(Instant::now);
         app.ctrl_c_at = None;
     }
@@ -647,7 +647,7 @@ pub(super) fn request_quit(app: &mut App, current_run: &mut Option<RunHandle>) {
     app.should_quit = true;
     if let Some(r) = current_run.as_mut() {
         // Signal cancel now. The event loop waits for flush and does not abort.
-        r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        lofi_core::signal_cancel(&r.cancel);
     }
 }
 

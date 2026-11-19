@@ -76,7 +76,7 @@ pub(super) fn drain_run_batch(
 /// their own. Returns true when aborted by deadline — quitting must not
 /// silently lose the un-flushed suffix.
 pub(crate) async fn settle_run_for_quit(run: RunHandle, timeout: Duration) -> bool {
-    run.cancel.store(true, Ordering::Relaxed);
+    lofi_core::signal_cancel(&run.cancel);
     let RunHandle { handle, mut rx, .. } = run;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut aborted_by_deadline = false;

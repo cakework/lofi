@@ -23,10 +23,33 @@ pub(crate) fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+pub(crate) fn collect_text(blocks: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        if let ContentBlock::Text { text } = b {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// Return the configured effort verbatim, omitting only `off`.
+pub(crate) fn openai_effort(level: &lofi_types::ThinkingLevel) -> Option<&str> {
+    (*level != lofi_types::ThinkingLevel::Off).then(|| level.as_str())
+}
+
 /// Converts provider-neutral messages to one protocol's wire request and
 /// maps that protocol's streaming payloads back to provider-neutral events.
 pub(crate) trait ProtocolIr: Send + 'static {
     type State: Default + Send + 'static;
+
+    fn endpoint_url<'a>(base_url: &'a str, model: &'a Model) -> Cow<'a, str> {
+        Cow::Borrowed(model.base_url.as_deref().unwrap_or(base_url))
+    }
+
+    fn apply_auth(builder: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        crate::with_bearer(builder, api_key)
+    }
 
     fn build_request_with_prefix(
         model: &Model,

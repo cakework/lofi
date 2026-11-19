@@ -58,9 +58,11 @@ pub(super) fn map_openai_responses_event(
             if let Some(delta) = v.get("delta").and_then(Value::as_str) {
                 if !delta.is_empty() {
                     if let Some(item_id) = v.get("item_id").and_then(Value::as_str) {
-                        state
-                            .reasoning_items_with_deltas
-                            .insert(item_id.to_string());
+                        if !state.reasoning_items_with_deltas.contains(item_id) {
+                            state
+                                .reasoning_items_with_deltas
+                                .insert(item_id.to_string());
+                        }
                     }
                     out.push(StreamingEvent::ThinkingDelta(delta.to_string()));
                 }
@@ -80,17 +82,16 @@ pub(super) fn map_openai_responses_event(
             }
         }
         "response.function_call_arguments.delta" => {
-            let item_id = v
-                .get("item_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let item_id = v.get("item_id").and_then(Value::as_str).unwrap_or("");
             if let Some(delta) = v.get("delta").and_then(Value::as_str) {
                 if !delta.is_empty() {
-                    let id = state.item_to_call.get(&item_id).cloned().unwrap_or(item_id);
-                    if !state.completed_tool_arguments.contains(&id) {
+                    let id_ref = state
+                        .item_to_call
+                        .get(item_id)
+                        .map_or(item_id, String::as_str);
+                    if !state.completed_tool_arguments.contains(id_ref) {
                         out.push(StreamingEvent::ToolUseInputDelta {
-                            id,
+                            id: id_ref.to_string(),
                             delta: delta.to_string(),
                         });
                     }

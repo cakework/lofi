@@ -570,7 +570,7 @@ impl SubagentRegistry {
                 if entry.status.is_terminal() {
                     continue;
                 }
-                entry.cancel.store(true, Ordering::SeqCst);
+                crate::agent::signal_cancel(&entry.cancel);
                 entry.notify_terminal = false;
                 let tools = entry.backend.tool_executor();
                 tools.jobs().kill_owned(id);
@@ -644,7 +644,7 @@ impl SubagentRegistry {
             if entry.status.is_terminal() {
                 return Some(entry.status.as_str());
             }
-            entry.cancel.store(true, Ordering::SeqCst);
+            crate::agent::signal_cancel(&entry.cancel);
             let mut state = json!({ "status": "cancelling" });
             if let Some(reason) = reason {
                 state["reason"] = json!(reason);

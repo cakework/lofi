@@ -19,9 +19,10 @@ mod shell;
 pub mod state;
 
 pub use agent::{
-    exec_input_code_and_label, exec_result_display, rebuild_agent, select_model, Agent, AgentEvent,
-    ConfirmRequest, ConfirmResponse, RunControls, SubagentLive, SubagentNotice, SubagentNoticeKind,
-    SubagentOp, SubagentRegistry, SubagentRunning, SubagentSupport, TurnInput, TurnRequest,
+    exec_input_code_and_label, exec_result_display, new_cancel_flag, rebuild_agent, select_model,
+    signal_cancel, Agent, AgentEvent, ConfirmRequest, ConfirmResponse, RunControls, SubagentLive,
+    SubagentNotice, SubagentNoticeKind, SubagentOp, SubagentRegistry, SubagentRunning,
+    SubagentSupport, TurnInput, TurnRequest,
 };
 pub use compact::{compact, compacted_history, CompactOptions, Compaction, HANDOFF_PREAMBLE};
 pub use lifecycle::{AgentLifecycle, HardCompactOutcome, LineageJobReconciliation};

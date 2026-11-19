@@ -38,7 +38,7 @@ impl CancelOnDrop {
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            self.cancel.store(true, Ordering::SeqCst);
+            crate::agent::signal_cancel(&self.cancel);
         }
     }
 }
@@ -452,55 +452,93 @@ fn spawn_event_drain(
 ) {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let drain = tokio::spawn(async move {
-        let note = |event: &AgentEvent| {
-            // Every event is progress: the deadline and the settle report
-            // both read this.
-            progress.note(event);
-            if let AgentEvent::RoundUsage { cost, usage } = event {
-                let spent = {
-                    let mut totals = lock(&totals);
-                    totals.add(*cost, usage);
-                    totals.total()
-                };
-                // Cancel as soon as the budget is crossed; the settle path
-                // reports the breach as the failure reason.
-                if token_budget.is_some_and(|budget| spent > budget) {
-                    cancel.store(true, Ordering::SeqCst);
-                }
+        let flush_batch = |batch: &[AgentEvent]| {
+            if batch.is_empty() {
+                return;
             }
-            if let Some(entry) = lock(&registry.entries).get_mut(&id) {
-                entry.activity.note(event);
-            }
-            let public = match event {
-                AgentEvent::Text(text) => Some(("text", json!({ "text": cap_event_text(text) }))),
-                AgentEvent::ToolStart { name, .. } => Some(("tool_start", json!({ "name": name }))),
-                AgentEvent::ToolEnd {
-                    result, is_error, ..
-                } => Some((
-                    "tool_end",
-                    json!({ "result": cap_event_text(result), "is_error": is_error }),
-                )),
-                AgentEvent::RoundUsage { cost, usage } => {
-                    Some(("usage", json!({ "cost": cost, "usage": usage })))
+            let mut public: Vec<(&'static str, Value)> = Vec::new();
+            let mut text_accum = String::new();
+            let flush_text = |text_accum: &mut String, public: &mut Vec<(&'static str, Value)>| {
+                if !text_accum.is_empty() {
+                    let chunk = cap_event_text(text_accum);
+                    text_accum.clear();
+                    public.push(("text", json!({ "text": chunk })));
                 }
-                _ => None,
             };
-            if let Some((kind, data)) = public {
-                if let Some(entry) = lock(&registry.entries).get_mut(&id) {
+            for event in batch {
+                // Every event is progress: the deadline and the settle report
+                // both read this.
+                progress.note(event);
+                if let AgentEvent::RoundUsage { cost, usage } = event {
+                    let spent = {
+                        let mut totals = lock(&totals);
+                        totals.add(*cost, usage);
+                        totals.total()
+                    };
+                    // Cancel as soon as the budget is crossed; the settle path
+                    // reports the breach as the failure reason.
+                    if token_budget.is_some_and(|budget| spent > budget) {
+                        crate::agent::signal_cancel(&cancel);
+                    }
+                }
+                match event {
+                    AgentEvent::Text(text) => {
+                        if !text_accum.is_empty()
+                            && text_accum.len().saturating_add(text.len()) > EVENT_TEXT_CAP
+                        {
+                            flush_text(&mut text_accum, &mut public);
+                        }
+                        text_accum.push_str(text);
+                    }
+                    AgentEvent::ToolStart { name, .. } => {
+                        flush_text(&mut text_accum, &mut public);
+                        public.push(("tool_start", json!({ "name": name })));
+                    }
+                    AgentEvent::ToolEnd {
+                        result, is_error, ..
+                    } => {
+                        flush_text(&mut text_accum, &mut public);
+                        public.push((
+                            "tool_end",
+                            json!({ "result": cap_event_text(result), "is_error": is_error }),
+                        ));
+                    }
+                    AgentEvent::RoundUsage { cost, usage } => {
+                        flush_text(&mut text_accum, &mut public);
+                        public.push(("usage", json!({ "cost": cost, "usage": usage })));
+                    }
+                    _ => {}
+                }
+            }
+            flush_text(&mut text_accum, &mut public);
+            if let Some(entry) = lock(&registry.entries).get_mut(&id) {
+                for event in batch {
+                    entry.activity.note(event);
+                }
+                for (kind, data) in public {
                     entry.events.push(kind, data);
                 }
             }
         };
+        let mut batch = Vec::new();
         loop {
+            batch.clear();
             tokio::select! {
                 _ = &mut stop_rx => {
                     while let Ok(event) = rx.try_recv() {
-                        note(&event);
+                        batch.push(event);
                     }
+                    flush_batch(&batch);
                     break;
                 }
                 event = rx.recv() => match event {
-                    Some(event) => note(&event),
+                    Some(first) => {
+                        batch.push(first);
+                        while let Ok(next) = rx.try_recv() {
+                            batch.push(next);
+                        }
+                        flush_batch(&batch);
+                    }
                     None => break,
                 },
             }
@@ -579,7 +617,8 @@ async fn run_under_watchdog(
     // The turn stops on its own flag: the run's flag stays the caller's, so
     // a deadline that stops this turn does not read as a kill to the summary
     // turn that follows it.
-    let stopping = Arc::new(AtomicBool::new(false));
+    let stopping = crate::agent::new_cancel_flag();
+    let cancel_notify = crate::agent::turn_session::lookup_cancel_notify(cancel);
     // A run whose task is aborted (a kill, a /new, a panic) still stops the
     // work it started: the sandbox watches this flag, not the task.
     let _stop_on_drop = CancelOnDrop {
@@ -609,6 +648,12 @@ async fn run_under_watchdog(
         tokio::select! {
             biased;
             res = &mut turn => break res,
+            () = crate::agent::turn_session::wait_cancel_flag(cancel, cancel_notify.as_ref()) => {
+                crate::agent::signal_cancel(&stopping);
+                break tokio::time::timeout(KILL_GRACE, &mut turn)
+                    .await
+                    .unwrap_or(Ok(TurnOutcome::Cancelled));
+            }
             () = tokio::time::sleep(WATCHDOG_TICK) => {
                 // A kill, an Esc, or a dropped caller stops the turn it
                 // started, and the run then settles cancelled. The turn still
@@ -616,7 +661,7 @@ async fn run_under_watchdog(
                 // the transcript sealed; only a turn that ignores the flag is
                 // dropped, after the grace a kill already allows.
                 if cancel.load(Ordering::SeqCst) {
-                    stopping.store(true, Ordering::SeqCst);
+                    crate::agent::signal_cancel(&stopping);
                     break tokio::time::timeout(KILL_GRACE, &mut turn)
                         .await
                         .unwrap_or(Ok(TurnOutcome::Cancelled));
@@ -643,7 +688,7 @@ async fn run_under_watchdog(
                     // start the command under a set stop flag.
                     let unwinding = waiting.is_none();
                     expired = Some((reason, waiting));
-                    stopping.store(true, Ordering::SeqCst);
+                    crate::agent::signal_cancel(&stopping);
                     if unwinding {
                         let _ = tokio::time::timeout(KILL_GRACE, &mut turn).await;
                     }
@@ -850,7 +895,9 @@ async fn wrap_up(
     // turn boundary keeps a per-turn cumulative cost from replacing the
     // run's total.
     lock(totals).start_turn();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = crate::agent::new_cancel_flag();
+    let cancel_notify = crate::agent::turn_session::lookup_cancel_notify(&cancel);
+    let run_cancel_notify = crate::agent::turn_session::lookup_cancel_notify(run_cancel);
     // Dropping this future (an aborted caller, a panic) still stops the
     // sandbox work a summary call may have started.
     let _stop = CancelOnDrop {
@@ -887,37 +934,43 @@ async fn wrap_up(
     tokio::pin!(deadline);
     // A cap shorter than the wrap-up budget bounds it too, so a test or a
     // tight caller never waits much past the deadline it set.
-    let finished = loop {
-        tokio::select! {
-            biased;
-            res = &mut turn => break Some(res),
-            () = &mut deadline => {
-                // The summary keeps the round it is in for the same reason
-                // the turn above does: dropping the future takes the reply
-                // it was streaming, and its message with it. The deadline
-                // stays authoritative, so this is not a wrap-up that
-                // finished.
-                cancel.store(true, Ordering::SeqCst);
-                let _ = tokio::time::timeout(KILL_GRACE, &mut turn).await;
-                break None;
-            }
-            () = tokio::time::sleep(WATCHDOG_TICK) => {
-                // The caller stopped the run, or the drain stopped the
-                // summary for crossing the budget: either way the turn winds
-                // down on its own so its round is recorded and the transcript
-                // sealed, and only a turn that ignores the flag is dropped.
-                if run_cancel.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
-                    cancel.store(true, Ordering::SeqCst);
-                    break Some(
-                        tokio::time::timeout(KILL_GRACE, &mut turn)
-                            .await
-                            .unwrap_or(Ok(TurnOutcome::Cancelled)),
-                    );
-                }
-            }
+    let finished = tokio::select! {
+        biased;
+        res = &mut turn => Some(res),
+        () = &mut deadline => {
+            // The summary keeps the round it is in for the same reason
+            // the turn above does: dropping the future takes the reply
+            // it was streaming, and its message with it. The deadline
+            // stays authoritative, so this is not a wrap-up that
+            // finished.
+            crate::agent::signal_cancel(&cancel);
+            let _ = tokio::time::timeout(KILL_GRACE, &mut turn).await;
+            None
+        }
+        () = crate::agent::turn_session::wait_cancel_flag(
+            run_cancel,
+            run_cancel_notify.as_ref(),
+        ) => {
+            crate::agent::signal_cancel(&cancel);
+            Some(
+                tokio::time::timeout(KILL_GRACE, &mut turn)
+                    .await
+                    .unwrap_or(Ok(TurnOutcome::Cancelled)),
+            )
+        }
+        () = crate::agent::turn_session::wait_cancel_flag(
+            &cancel,
+            cancel_notify.as_ref(),
+        ) => {
+            crate::agent::signal_cancel(&cancel);
+            Some(
+                tokio::time::timeout(KILL_GRACE, &mut turn)
+                    .await
+                    .unwrap_or(Ok(TurnOutcome::Cancelled)),
+            )
         }
     };
-    cancel.store(true, Ordering::SeqCst);
+    crate::agent::signal_cancel(&cancel);
     let _ = stop_tx.send(());
     let _ = drain.await;
     matches!(

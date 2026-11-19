@@ -307,13 +307,32 @@ fn find_suffix_split(live: &[LiveMessage], cut: usize, budget_tokens: usize) -> 
     None
 }
 
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_byte_len(value: &serde_json::Value) -> usize {
+    let mut counter = ByteCounter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
 pub(crate) fn estimate_message_tokens(m: &Message) -> usize {
     let chars: usize = m
         .blocks
         .iter()
         .map(|b| match b {
             ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => text.len(),
-            ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
+            ContentBlock::ToolUse { name, input, .. } => name.len() + json_byte_len(input),
             // A result pays for the images it carries beside its text.
             ContentBlock::ToolResult {
                 content, images, ..

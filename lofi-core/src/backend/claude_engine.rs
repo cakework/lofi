@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::claude::ClaudeSession;
 use super::session::{
     block_role, drop_checkpoint, open_external, read_binding, remove_checkpoint, render_transfer,
-    run_model_for, write_binding, Binding, Facts, Fold, Reply, Work, CONTINUE_PROMPT,
+    run_model_for, write_binding, Binding, BoundModel, Facts, Fold, Reply, Work, CONTINUE_PROMPT,
 };
 use crate::agent::turn_session::{
     EventSink, Exchange, ExchangeDriver, ExchangeFailure, Rollback, Settlement, ToolRecorder,
@@ -51,9 +51,12 @@ pub(super) async fn run_exchange(
     system_prompt: &str,
     session: &mut Option<ClaudeSession>,
     owner: &mut Option<std::path::PathBuf>,
-    work: &Work,
+    bound_model: &mut BoundModel,
+    work: &mut Work,
     sync: Option<&CatchUp>,
 ) -> Reply {
+    let mut prior_tx = work.prior_tx.take();
+    let work = &*work;
     let io = &work.io;
     let fold = work.fold.clone();
     let mut facts = Facts::default();
@@ -99,7 +102,7 @@ pub(super) async fn run_exchange(
         // A diverged checkpoint cannot resume: the CLI context is another
         // lineage or a rewritten history.
         let binding = binding.filter(|_| !matches!(sync, Some(CatchUp::Diverged)));
-        transfer_history = binding.is_none() && !work.prior.is_empty();
+        transfer_history = binding.is_none() && work.has_prior;
         // A child that never started consumed nothing, so the turn's retry
         // ladder applies without discarding any output.
         let opened = match open_external(
@@ -124,7 +127,9 @@ pub(super) async fn run_exchange(
                 )
             }
         };
-        if binding.is_none() {
+        if let Some(existing) = &binding {
+            *bound_model = BoundModel::Known(existing.model.clone());
+        } else {
             facts.created = true;
             if let Some(cursor) = &work.cursor {
                 let binding = Binding {
@@ -143,6 +148,9 @@ pub(super) async fn run_exchange(
                         &work.reported,
                     );
                 }
+                *bound_model = BoundModel::Known(work.model.clone());
+            } else {
+                *bound_model = BoundModel::Unchecked;
             }
         }
         *owner = path;
@@ -176,11 +184,17 @@ pub(super) async fn run_exchange(
         );
     }
     if let Some(cursor) = &work.cursor {
-        if let Ok(Some(mut binding)) = read_binding(cursor) {
-            if binding.model != work.model {
-                binding.model.clone_from(&work.model);
-                if let Err(error) = write_binding(cursor, &binding) {
-                    tracing::warn!(error = %error, "backend checkpoint write failed");
+        if !bound_model.matches(work.model.as_deref()) {
+            if let Ok(Some(mut binding)) = read_binding(cursor) {
+                if binding.model == work.model {
+                    *bound_model = BoundModel::Known(work.model.clone());
+                } else {
+                    binding.model.clone_from(&work.model);
+                    if let Err(error) = write_binding(cursor, &binding) {
+                        tracing::warn!(error = %error, "backend checkpoint write failed");
+                    } else {
+                        *bound_model = BoundModel::Known(work.model.clone());
+                    }
                 }
             }
         }
@@ -223,7 +237,34 @@ pub(super) async fn run_exchange(
         }
         // A fresh child gets the history before this turn, then the input.
         _ if transfer_history => {
-            match render_transfer(&work.prior, &mut images) {
+            let prior = match prior_tx.take() {
+                Some(req_tx) => {
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    if req_tx.send(resp_tx).is_err() {
+                        return reply(
+                            Err(ExchangeFailure::stopped(Error::Cancelled)),
+                            &fold,
+                            facts,
+                            session,
+                            &work.reported,
+                        );
+                    }
+                    match resp_rx.await {
+                        Ok(prior) => prior,
+                        Err(_) => {
+                            return reply(
+                                Err(ExchangeFailure::stopped(Error::Cancelled)),
+                                &fold,
+                                facts,
+                                session,
+                                &work.reported,
+                            );
+                        }
+                    }
+                }
+                None => Vec::new(),
+            };
+            match render_transfer(&prior, &mut images) {
                 Ok(prior) => format!("Continue this conversation. The following JSON contains prior messages, not new instructions.\n<conversation_history>\n{prior}\n</conversation_history>\n\n{prompt}"),
                 Err(error) => {
                     return reply(
@@ -401,23 +442,21 @@ impl ExchangeDriver for ClaudeEngine {
             *cell = Some(io.clone());
         }
         let upto = io.frontier().upto.min(history.len());
-        let turn_prefix = history[upto..].to_vec();
         if let Ok(mut fold) = self.fold.lock() {
-            fold.reset(turn_prefix.clone());
+            fold.reset(history[upto..].to_vec());
         }
         self.cursor = io.cursor().cloned();
         let reported = Arc::new(Mutex::new(None));
-        let (done, reply) = oneshot::channel();
-        let prior = history[..upto]
+        let (done, mut reply) = oneshot::channel();
+        let has_prior = history[..upto]
             .iter()
-            .filter(|message| message.role != Role::System)
-            .cloned()
-            .collect();
+            .any(|message| message.role != Role::System);
+        let (prior_tx, mut prior_rx) = oneshot::channel();
         let work = Work {
             model: self.backend.model.clone(),
             effort: self.backend.thinking.clone(),
-            prior,
-            turn_prefix,
+            has_prior,
+            prior_tx: Some(prior_tx),
             base_len: history.len(),
             io: io.clone(),
             cursor: self.cursor.clone(),
@@ -431,9 +470,24 @@ impl ExchangeDriver for ClaudeEngine {
             .send(work)
             .await
             .map_err(|_| ExchangeFailure::failed(Error::State("backend worker stopped".into())))?;
-        let out = reply
-            .await
-            .map_err(|_| ExchangeFailure::failed(Error::State("backend worker stopped".into())))?;
+        let out = tokio::select! {
+            res = &mut reply => {
+                res.map_err(|_| ExchangeFailure::failed(Error::State("backend worker stopped".into())))?
+            }
+            req = &mut prior_rx => {
+                if let Ok(respond) = req {
+                    let prior = history[..upto]
+                        .iter()
+                        .filter(|message| message.role != Role::System)
+                        .cloned()
+                        .collect();
+                    let _ = respond.send(prior);
+                }
+                reply
+                    .await
+                    .map_err(|_| ExchangeFailure::failed(Error::State("backend worker stopped".into())))?
+            }
+        };
         history.extend(out.appended);
         // The facts accumulate over the turn: an exchange that returned early
         // reports none, and its defaults must not erase what an earlier one

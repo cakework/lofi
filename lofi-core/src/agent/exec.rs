@@ -379,28 +379,36 @@ pub(crate) fn cap_description(text: &str) -> String {
     format!("{}{DESCRIPTION_CUT_MARKER}", &text[..end])
 }
 
+pub(crate) fn normalize_exec_input_in_place(input: &mut serde_json::Value) {
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+    match obj.get_mut("description") {
+        Some(serde_json::Value::String(description)) => {
+            let trimmed = description.trim();
+            if trimmed.len() == description.len()
+                && trimmed.chars().count() <= MAX_DESCRIPTION_CHARS
+            {
+                return;
+            }
+            *description = cap_description(trimmed);
+        }
+        // A description of another type is dropped: the call is rejected
+        // as missing one, so the transcript must not retain the value.
+        Some(_) => {
+            obj.remove("description");
+        }
+        None => {}
+    }
+}
+
 /// Cap the description of a recorded exec call, so the transcript and
 /// every later provider request carry the bounded text the label and the
 /// intent come from.
 #[must_use]
 pub fn normalize_exec_input(input: &serde_json::Value) -> serde_json::Value {
     let mut out = input.clone();
-    if let Some(obj) = out.as_object_mut() {
-        match obj.get("description") {
-            Some(serde_json::Value::String(description)) => {
-                obj.insert(
-                    "description".to_string(),
-                    serde_json::Value::String(cap_description(description)),
-                );
-            }
-            // A description of another type is dropped: the call is rejected
-            // as missing one, so the transcript must not retain the value.
-            Some(_) => {
-                obj.remove("description");
-            }
-            None => {}
-        }
-    }
+    normalize_exec_input_in_place(&mut out);
     out
 }
 

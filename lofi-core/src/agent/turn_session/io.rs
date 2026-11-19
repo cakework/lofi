@@ -382,6 +382,68 @@ pub(super) fn merge_range(
     }
 }
 
+type CancelEntry = (usize, std::sync::Weak<AtomicBool>, Arc<tokio::sync::Notify>);
+
+static CANCEL_NOTIFIERS: std::sync::LazyLock<Mutex<Vec<CancelEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Allocate a cancellation flag paired with an event-driven [`tokio::sync::Notify`].
+/// Call [`signal_cancel`] to set the flag and wake every async waiter immediately.
+#[must_use]
+pub fn new_cancel_flag() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let key = Arc::as_ptr(&flag) as usize;
+    let weak = Arc::downgrade(&flag);
+    let mut table = CANCEL_NOTIFIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    table.retain(|(_, w, _)| w.strong_count() > 0);
+    table.push((key, weak, notify));
+    flag
+}
+
+/// Set `flag` and wake every async waiter watching it.
+pub fn signal_cancel(flag: &Arc<AtomicBool>) {
+    flag.store(true, Ordering::SeqCst);
+    if let Some(notify) = lookup_cancel_notify(flag) {
+        notify.notify_waiters();
+    }
+}
+
+pub(crate) fn lookup_cancel_notify(flag: &Arc<AtomicBool>) -> Option<Arc<tokio::sync::Notify>> {
+    let key = Arc::as_ptr(flag) as usize;
+    let weak = Arc::downgrade(flag);
+    let table = CANCEL_NOTIFIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    table
+        .iter()
+        .find(|(k, w, _)| *k == key && w.ptr_eq(&weak))
+        .map(|(_, _, n)| Arc::clone(n))
+}
+
+pub(crate) async fn wait_cancel_flag(
+    flag: &Arc<AtomicBool>,
+    notify: Option<&Arc<tokio::sync::Notify>>,
+) {
+    if let Some(notify) = notify {
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            notified.await;
+        }
+    } else {
+        while !flag.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 /// The cancellation flag of one turn.
 ///
 /// Monotonic: once set it stays set, so a transport that signals it can only
@@ -389,6 +451,7 @@ pub(super) fn merge_range(
 #[derive(Clone, Default)]
 pub struct CancelToken {
     flag: Option<Arc<AtomicBool>>,
+    notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CancelToken {
@@ -396,8 +459,11 @@ impl CancelToken {
     /// that passes none still gets one, so dropping the turn future can stop
     /// its child.
     pub(crate) fn new(flag: Option<Arc<AtomicBool>>) -> Self {
+        let flag = flag.unwrap_or_else(new_cancel_flag);
+        let notify = lookup_cancel_notify(&flag);
         Self {
-            flag: Some(flag.unwrap_or_default()),
+            flag: Some(flag),
+            notify,
         }
     }
 
@@ -409,7 +475,10 @@ impl CancelToken {
 
     pub(crate) fn signal(&self) {
         if let Some(flag) = &self.flag {
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(notify) = &self.notify {
+            notify.notify_waiters();
         }
     }
 
@@ -417,12 +486,15 @@ impl CancelToken {
         self.flag.as_ref()
     }
 
-    /// Resolve once the turn is cancelled. Polls the flag the caller sets, so
-    /// a UI interrupt and a dropped caller reach it the same way.
+    /// Resolve once the turn is cancelled. Uses [`tokio::sync::Notify`] when
+    /// allocated via [`new_cancel_flag`], falling back to 10ms polling only for
+    /// raw `Arc<AtomicBool>` flags constructed directly in tests.
     pub(crate) async fn wait(&self) {
-        while !self.is_cancelled() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let Some(flag) = &self.flag else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        wait_cancel_flag(flag, self.notify.as_ref()).await;
     }
 }
 

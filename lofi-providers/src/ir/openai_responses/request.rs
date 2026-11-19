@@ -1,17 +1,8 @@
-use lofi_types::{ContentBlock, Message, Model, Role, ServiceTier, ThinkingLevel};
-use serde_json::{json, Value};
+use lofi_types::{ContentBlock, Message, Model, Role, ServiceTier};
+use serde_json::{json, Map, Value};
 
+use crate::ir::{collect_text, openai_effort};
 use crate::ToolSchema;
-
-fn collect_text(blocks: &[ContentBlock]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        if let ContentBlock::Text { text } = b {
-            out.push_str(text);
-        }
-    }
-    out
-}
 
 fn input_message(message: &Message) -> Option<Value> {
     let text = collect_text(&message.blocks);
@@ -146,67 +137,95 @@ pub(super) fn build_openai_responses_request<'a>(
     tools: &[ToolSchema],
 ) -> Value {
     let input = to_openai_responses_input(messages);
-    let mut req = json!({
-        "model": model.id,
-        "input": input,
-        "stream": true,
-        "store": false,
-    });
+    let cache_key = prompt_cache_key(model, &input);
+    let mut req = Map::with_capacity(10);
+    req.insert("model".to_string(), Value::String(model.id.clone()));
+    req.insert("input".to_string(), Value::Array(input));
+    req.insert("stream".to_string(), Value::Bool(true));
+    req.insert("store".to_string(), Value::Bool(false));
     // Stateless Responses (store=false / ZDR) needs the encrypted reasoning
     // blob on later turns. OpenAI now emits it by default; `include` remains
     // for older and compatible endpoints.
-    req["include"] = json!(["reasoning.encrypted_content"]);
-    req["prompt_cache_key"] = json!(prompt_cache_key(model, &input));
+    req.insert(
+        "include".to_string(),
+        json!(["reasoning.encrypted_content"]),
+    );
+    req.insert("prompt_cache_key".to_string(), Value::String(cache_key));
     if let Some(mt) = model.max_tokens {
-        req["max_output_tokens"] = json!(mt);
+        req.insert("max_output_tokens".to_string(), json!(mt));
     }
     if !tools.is_empty() {
         let tools_arr: Vec<Value> = tools
             .iter()
             .map(|t| {
-                json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema,
-                })
+                let mut tool = Map::with_capacity(4);
+                tool.insert("type".to_string(), Value::String("function".to_string()));
+                tool.insert("name".to_string(), Value::String(t.name.clone()));
+                tool.insert(
+                    "description".to_string(),
+                    Value::String(t.description.clone()),
+                );
+                tool.insert("parameters".to_string(), t.input_schema.clone());
+                Value::Object(tool)
             })
             .collect();
-        req["tools"] = json!(tools_arr);
+        req.insert("tools".to_string(), Value::Array(tools_arr));
     }
     if let Some(effort) = openai_effort(&model.thinking) {
-        req["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+        req.insert(
+            "reasoning".to_string(),
+            json!({ "effort": effort, "summary": "auto" }),
+        );
     }
     if model.service_tier != ServiceTier::Auto {
-        req["service_tier"] = json!(model.service_tier.as_str());
+        req.insert(
+            "service_tier".to_string(),
+            Value::String(model.service_tier.as_str().to_string()),
+        );
     }
-    req
+    Value::Object(req)
+}
+
+struct FnvHasher(u64);
+
+impl FnvHasher {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+}
+
+impl std::io::Write for FnvHasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn prompt_cache_key(model: &Model, input: &[Value]) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut hash = FNV_OFFSET;
-    let mut update = |bytes: &[u8]| {
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    };
-    update(model.id.as_bytes());
+    let mut hasher = FnvHasher::new();
+    hasher.update(model.id.as_bytes());
     if let Some(first) = input.first() {
-        update(first.to_string().as_bytes());
+        let _ = serde_json::to_writer(&mut hasher, first);
     }
     if let Some(first_user) = input
         .iter()
         .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
     {
-        update(first_user.to_string().as_bytes());
+        let _ = serde_json::to_writer(&mut hasher, first_user);
     }
-    format!("lofi:{hash:016x}")
-}
-
-fn openai_effort(level: &ThinkingLevel) -> Option<&str> {
-    (level != &ThinkingLevel::Off).then(|| level.as_str())
+    format!("lofi:{:016x}", hasher.0)
 }

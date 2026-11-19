@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -7,13 +8,47 @@ use lofi_types::ContentBlock;
 use serde_json::{json, Value};
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 use super::rpc;
 use crate::agent::{ToolCallContext, ToolExecutor};
 
+pub(super) struct BridgeWatch {
+    finished: Arc<AtomicBool>,
+    done: Arc<Notify>,
+}
+
+impl BridgeWatch {
+    pub(super) async fn wait(&self) {
+        loop {
+            let notified = self.done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.finished.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct FinishOnDrop {
+    finished: Arc<AtomicBool>,
+    done: Arc<Notify>,
+}
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        self.done.notify_waiters();
+    }
+}
+
 pub(super) struct Bridge {
     pub config: Value,
     active: Arc<Mutex<Option<ToolCallContext>>>,
+    finished: Arc<AtomicBool>,
+    done: Arc<Notify>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -26,8 +61,16 @@ impl Bridge {
         let config = json!({"name":"lofi", "command":executable, "args":["mcp", "serve"],
             "env":[{"name":"LOFI_EXEC_ADDRESS","value":address.to_string()}, {"name":"LOFI_EXEC_TOKEN","value":token}]});
         let active = Arc::new(Mutex::new(None));
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(Notify::new());
         let state = active.clone();
+        let task_finished = finished.clone();
+        let task_done = done.clone();
         let task = tokio::spawn(async move {
+            let _guard = FinishOnDrop {
+                finished: task_finished,
+                done: task_done,
+            };
             let (stream, _) = listener.accept().await?;
             let (reader, mut writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
@@ -43,6 +86,8 @@ impl Bridge {
         Ok(Self {
             config,
             active,
+            finished,
+            done,
             task,
         })
     }
@@ -65,8 +110,11 @@ impl Bridge {
         }
     }
 
-    pub fn task_handle(&self) -> tokio::task::AbortHandle {
-        self.task.abort_handle()
+    pub fn watcher(&self) -> BridgeWatch {
+        BridgeWatch {
+            finished: self.finished.clone(),
+            done: self.done.clone(),
+        }
     }
 }
 

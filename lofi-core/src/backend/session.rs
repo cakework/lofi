@@ -272,9 +272,10 @@ impl ExternalBackend {
                 runtime.block_on(async move {
                     let mut session: Option<ClaudeSession> = None;
                     let mut owner = None;
+                    let mut bound_model = BoundModel::Unchecked;
                     let mut history_len = 0;
                     let mut effort = lofi_types::ThinkingLevel::Off;
-                    while let Some(work) = rx.recv().await {
+                    while let Some(mut work) = rx.recv().await {
                         if work.done.is_closed() {
                             continue;
                         }
@@ -323,11 +324,9 @@ impl ExternalBackend {
                                 let _ = previous.close().await;
                             }
                             owner = None;
+                            bound_model = BoundModel::Unchecked;
                         }
                         effort = work.effort.clone();
-                        if let Ok(mut fold) = work.fold.lock() {
-                            fold.reset(work.turn_prefix.clone());
-                        }
                         let out = run_exchange(
                             &name,
                             &config,
@@ -336,7 +335,8 @@ impl ExternalBackend {
                             &system_prompt,
                             &mut session,
                             &mut owner,
-                            &work,
+                            &mut bound_model,
+                            &mut work,
                             sync.as_ref(),
                         )
                         .await;
@@ -345,7 +345,8 @@ impl ExternalBackend {
                         // this turn's leaf would gate the next resume on a delta
                         // the disk lacks.
                         if work.abandoned.load(Ordering::Acquire) {
-                            abandon_exchange(&work, &mut session, &mut owner).await;
+                            abandon_exchange(&work, &mut session, &mut owner, &mut bound_model)
+                                .await;
                         }
                         history_len = work.base_len + out.appended.len();
                         let _ = work.done.send(out);
@@ -366,6 +367,7 @@ async fn abandon_exchange(
     work: &Work,
     session: &mut Option<ClaudeSession>,
     owner: &mut Option<PathBuf>,
+    bound_model: &mut BoundModel,
 ) {
     if let Some(cursor) = work.cursor.as_ref() {
         remove_checkpoint(cursor);
@@ -374,6 +376,7 @@ async fn abandon_exchange(
         let _ = previous.close().await;
     }
     *owner = None;
+    *bound_model = BoundModel::Unchecked;
 }
 
 pub(super) async fn open_external(
@@ -446,15 +449,28 @@ fn child_is_fresh(
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+pub(super) enum BoundModel {
+    #[default]
+    Unchecked,
+    Known(Option<String>),
+}
+
+impl BoundModel {
+    pub(super) fn matches(&self, model: Option<&str>) -> bool {
+        matches!(self, Self::Known(bound) if bound.as_deref() == model)
+    }
+}
+
 /// One exchange handed to the worker thread.
 pub(super) struct Work {
     pub(super) model: Option<String>,
     pub(super) effort: lofi_types::ThinkingLevel,
-    /// Non-system messages before this turn's admission frontier, used when a
-    /// fresh child must receive prior conversation history.
-    pub(super) prior: Vec<Message>,
-    /// Messages already recorded in this turn before this exchange began.
-    pub(super) turn_prefix: Vec<Message>,
+    /// Whether non-system messages exist before this turn's admission frontier.
+    pub(super) has_prior: bool,
+    /// On-demand channel requesting prior history only when a fresh child with
+    /// no valid binding needs history transfer.
+    pub(super) prior_tx: Option<oneshot::Sender<oneshot::Sender<Vec<Message>>>>,
     /// Total length of the caller's history at the start of this exchange.
     pub(super) base_len: usize,
     pub(super) io: TurnIo,

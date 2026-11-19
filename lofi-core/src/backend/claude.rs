@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -412,28 +412,31 @@ impl ClaudeSession {
         let cancel = context
             .cancel
             .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let tool_cancel = Arc::new(AtomicBool::new(false));
+            .unwrap_or_else(crate::agent::new_cancel_flag);
+        let cancel_notify = crate::agent::turn_session::lookup_cancel_notify(&cancel);
+        let tool_cancel = crate::agent::new_cancel_flag();
         context.cancel = Some(tool_cancel.clone());
         let events = context.events.clone();
-        let bridge = self.bridge.task_handle();
+        let bridge = self.bridge.watcher();
         // The watcher reports why it fired. A set flag or a closed consumer is
         // a cancellation; a dead bridge is a transport failure. Reporting both
         // as `Cancelled` settled the turn as a detach and answered the prompt
         // with silence.
         let interrupted = async {
-            loop {
-                if cancel.load(Ordering::Relaxed)
-                    || events
-                        .as_ref()
-                        .is_some_and(crate::agent::turn_session::EventSink::is_closed)
-                {
-                    break Error::Cancelled;
+            let events_closed = async {
+                match &events {
+                    Some(sink) => sink.closed().await,
+                    None => std::future::pending().await,
                 }
-                if bridge.is_finished() {
-                    break Error::State("Claude Code tool bridge stopped".into());
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            tokio::select! {
+                biased;
+                () = crate::agent::turn_session::wait_cancel_flag(
+                    &cancel,
+                    cancel_notify.as_ref(),
+                ) => Error::Cancelled,
+                () = events_closed => Error::Cancelled,
+                () = bridge.wait() => Error::State("Claude Code tool bridge stopped".into()),
             }
         };
         // The prompt future holds the mutable borrow of self for as long as it
@@ -477,7 +480,7 @@ impl ClaudeSession {
             };
             (result, lost_child)
         };
-        tool_cancel.store(true, Ordering::Relaxed);
+        crate::agent::signal_cancel(&tool_cancel);
         // A finished turn serves no tool call: the context holds a clone of the
         // turn's event sender, and a live one would keep the sink open.
         self.bridge.deactivate();

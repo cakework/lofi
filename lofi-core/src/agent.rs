@@ -45,7 +45,7 @@ pub use subagent::{
 };
 pub use tool_executor::{ConfirmRequest, ConfirmResponse, ToolCallContext, ToolExecutor};
 pub(crate) use turn_session::ToolRecorder;
-pub use turn_session::{RunControls, TurnInput, TurnRequest};
+pub use turn_session::{new_cancel_flag, signal_cancel, RunControls, TurnInput, TurnRequest};
 
 #[cfg(test)]
 mod tests;
@@ -56,7 +56,7 @@ pub use event::AgentEvent;
 pub(crate) use exec::extract_code_prefix;
 pub(crate) use exec::{
     cap_description, exec_timeout_ms, exec_tool_schema_bytes, exec_tool_schema_ref,
-    normalize_exec_input,
+    normalize_exec_input, normalize_exec_input_in_place,
 };
 pub(crate) use exec::{cap_exec_envelope, cap_exec_result, cap_tool_result, CodePrefixDecoder};
 pub use exec::{

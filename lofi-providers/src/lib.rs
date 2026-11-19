@@ -1,15 +1,12 @@
-mod anthropic_messages;
-mod google_generative_ai;
 mod ir;
 mod message_assembler;
-mod openai_completions;
-mod openai_responses;
 pub(crate) mod sse;
 mod systemone;
 
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -18,13 +15,77 @@ use lofi_types::{Api, Message, Model, ProviderConfig, StreamingEvent};
 
 use lofi_error::{Error, Result};
 
-use anthropic_messages::AnthropicMessagesProvider;
-pub use anthropic_messages::ANTHROPIC_VERSION;
-use google_generative_ai::GoogleGenerativeAiProvider;
+pub use ir::anthropic_messages::ANTHROPIC_VERSION;
+use ir::{
+    AnthropicMessagesIr, GoogleGenerativeAiIr, OpenAiCompletionsIr, OpenAiResponsesIr, ProtocolIr,
+};
 pub use message_assembler::{assemble_message, MessageAssembler};
-use openai_completions::OpenAiCompletionsProvider;
-use openai_responses::OpenAiResponsesProvider;
+use sse::{map_sse_response, IrSseMapper};
 pub use systemone::{open_decision, Decision, DecisionRequest, DecisionResponse, DecisionUsage};
+
+struct IrProvider<I: ProtocolIr> {
+    base_url: String,
+    api_key: String,
+    headers: HashMap<String, String>,
+    client: reqwest::Client,
+    response_start_timeout: std::time::Duration,
+    body_idle: std::time::Duration,
+    _ir: PhantomData<fn() -> I>,
+}
+
+impl<I: ProtocolIr> IrProvider<I> {
+    fn new(
+        base_url: String,
+        api_key: String,
+        headers: HashMap<String, String>,
+        client: reqwest::Client,
+        response_start_timeout: std::time::Duration,
+        body_idle: std::time::Duration,
+    ) -> Self {
+        Self {
+            base_url,
+            api_key,
+            headers,
+            client,
+            response_start_timeout,
+            body_idle,
+            _ir: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<I: ProtocolIr> Provider for IrProvider<I> {
+    async fn stream(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<BoxStream<'static, Result<StreamingEvent>>> {
+        self.stream_with_prefix(model, &[], messages, tools).await
+    }
+
+    async fn stream_with_prefix(
+        &self,
+        model: &Model,
+        prefix: &[Message],
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<BoxStream<'static, Result<StreamingEvent>>> {
+        let body = I::build_request_with_prefix(model, prefix, messages, tools);
+        let url = I::endpoint_url(&self.base_url, model);
+        let req = apply_headers(
+            I::apply_auth(self.client.post(url.as_ref()).json(&body), &self.api_key),
+            &self.headers,
+        );
+        let resp = send_stream_request(req, self.response_start_timeout).await?;
+        Ok(map_sse_response(
+            resp,
+            self.body_idle,
+            IrSseMapper::<I>::new(model),
+        ))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ToolSchema {
@@ -104,38 +165,38 @@ pub fn open(api: Api, cfg: &ProviderConfig) -> Result<Box<dyn Provider>> {
                     .to_string(),
             ));
         }
-        Api::OpenAiCompletions => Box::new(OpenAiCompletionsProvider {
+        Api::OpenAiCompletions => Box::new(IrProvider::<OpenAiCompletionsIr>::new(
             base_url,
             api_key,
             headers,
             client,
             response_start_timeout,
             body_idle,
-        }),
-        Api::OpenAiResponses => Box::new(OpenAiResponsesProvider {
+        )),
+        Api::OpenAiResponses => Box::new(IrProvider::<OpenAiResponsesIr>::new(
             base_url,
             api_key,
             headers,
             client,
             response_start_timeout,
             body_idle,
-        }),
-        Api::AnthropicMessages => Box::new(AnthropicMessagesProvider {
+        )),
+        Api::AnthropicMessages => Box::new(IrProvider::<AnthropicMessagesIr>::new(
             base_url,
             api_key,
             headers,
             client,
             response_start_timeout,
             body_idle,
-        }),
-        Api::GoogleGenerativeAi => Box::new(GoogleGenerativeAiProvider {
+        )),
+        Api::GoogleGenerativeAi => Box::new(IrProvider::<GoogleGenerativeAiIr>::new(
             base_url,
             api_key,
             headers,
             client,
             response_start_timeout,
             body_idle,
-        }),
+        )),
     };
     Ok(provider)
 }
@@ -638,14 +699,14 @@ mod tests {
         let mut c = cfg();
         c.base_url = Some("https://api.example.com/".to_string());
         assert!(open(Api::OpenAiCompletions, &c).is_ok());
-        let oc = OpenAiCompletionsProvider {
-            base_url: "https://api.example.com".to_string(),
-            api_key: "sk-test".to_string(),
-            headers: HashMap::from([("x-custom".to_string(), "yes".to_string())]),
-            client: http_client().unwrap(),
-            response_start_timeout: std::time::Duration::from_secs(90),
-            body_idle: std::time::Duration::from_mins(5),
-        };
+        let oc = IrProvider::<OpenAiCompletionsIr>::new(
+            "https://api.example.com".to_string(),
+            "sk-test".to_string(),
+            HashMap::from([("x-custom".to_string(), "yes".to_string())]),
+            http_client().unwrap(),
+            std::time::Duration::from_secs(90),
+            std::time::Duration::from_mins(5),
+        );
         assert_eq!(oc.base_url, "https://api.example.com");
     }
 
@@ -655,6 +716,7 @@ mod tests {
             Api::OpenAiCompletions,
             Api::OpenAiResponses,
             Api::AnthropicMessages,
+            Api::GoogleGenerativeAi,
         ] {
             let mut c = cfg();
             c.api_type = Some(api);

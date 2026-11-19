@@ -1,5 +1,6 @@
 //! Native Google Generative AI request and streaming response mapping.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use base64::Engine as _;
@@ -25,6 +26,15 @@ pub(crate) struct GoogleMapperState {
 
 impl ProtocolIr for GoogleGenerativeAiIr {
     type State = GoogleMapperState;
+
+    fn endpoint_url<'a>(base_url: &'a str, model: &'a Model) -> Cow<'a, str> {
+        let base = model.base_url.as_deref().unwrap_or(base_url);
+        Cow::Owned(stream_url(base, &model.id))
+    }
+
+    fn apply_auth(builder: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        crate::with_key_header(builder, "x-goog-api-key", api_key)
+    }
 
     fn build_request_inner<'a>(
         model: &Model,
@@ -103,25 +113,58 @@ fn build_request<'a>(
         }
     }
 
-    let mut body = json!({"contents": contents});
+    let mut body = Map::with_capacity(4);
+    body.insert("contents".to_string(), Value::Array(contents));
     if !system.is_empty() {
-        body["systemInstruction"] = json!({"parts": system});
+        let mut sys = Map::with_capacity(1);
+        sys.insert("parts".to_string(), Value::Array(system));
+        body.insert("systemInstruction".to_string(), Value::Object(sys));
     }
     if !tools.is_empty() {
-        body["tools"] = json!([{
-            "functionDeclarations": tools.iter().map(|tool| json!({
-                "name": tool.name,
-                "description": tool.description,
-                "parametersJsonSchema": tool.input_schema,
-            })).collect::<Vec<_>>()
-        }]);
+        let declarations: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                let mut decl = Map::with_capacity(3);
+                decl.insert("name".to_string(), Value::String(tool.name.clone()));
+                decl.insert(
+                    "description".to_string(),
+                    Value::String(tool.description.clone()),
+                );
+                decl.insert(
+                    "parametersJsonSchema".to_string(),
+                    tool.input_schema.clone(),
+                );
+                Value::Object(decl)
+            })
+            .collect();
+        let mut entry = Map::with_capacity(1);
+        entry.insert(
+            "functionDeclarations".to_string(),
+            Value::Array(declarations),
+        );
+        body.insert(
+            "tools".to_string(),
+            Value::Array(vec![Value::Object(entry)]),
+        );
     }
 
     let generation = generation_config(model);
     if !generation.is_empty() {
-        body["generationConfig"] = Value::Object(generation);
+        body.insert("generationConfig".to_string(), Value::Object(generation));
     }
-    body
+    Value::Object(body)
+}
+
+fn stream_url(base: &str, model_id: &str) -> String {
+    if base.contains(":streamGenerateContent") {
+        return base.to_string();
+    }
+    let model_id = model_id.strip_prefix("models/").unwrap_or(model_id);
+    format!(
+        "{}/models/{}:streamGenerateContent?alt=sse",
+        base.trim_end_matches('/'),
+        model_id
+    )
 }
 
 fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
@@ -735,6 +778,17 @@ mod tests {
                     signature: "c2ln".into(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn builds_native_stream_url() {
+        assert_eq!(
+            super::stream_url(
+                "https://generativelanguage.googleapis.com/v1beta/",
+                "gemini-3-flash"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse"
         );
     }
 }

@@ -15,7 +15,11 @@ mod recovery;
 pub use contract::{
     Exchange, ExchangeDriver, ExchangeFailure, Rollback, Settlement, ToolRecorder, TurnPolicy,
 };
-pub(crate) use io::{Admission, CancelToken, EventSink, ExchangeInput, TurnIo};
+pub(crate) use io::{
+    lookup_cancel_notify, wait_cancel_flag, Admission, CancelToken, EventSink, ExchangeInput,
+    TurnIo,
+};
+pub use io::{new_cancel_flag, signal_cancel};
 pub(crate) use record::{discard_round, record_notice, record_prompt};
 #[cfg(test)]
 pub(in crate::agent) use recovery::MAX_RECOVERY_ROUNDS;

@@ -283,7 +283,7 @@ pub(super) async fn prepare(
     // would leak child processes at session end.
     let jobs = template.tool_executor().jobs();
 
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = crate::agent::new_cancel_flag();
     // Reserve capacity, the id, and a placeholder entry under one lock;
     // transcript creation does blocking store I/O and must not hold it.
     // A rejected spawn returns inside the block, so it leaves no persistent
@@ -485,7 +485,7 @@ pub(super) fn restore_entry(
         backend: child,
         messages: Vec::new(),
         history_loaded: false,
-        cancel: Arc::new(AtomicBool::new(false)),
+        cancel: crate::agent::new_cancel_flag(),
         session: file
             .path()
             .file_name()
@@ -612,7 +612,7 @@ fn prepare_resume_run(
         // Fresh cancel flag per run: the previous run's flag may still be
         // observed by its lingering sandbox work, and resetting it would
         // uncancel that work.
-        entry.cancel = Arc::new(AtomicBool::new(false));
+        entry.cancel = crate::agent::new_cancel_flag();
         // The previous run's outcome and abort handle belong to that run; the
         // new run stores its own. Waiters see the state move back to running.
         entry.outcome = None;

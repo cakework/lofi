@@ -73,10 +73,18 @@ fn cap_exec_descriptions(blocks: &mut [ContentBlock]) {
     for block in blocks {
         if let ContentBlock::ToolUse { name, input, .. } = block {
             if name == lofi_code::EXEC_TOOL_NAME {
-                *input = crate::agent::normalize_exec_input(input);
+                crate::agent::normalize_exec_input_in_place(input);
             }
         }
     }
+}
+
+#[derive(Default)]
+struct ToolStreamState {
+    raw: String,
+    emitted: usize,
+    decoder: super::CodePrefixDecoder,
+    started_decoding: bool,
 }
 
 /// The provider transport's per-turn state. It must not leak across turns, so
@@ -299,9 +307,7 @@ impl Agent {
         let mut round_stop_reason: Option<lofi_types::StopReason> = None;
         let mut reply_bytes = 0usize;
         let mut opaque_bytes = 0usize;
-        let mut tool_raw: HashMap<String, String> = HashMap::new();
-        let mut tool_emitted: HashMap<String, usize> = HashMap::new();
-        let mut tool_decoders: HashMap<String, super::CodePrefixDecoder> = HashMap::new();
+        let mut tool_streams: HashMap<String, ToolStreamState> = HashMap::new();
         let mut provider_progress = false;
         // The round stopped at its reply byte budget.
         let mut budget_capped = false;
@@ -361,37 +367,41 @@ impl Agent {
                         }
                     }
                     StreamingEvent::ToolUseInputDelta { id, delta } => {
-                        let raw = tool_raw.entry(id.clone()).or_default();
-                        raw.push_str(delta);
-                        let decoded = tool_decoders.entry(id.clone()).or_default().update(raw);
-                        let prev = tool_emitted.get(id).copied().unwrap_or(0);
+                        let ts = match tool_streams.get_mut(id.as_str()) {
+                            Some(ts) => ts,
+                            None => tool_streams.entry(id.clone()).or_default(),
+                        };
+                        ts.raw.push_str(delta);
+                        ts.started_decoding = true;
+                        let decoded = ts.decoder.update(&ts.raw);
+                        let prev = ts.emitted;
                         if let Some(chunk) = decoded.get(prev..) {
                             if !chunk.is_empty() {
-                                if !sink.tool_input_delta(id.clone(), chunk.to_string()).await {
+                                let new_len = decoded.len();
+                                let chunk = chunk.to_string();
+                                if !sink.tool_input_delta(id.clone(), chunk).await {
                                     return Err(Error::Cancelled);
                                 }
-                                tool_emitted.insert(id.clone(), decoded.len());
+                                ts.emitted = new_len;
                             }
                         }
                     }
                     StreamingEvent::ToolUseInputComplete { id, input } => {
-                        reply_bytes = reply_bytes.saturating_add(
-                            input
-                                .len()
-                                .saturating_sub(tool_raw.get(id).map_or(0, String::len)),
-                        );
-                        let previous = tool_decoders
-                            .get_mut(id)
-                            .map(|decoder| {
-                                decoder
-                                    .update(tool_raw.get(id).map_or("", String::as_str))
-                                    .to_string()
-                            })
-                            .unwrap_or_default();
-                        tool_raw.insert(id.clone(), input.clone());
-                        let mut complete_decoder = super::CodePrefixDecoder::default();
-                        let complete_code = complete_decoder.update(input).to_string();
-                        tool_decoders.insert(id.clone(), complete_decoder);
+                        let ts = match tool_streams.get_mut(id.as_str()) {
+                            Some(ts) => ts,
+                            None => tool_streams.entry(id.clone()).or_default(),
+                        };
+                        reply_bytes =
+                            reply_bytes.saturating_add(input.len().saturating_sub(ts.raw.len()));
+                        let previous = if ts.started_decoding {
+                            ts.decoder.update(&ts.raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        ts.raw.clone_from(input);
+                        ts.decoder = super::CodePrefixDecoder::default();
+                        ts.started_decoding = true;
+                        let complete_code = ts.decoder.update(input).to_string();
                         if let Some(chunk) = complete_code.strip_prefix(&previous) {
                             if !chunk.is_empty()
                                 && !sink.tool_input_delta(id.clone(), chunk.to_string()).await
@@ -399,7 +409,7 @@ impl Agent {
                                 return Err(Error::Cancelled);
                             }
                         }
-                        tool_emitted.insert(id.clone(), complete_code.len());
+                        ts.emitted = complete_code.len();
                     }
                     StreamingEvent::Done { usage, stop_reason } => {
                         round_stop_reason = *stop_reason;

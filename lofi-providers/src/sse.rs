@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use lofi_types::StreamingEvent;
@@ -7,43 +9,64 @@ use crate::provider_transport_error;
 use lofi_error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SseEvent {
-    pub event: Option<String>,
-    pub data: String,
+pub(crate) struct SseEvent<'a> {
+    pub event: Option<&'a str>,
+    pub data: Cow<'a, str>,
 }
 
-#[must_use]
-fn parse_sse_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<SseEvent> {
-    let mut out = Vec::new();
-    let mut event = None;
-    let mut data_lines = Vec::new();
-    let mut have_data = false;
-    for line in lines {
+fn for_each_sse_event<'a>(block: &'a str, mut on_event: impl FnMut(SseEvent<'a>) -> bool) {
+    let mut event: Option<&'a str> = None;
+    let mut first_data: Option<&'a str> = None;
+    let mut multi_data: Option<String> = None;
+    for line in block.lines() {
         if line.is_empty() {
-            if have_data {
-                out.push(SseEvent {
+            if let Some(buf) = multi_data.take() {
+                if !on_event(SseEvent {
                     event: event.take(),
-                    data: data_lines.join("\n"),
-                });
-                data_lines.clear();
-                have_data = false;
+                    data: Cow::Owned(buf),
+                }) {
+                    return;
+                }
+                first_data = None;
+            } else if let Some(single) = first_data.take() {
+                if !on_event(SseEvent {
+                    event: event.take(),
+                    data: Cow::Borrowed(single),
+                }) {
+                    return;
+                }
             } else {
                 event = None;
             }
         } else if let Some(rest) = line.strip_prefix("event:") {
-            event = Some(rest.trim().to_string());
+            event = Some(rest.trim());
         } else if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-            have_data = true;
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            if let Some(buf) = &mut multi_data {
+                buf.push('\n');
+                buf.push_str(payload);
+            } else if let Some(prev) = first_data {
+                let mut buf = String::with_capacity(prev.len() + 1 + payload.len());
+                buf.push_str(prev);
+                buf.push('\n');
+                buf.push_str(payload);
+                multi_data = Some(buf);
+            } else {
+                first_data = Some(payload);
+            }
         }
     }
-    if have_data {
-        out.push(SseEvent {
+    if let Some(buf) = multi_data {
+        let _ = on_event(SseEvent {
             event,
-            data: data_lines.join("\n"),
+            data: Cow::Owned(buf),
+        });
+    } else if let Some(single) = first_data {
+        let _ = on_event(SseEvent {
+            event,
+            data: Cow::Borrowed(single),
         });
     }
-    out
 }
 
 fn is_done_marker(data: &str) -> bool {
@@ -71,10 +94,10 @@ impl<I: ProtocolIr> Default for IrSseMapper<I> {
 }
 
 impl<I: ProtocolIr> SseMapper for IrSseMapper<I> {
-    fn map(&mut self, event: SseEvent) -> Result<Vec<StreamingEvent>> {
+    fn map(&mut self, event: SseEvent<'_>) -> Result<Vec<StreamingEvent>> {
         let data: serde_json::Value = serde_json::from_str(&event.data)
             .map_err(|error| Error::Provider(format!("malformed SSE data: {error}")))?;
-        I::map_event(event.event.as_deref(), &data, &mut self.state)
+        I::map_event(event.event, &data, &mut self.state)
     }
 
     fn on_eof(&mut self) -> Result<()> {
@@ -93,7 +116,7 @@ impl<I: ProtocolIr> SseMapper for IrSseMapper<I> {
 pub(crate) type EventStream = std::pin::Pin<Box<dyn Stream<Item = Result<StreamingEvent>> + Send>>;
 
 pub(crate) trait SseMapper: Send + 'static {
-    fn map(&mut self, event: SseEvent) -> Result<Vec<StreamingEvent>>;
+    fn map(&mut self, event: SseEvent<'_>) -> Result<Vec<StreamingEvent>>;
 
     /// Called when the upstream byte stream ends. The default accepts EOF;
     /// providers whose protocol requires an explicit terminal event override
@@ -122,9 +145,9 @@ pub(crate) trait SseMapper: Send + 'static {
 
 impl<F> SseMapper for F
 where
-    F: FnMut(SseEvent) -> Result<Vec<StreamingEvent>> + Send + 'static,
+    F: for<'a> FnMut(SseEvent<'a>) -> Result<Vec<StreamingEvent>> + Send + 'static,
 {
-    fn map(&mut self, event: SseEvent) -> Result<Vec<StreamingEvent>> {
+    fn map(&mut self, event: SseEvent<'_>) -> Result<Vec<StreamingEvent>> {
         (self)(event)
     }
 }
@@ -400,9 +423,18 @@ fn flush_one_pending_block<M: SseMapper>(state: &mut SseState<M>, final_flush: b
         sse_error(state, "SSE event exceeded maximum buffered size");
         return true;
     }
-    let block = state.pending_lines[state.pending_start..end].to_string();
+    let start = state.pending_start;
     state.pending_start = next;
-    enqueue_block(state, &block);
+    {
+        let block = &state.pending_lines[start..end];
+        enqueue_block(
+            &mut state.mapper,
+            &mut state.queued,
+            &mut state.pending_done,
+            &mut state.done,
+            block,
+        );
+    }
     if state.pending_start >= state.pending_lines.len() / 2 {
         state.pending_lines.drain(..state.pending_start);
         state.pending_start = 0;
@@ -415,44 +447,51 @@ fn flush_one_pending_block<M: SseMapper>(state: &mut SseState<M>, final_flush: b
 /// `data: [DONE]` is the terminal sentinel: a deferred `pending_done` is
 /// flushed first, then the stream is marked done so nothing after the marker
 /// is emitted (a peer that stays open cannot hold the caller hostage).
-fn enqueue_block<M: SseMapper>(state: &mut SseState<M>, block: &str) {
-    for ev in parse_sse_lines(block.lines()) {
-        if is_done_marker(&ev.data) && state.mapper.handles_done_marker() {
-            if let Some(done) = state.pending_done.take() {
-                state.queued.push_back(Ok(done));
+fn enqueue_block<M: SseMapper>(
+    mapper: &mut M,
+    queued: &mut std::collections::VecDeque<Result<StreamingEvent>>,
+    pending_done: &mut Option<StreamingEvent>,
+    done: &mut bool,
+    block: &str,
+) {
+    for_each_sse_event(block, |ev| {
+        if is_done_marker(&ev.data) && mapper.handles_done_marker() {
+            if let Some(deferred) = pending_done.take() {
+                queued.push_back(Ok(deferred));
             }
-            state.done = true;
-            return;
+            *done = true;
+            return false;
         }
-        match state.mapper.map(ev) {
+        match mapper.map(ev) {
             Ok(events) => {
-                let defer_done = state.mapper.defer_done_until_transport_end();
+                let defer_done = mapper.defer_done_until_transport_end();
                 let mut terminal = false;
                 for event in events {
                     if matches!(event, StreamingEvent::Done { .. }) {
                         if defer_done {
-                            state.pending_done = Some(event);
+                            *pending_done = Some(event);
                         } else {
-                            state.queued.push_back(Ok(event));
+                            queued.push_back(Ok(event));
                             terminal = true;
                         }
                     } else {
-                        state.queued.push_back(Ok(event));
+                        queued.push_back(Ok(event));
                     }
                 }
                 if terminal {
-                    state.done = true;
-                    return;
+                    *done = true;
+                    return false;
                 }
+                true
             }
             Err(e) => {
-                state.pending_done = None;
-                state.queued.push_back(Err(e));
-                state.done = true;
-                return;
+                *pending_done = None;
+                queued.push_back(Err(e));
+                *done = true;
+                false
             }
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -463,7 +502,7 @@ mod tests {
     use lofi_types::StreamingEvent;
 
     #[allow(clippy::needless_pass_by_value)]
-    fn text_mapper(ev: SseEvent) -> Result<Vec<StreamingEvent>> {
+    fn text_mapper(ev: SseEvent<'_>) -> Result<Vec<StreamingEvent>> {
         let v: serde_json::Value = serde_json::from_str(&ev.data)
             .map_err(|e| Error::Provider(format!("malformed SSE data: {e}")))?;
         Ok(v.get("text")
@@ -690,7 +729,7 @@ mod tests {
     struct DoneMapper;
 
     impl SseMapper for DoneMapper {
-        fn map(&mut self, event: SseEvent) -> Result<Vec<StreamingEvent>> {
+        fn map(&mut self, event: SseEvent<'_>) -> Result<Vec<StreamingEvent>> {
             if event.data == "done" {
                 Ok(vec![StreamingEvent::Done {
                     usage: lofi_types::Usage::default(),
@@ -706,7 +745,7 @@ mod tests {
     struct DeferredDoneMapper;
 
     impl SseMapper for DeferredDoneMapper {
-        fn map(&mut self, event: SseEvent) -> Result<Vec<StreamingEvent>> {
+        fn map(&mut self, event: SseEvent<'_>) -> Result<Vec<StreamingEvent>> {
             if event.data == "done" {
                 Ok(vec![StreamingEvent::Done {
                     usage: lofi_types::Usage::default(),

@@ -3,21 +3,13 @@
 use std::collections::HashMap;
 
 use lofi_types::{ContentBlock, Message, Model, Role, StreamingEvent, ThinkingLevel, Usage};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
-use super::ProtocolIr;
+use super::{collect_text, ProtocolIr};
 use crate::ToolSchema;
 use lofi_error::{Error, Result};
 
-fn collect_text(blocks: &[ContentBlock]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        if let ContentBlock::Text { text } = b {
-            out.push_str(text);
-        }
-    }
-    out
-}
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 fn to_anthropic_request_parts<'a>(
     messages: impl IntoIterator<Item = &'a Message>,
@@ -184,6 +176,11 @@ pub(crate) struct AnthropicMessagesIr;
 impl ProtocolIr for AnthropicMessagesIr {
     type State = AnthropicMapperState;
 
+    fn apply_auth(builder: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        crate::with_key_header(builder, "x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+    }
+
     fn build_request_inner<'a>(
         model: &Model,
         messages: impl Iterator<Item = &'a Message>,
@@ -221,43 +218,53 @@ fn build_anthropic_request<'a>(
 ) -> Value {
     let (system, mut msgs) = to_anthropic_request_parts(messages);
     add_conversation_cache_breakpoint(&mut msgs);
-    let mut req = json!({
-        "model": model.id,
-        "messages": msgs,
-        "stream": true,
-        "max_tokens": model.max_tokens.unwrap_or(4096),
-    });
+    let mut req = Map::with_capacity(8);
+    req.insert("model".to_string(), Value::String(model.id.clone()));
+    req.insert("messages".to_string(), Value::Array(msgs));
+    req.insert("stream".to_string(), Value::Bool(true));
+    req.insert(
+        "max_tokens".to_string(),
+        json!(model.max_tokens.unwrap_or(4096)),
+    );
     if let Some(effort) = anthropic_effort(&model.thinking) {
         // `effort` lives in `output_config`, not on `thinking` — Anthropic
         // rejects the nested shape with
         // "thinking.adaptive.effort: Extra inputs are not permitted."
-        req["thinking"] = json!({ "type": "adaptive" });
-        req["output_config"] = json!({ "effort": effort });
+        req.insert("thinking".to_string(), json!({ "type": "adaptive" }));
+        req.insert("output_config".to_string(), json!({ "effort": effort }));
     }
     if let Some(sys) = system {
-        req["system"] = json!([{
-            "type": "text",
-            "text": sys,
-            "cache_control": ephemeral_cache_control(),
-        }]);
+        req.insert(
+            "system".to_string(),
+            json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": ephemeral_cache_control(),
+            }]),
+        );
     }
     if !tools.is_empty() {
-        let mut tools_arr: Vec<Value> = tools
+        let len = tools.len();
+        let tools_arr: Vec<Value> = tools
             .iter()
-            .map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.input_schema,
-                })
+            .enumerate()
+            .map(|(idx, t)| {
+                let mut tool = Map::with_capacity(if idx + 1 == len { 4 } else { 3 });
+                tool.insert("name".to_string(), Value::String(t.name.clone()));
+                tool.insert(
+                    "description".to_string(),
+                    Value::String(t.description.clone()),
+                );
+                tool.insert("input_schema".to_string(), t.input_schema.clone());
+                if idx + 1 == len {
+                    tool.insert("cache_control".to_string(), ephemeral_cache_control());
+                }
+                Value::Object(tool)
             })
             .collect();
-        if let Some(last) = tools_arr.last_mut() {
-            last["cache_control"] = ephemeral_cache_control();
-        }
-        req["tools"] = json!(tools_arr);
+        req.insert("tools".to_string(), Value::Array(tools_arr));
     }
-    req
+    Value::Object(req)
 }
 
 fn ephemeral_cache_control() -> Value {
