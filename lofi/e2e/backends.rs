@@ -163,6 +163,7 @@ fn fake_claude_setup() -> (String, Mcp) {
     }
     std::fs::write("claude-session", id).unwrap();
     std::fs::write("claude-method", method).unwrap();
+    std::fs::write("claude-pid", std::process::id().to_string()).unwrap();
     // The bridge token must not be readable from argv.
     assert!(!args.iter().any(|arg| arg.contains("LOFI_EXEC_TOKEN")));
     let mcp_path = value("--mcp-config");
@@ -2286,4 +2287,50 @@ no_auth = true
     assert_eq!(body["status"], "completed", "{body}");
     assert_eq!(body["result"], "http child answer", "{body}");
     assert_eq!(server.requests().len(), 1, "the child must run on the mock");
+}
+
+#[test]
+fn claude_dead_idle_child_reopens_with_resume_on_next_turn() {
+    let fixture = claude_fixture();
+    let mut tui = fixture.spawn(&[]);
+    tui.submit("first prompt");
+    fixture.wait_for_event_count("turn_end", 1);
+    let session = std::fs::read_to_string(fixture.workspace.join("claude-session")).unwrap();
+    let pid: i32 = std::fs::read_to_string(fixture.workspace.join("claude-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let status = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // Wait until the killed child has exited (or become a zombie awaiting wait()).
+    let deadline = std::time::Instant::now() + WAIT;
+    while std::time::Instant::now() < deadline {
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| stat.contains(") Z "));
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !alive || zombie {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    tui.submit("second prompt");
+    fixture.wait_for_event_count("turn_end", 2);
+    tui.submit("/quit");
+    tui.wait_exit();
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("claude-method")).unwrap(),
+        "--resume"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("claude-resumed")).unwrap(),
+        session
+    );
 }

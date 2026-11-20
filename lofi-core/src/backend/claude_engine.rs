@@ -100,7 +100,7 @@ pub(super) fn spawn_worker(init: WorkerInit) -> Result<mpsc::Sender<Work>> {
                     // A cancelled or failed turn closes the child; it cannot
                     // take another prompt, so the next turn must reopen the
                     // session from the checkpoint.
-                    let is_live = session.as_ref().is_none_or(|s| !s.is_closed());
+                    let is_live = session.as_mut().is_none_or(|s| !s.is_closed());
                     if session.is_some() && (!fresh || !is_live || work.effort != effort) {
                         if let Some(mut previous) = session.take() {
                             let _ = previous.close().await;

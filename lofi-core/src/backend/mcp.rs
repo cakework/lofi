@@ -116,6 +116,10 @@ impl Bridge {
             done: self.done.clone(),
         }
     }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
 }
 
 /// The executable the child spawns: a path to the pinned image inside `dir`,

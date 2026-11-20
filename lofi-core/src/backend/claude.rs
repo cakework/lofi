@@ -797,10 +797,18 @@ impl ClaudeSession {
         Ok(())
     }
 
-    /// Whether a cancelled or failed turn left the child unusable.
+    /// Whether a cancelled, failed, or idle-exited child is unusable.
     #[must_use]
-    pub fn is_closed(&self) -> bool {
-        self.poisoned
+    pub fn is_closed(&mut self) -> bool {
+        if self.poisoned || self.bridge.is_finished() {
+            return true;
+        }
+        if matches!(self.child.try_wait(), Ok(None)) {
+            false
+        } else {
+            self.poisoned = true;
+            true
+        }
     }
 
     /// Whether the CLI reported its init message. Only then does the session
