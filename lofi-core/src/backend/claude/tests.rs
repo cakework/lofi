@@ -169,3 +169,99 @@ async fn a_frame_that_arrives_is_the_turn_continuing() {
 
     assert_eq!(frame["type"], "assistant");
 }
+
+#[test]
+fn result_error_message_surfaces_subtype_and_detail() {
+    let frame = json!({
+        "type": "result",
+        "subtype": "error_max_turns",
+        "is_error": true,
+        "result": "rate limit exceeded on upstream"
+    });
+    let msg = result_error_message(&frame);
+    assert!(msg.contains("error_max_turns"), "{msg}");
+    assert!(msg.contains("rate limit exceeded on upstream"), "{msg}");
+
+    let errors_frame = json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "errors": ["invalid model alias", "check config"]
+    });
+    let msg = result_error_message(&errors_frame);
+    assert!(msg.contains("error_during_execution"), "{msg}");
+    assert!(msg.contains("invalid model alias"), "{msg}");
+}
+
+#[tokio::test]
+async fn oneshot_surfaces_child_stderr_on_early_exit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("failing-claude");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'fatal: bad cli flag --foo' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let err = super::super::oneshot::complete(
+        &script.display().to_string(),
+        dir.path(),
+        None,
+        &lofi_types::ThinkingLevel::Off,
+        &super::super::contract::CompletionRequest {
+            system: "sys".into(),
+            prompt: "hi".into(),
+            max_tokens: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("fatal: bad cli flag --foo"), "{err}");
+}
+
+#[tokio::test]
+async fn session_prompt_surfaces_child_stderr_on_early_exit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("failing-claude");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'Error: auth token expired' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let exe = std::env::current_exe().unwrap();
+    let mut session = ClaudeSession::open(
+        Launch {
+            command: &script.display().to_string(),
+            model: None,
+            effort: ThinkingLevel::Off,
+            resume: None,
+            system_prompt: "You are lofi",
+            frame_idle: Some(Duration::from_secs(5)),
+        },
+        dir.path(),
+        &exe,
+    )
+    .await
+    .unwrap();
+    let executor = ToolExecutor::in_memory(dir.path());
+    let err = session
+        .prompt(
+            Value::String("hi".into()),
+            executor,
+            ToolCallContext::default(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("Error: auth token expired"), "{err}");
+}

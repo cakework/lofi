@@ -206,6 +206,44 @@ fn private_files(
     })
 }
 
+fn build_command(
+    command: &str,
+    model: Option<&str>,
+    effort: &ThinkingLevel,
+    resuming: bool,
+    id: &str,
+    files: &PrivateFiles,
+    root: &Path,
+) -> Command {
+    let mut process = Command::new(command);
+    process.args(FIXED_ARGS);
+    process.arg("--mcp-config").arg(&files.mcp_config);
+    process
+        .arg("--system-prompt-file")
+        .arg(&files.system_prompt);
+    // Off selects no effort flag, which leaves the CLI default.
+    if let Some(flag) = effort_flag(effort) {
+        process.arg(flag);
+    }
+    process.arg(format!(
+        "{}={id}",
+        if resuming { "--resume" } else { "--session-id" }
+    ));
+    if let Some(model) = model {
+        process.arg(format!("--model={model}"));
+    }
+    // Deferred tool discovery can add ToolSearch even with no built-in tools.
+    process
+        .env("ENABLE_TOOL_SEARCH", "false")
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    process
+}
+
 /// Everything the CLI child is opened with, apart from the workspace and
 /// the tool executor.
 pub(super) struct Launch<'a> {
@@ -227,6 +265,7 @@ pub(super) struct ClaudeSession {
     group: Option<lofi_code::tools::PgrpKillGuard>,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    stderr: rpc::StderrTail,
     bridge: Bridge,
     id: String,
     initialized: bool,
@@ -303,37 +342,8 @@ impl ClaudeSession {
         let activity = Arc::new(crate::agent::ActivityWatch::default());
         let bridge = Bridge::start(&executable).await?;
         let files = private_files(dir, system_prompt, &mcp_config(&bridge)?)?;
-        let mut process = Command::new(command);
-        process.args(FIXED_ARGS);
-        process.arg("--mcp-config").arg(&files.mcp_config);
-        process
-            .arg("--system-prompt-file")
-            .arg(&files.system_prompt);
-        // Off selects no effort flag, which leaves the CLI default.
-        if let Some(flag) = effort_flag(&effort) {
-            process.arg(flag);
-        }
-        process.arg(format!(
-            "{}={id}",
-            if resume.is_some() {
-                "--resume"
-            } else {
-                "--session-id"
-            }
-        ));
-        if let Some(model) = model {
-            process.arg(format!("--model={model}"));
-        }
-        // Deferred tool discovery can add ToolSearch even with no built-in tools.
-        let mut child = process
-            .env("ENABLE_TOOL_SEARCH", "false")
-            .current_dir(root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut child =
+            build_command(command, model, &effort, resume.is_some(), &id, &files, root).spawn()?;
         let group = Some(lofi_code::tools::PgrpKillGuard::new(child.id()));
         let input = child
             .stdin
@@ -345,11 +355,18 @@ impl ClaudeSession {
                 .take()
                 .ok_or_else(|| Error::State("missing Claude Code stdout".into()))?,
         );
+        let stderr = rpc::StderrTail::spawn(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| Error::State("missing Claude Code stderr".into()))?,
+        );
         Ok(Self {
             child,
             group,
             input,
             output,
+            stderr,
             bridge,
             id,
             initialized: false,
@@ -485,12 +502,14 @@ impl ClaudeSession {
             // it up now spares the next turn a write into a dead pipe.
             let _ = self.close().await;
         }
-        if result.is_err() {
+        if let Err(error) = result {
             // The CLI reports usage once, in its result frame. A turn that
             // ended early still spent the rounds it ran, so it reports what
             // the last assistant frame carried.
             self.report_partial(&context).await;
             self.close().await?;
+            let stderr = self.stderr.finish().await;
+            return Err(rpc::with_stderr(error, &stderr));
         }
         result
     }
@@ -657,9 +676,7 @@ impl ClaudeSession {
                     self.close_thinking(context).await?;
                     self.report_result(&message, context).await?;
                     if message["is_error"] != false || message["subtype"] != "success" {
-                        return Err(Error::State(
-                            "Claude Code could not complete the turn; check `claude auth status` and the saved session. Use `claude auth login` if not logged in.".into(),
-                        ));
+                        return Err(Error::State(result_error_message(&message)));
                     }
                     if !self.initialized {
                         return Err(Error::State(
@@ -865,10 +882,11 @@ impl ClaudeSession {
         })
         .await
         .unwrap_or_else(|_| Err(Error::State("Claude Code model change timed out".into())));
-        if result.is_err() {
+        if let Err(error) = result {
             self.close().await?;
+            let stderr = self.stderr.finish().await;
+            return Err(rpc::with_stderr(error, &stderr));
         }
-        result?;
         self.model = model.map(str::to_owned);
         self.round_model = None;
         self.display_model = None;
@@ -925,6 +943,49 @@ fn validate_init(message: &Value) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Format a structured error message from a Claude Code `result` frame.
+fn result_error_message(message: &Value) -> String {
+    const DETAIL_LIMIT: usize = 500;
+    let subtype = message["subtype"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "success");
+    let detail = message["result"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            let items: Vec<&str> = message["errors"]
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .collect();
+            (!items.is_empty()).then(|| items.join("; "))
+        });
+    match (subtype, detail) {
+        (Some(subtype), Some(detail)) => {
+            let detail = clip_detail(&detail, DETAIL_LIMIT);
+            format!("Claude Code failed ({subtype}): {detail}")
+        }
+        (None, Some(detail)) => {
+            let detail = clip_detail(&detail, DETAIL_LIMIT);
+            format!("Claude Code failed: {detail}")
+        }
+        (Some(subtype), None) => format!(
+            "Claude Code failed ({subtype}); check `claude auth status` and the saved session."
+        ),
+        (None, None) => "Claude Code could not complete the turn; check `claude auth status` and the saved session. Use `claude auth login` if not logged in.".into(),
+    }
+}
+
+fn clip_detail(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_owned(),
+    }
 }
 
 /// The reported value, cut short so a large policy list cannot fill the

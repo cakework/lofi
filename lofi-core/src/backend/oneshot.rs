@@ -84,7 +84,7 @@ pub(super) async fn complete(
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true)
         .spawn()?;
@@ -97,6 +97,12 @@ pub(super) async fn complete(
             .stdout
             .take()
             .ok_or_else(|| Error::State("missing Claude Code stdout".into()))?,
+    );
+    let mut stderr = rpc::StderrTail::spawn(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::State("missing Claude Code stderr".into()))?,
     );
     // The ceiling covers the whole exchange: a child that hangs before it
     // reads stdin blocks the write just as surely as one that never answers.
@@ -116,7 +122,13 @@ pub(super) async fn complete(
     };
     child.start_kill().ok();
     let _ = child.wait().await;
-    text
+    match text {
+        Ok(completion) => Ok(completion),
+        Err(error) => {
+            let tail = stderr.finish().await;
+            Err(rpc::with_stderr(error, &tail))
+        }
+    }
 }
 
 async fn collect(output: &mut BufReader<tokio::process::ChildStdout>) -> Result<Completion> {
