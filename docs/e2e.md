@@ -1,94 +1,90 @@
 # End-to-end testing
 
-Lofi's process-level test target is defined in `lofi/Cargo.toml` and implemented in `lofi/e2e/`. It runs the Cargo-built `lofi` binary in print mode or through a pseudo-terminal. Tests use temporary configuration, policy, state, and workspace directories plus a local mock model server. They do not need API keys or external network access.
-
-The current target contains 291 tests.
+The process-level test target is declared in `lofi/Cargo.toml` and implemented in `lofi/e2e/`. Each test spawns the compiled `lofi` binary in print mode or inside a pseudo-terminal (PTY, a virtual terminal device). Every child process runs against temporary configuration, policy, state, and workspace directories paired with a local mock HTTP server. Because all model traffic stays on loopback, the suite needs no API keys and makes no external network calls. The target currently contains 297 tests.
 
 ## Run the suite
 
-Run all E2E tests:
+To execute all end-to-end tests at once, run `just`:
 
 ```sh
 just e2e
 ```
 
-Run one module or one test with Cargo's name filter:
+When working on a single feature, pass a Cargo name filter to run one module or one test case:
 
 ```sh
 cargo test -p lofi --test e2e --offline providers::
-cargo test -p lofi --test e2e --offline responses_idle_body_retries_with_the_configured_timeout
+cargo test -p lofi --test e2e --offline responses_stalled_body_times_out_and_retries
 ```
 
-List the tests without running them:
+To list all registered test names without running them, pass `--list` to the test binary:
 
 ```sh
 cargo test -p lofi --test e2e --offline -- --list
 ```
 
-Run the complete format, lint, and workspace test set with `just check`.
+Before finishing a change, run `just check` to execute formatting, Clippy lints, unit tests, and the full E2E suite together.
 
 ## Test design
 
-The shared support code in `lofi/e2e/support.rs` provides:
+Shared helpers in `lofi/e2e/support.rs` build isolated sandboxes for each child `lofi` process. By default, a test fixture serves OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Google Generative AI endpoints from one local server. At the same time, the fixture strips common provider API keys from child environments and points `LOFI_CONFIG`, `LOFI_POLICY`, and `LOFI_STATE_HOME` at temporary paths. Five helpers in `support.rs` drive most test cases:
 
-- `Fixture` for isolated config, policy, state, and workspace paths.
-- `MockServer` and `MockResponse` for ordered HTTP and SSE responses.
-- Print-mode helpers for stdout, stderr, exit status, requests, and transcripts.
-- `Tui` for pseudo-terminal input, screen assertions, resize, signals, and OSC output.
-- Bounded polling for asynchronous process, transcript, and job state.
+- `Fixture` creates and cleans up isolated configuration, policy, state, and workspace directories.
+- `MockServer` and `MockResponse` script ordered HTTP JSON and Server-Sent Events (SSE, a streaming HTTP text format) replies.
+- Print-mode helpers capture stdout, stderr, exit codes, recorded HTTP requests, and saved transcripts.
+- `Tui` drives PTY keystrokes, screen assertions, window resizes, signals, and OSC escape replies.
+- Bounded polling helpers wait for asynchronous process, transcript, and background-job state changes.
 
-The default fixture exposes OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Google Generative AI models through the same local server. It removes common provider API keys from child environments and sets `LOFI_CONFIG`, `LOFI_POLICY`, and `LOFI_STATE_HOME` to temporary paths.
-
-Tests assert public behavior at process boundaries. This includes request payloads, streamed terminal output, exit status, persisted transcript events, process-group cleanup, and behavior after restart. Protocol parser details and hard resource limits stay in crate-level tests when a full process adds no useful coverage.
+Using those helpers, tests assert public behavior at process boundaries. Typical assertions inspect HTTP request payloads, terminal output, exit codes, JSON Lines transcripts, process-group cleanup, and state after a restart. In contrast, wire-parser edge cases and QuickJS memory limits stay in crate unit tests where spawning a full binary adds no extra signal.
 
 ## Coverage map
 
-The counts below come from the current Cargo test target.
+The test counts below come directly from `cargo test -p lofi --test e2e --offline -- --list`. Each module owns a distinct user-visible workflow so failures point straight to the affected subsystem. Together, the nine modules cover subcommands, print runs, and interactive PTY sessions.
 
 | Module | Tests | Main coverage |
 | --- | ---: | --- |
-| `agent` | 25 | System prompts and skills, thinking controls, loop recovery, retries, permissions, tool failure, cancellation, and durable partial rounds. |
-| `backends` | 59 | A fake Claude CLI child: protocol initialization and failure, reported and aliased models, effort flags, resume by id, compaction and hard caps, cost deltas, jobs, subagents, backend switching, and an external evaluator on a CLI backend. |
-| `cli` | 28 | Help and version, print mode, informational commands, environment injection, startup failures, session listing, model errors, signals, and reasoning replay. |
-| `configuration` | 11 | Automatic approval and the ask rules that reserve it, the rejected `mode` key, resolved and redacted environment values, model discovery and cache fallback, recovery policy, and filesystem secret boundaries. |
-| `native_tools` | 22 | File, search, docs, skill, recall, result, image, and background-job APIs, including interactive terminal jobs, typed input, key sequences, signals, EOF, dimensions, and idle reporting. |
-| `providers` | 18 | All four provider transports, fragmented SSE, custom headers, no-auth requests, premature EOF, silent long-running response bodies, lifecycle events, retry reset after progress, stream errors, tiers, images, and signed reasoning. |
-| `sessions` | 65 | Creation, resume, branches, job ownership, failed and cancelled turns, compaction, truncation recovery, transcript repair, state permissions, temporary leases, large transcripts, and restored navigation. |
-| `tools` | 14 | Native tool cycles for all providers, parallel and interleaved calls, malformed arguments, thinking signatures, cache breakpoints, compaction, and resume. |
-| `tui` | 49 | Transcript details, slash commands, pickers, policy dialogs, queued prompts, user-shell streaming and cancellation, selection and copy, mixed Markdown resize and replay, shutdown, and terminal restoration. |
-| **Total** | **291** | Real-binary behavior in print mode and pseudo-terminals. |
+| `agent` | 25 | System prompts, skills, thinking controls, loop recovery, retries, directory grants, tool errors, cancellation, and durable partial rounds. |
+| `backends` | 63 | Fake Claude CLI child processes: handshake validation, reported and aliased models, effort flags, session resume, compaction, cost deltas, jobs, subagents, backend switching, and CLI evaluators. |
+| `cli` | 28 | Help and version flags, print mode, informational subcommands, `-e` environment injection, startup validation, session listing and pruning, signals, and reasoning replay. |
+| `configuration` | 11 | `[auto_mode]` evaluation, reserved `[[ask]]` rules, rejected legacy `mode` keys, resolved and redacted environment values, model discovery cache fallback, and secret boundaries. |
+| `native_tools` | 22 | File, search, docs, skill, memory, recall, result, image, and background-job APIs plus interactive PTY jobs, key sequences, signals, dimensions, and idle detection. |
+| `providers` | 19 | All four chat protocols, fragmented SSE chunks, custom headers, `no_auth` providers, premature EOF, long active streams, stalled body timeouts, retry reset after progress, tiers, images, and signed reasoning. |
+| `sessions` | 66 | Transcript creation, resume, tree rollback, job reconciliation, failed and canceled turns, compaction checkpoints, truncated final lines, file permissions, temp leases, and large transcript replay. |
+| `tools` | 14 | End-to-end `exec` tool cycles across all four protocols, parallel and interleaved calls, malformed tool JSON, thinking signatures, Anthropic cache breakpoints, compaction, and resume. |
+| `tui` | 49 | Detail expansion, slash commands, picker modals, approval and path dialogs, queued prompts, `!` and `!!` user shell runs, visual selection and OSC 52 copy, Markdown resize, and terminal cleanup. |
+| Total | 297 | Real-binary coverage across print mode, subcommands, and PTY sessions. |
 
 ### Provider and stream coverage
 
-The suite sends real local HTTP requests for all supported APIs. It checks text, reasoning, usage, tools, images, errors, terminal events, and replay data. Transport tests cover fragmented reads, protocol-specific premature ends, retry reset after stream progress, and OpenAI Responses lifecycle events that do not map to visible model output. Silent and progressing 31-second Responses streams verify that successful response bodies have no fixed Lofi deadline.
+Provider tests send real HTTP requests over localhost across all four supported chat protocols. Across those protocols, the suite tests streamed text, reasoning traces, token usage, tool calls, image inputs, error classification, and multi-turn replay. Lower-level transport tests also simulate fragmented socket reads, premature connection drops, retry counter resets after stream progress, and OpenAI Responses lifecycle events. Finally, 31-second Responses streams make sure that active streams have no fixed total-turn deadline, whereas streams that stall past `body_idle_timeout_ms` time out and retry.
 
 ### Session and process coverage
 
-Session tests restart the binary against durable JSON Lines transcripts. They cover active branches, rollback, compaction checkpoints, malformed final lines, missing cursor records, unsupported transcripts, permissions, stale process state, and model restoration. Process tests also check foreground and background process-group cleanup, signal exit status, terminal restoration, and Linux/glibc memory release for large replay and tree-picker fixtures.
+Session tests stop and restart the `lofi` binary against saved JSON Lines transcripts on disk. Across restarts, they test active tree branches, `/tree` rollbacks, compaction checkpoints, truncated final lines, missing cursor records, unsupported format versions, file permissions, and model restoration. Alongside transcript state, process tests make sure that process groups exit cleanly, signals report expected exit codes, and terminal modes restore on shutdown. On Linux with glibc, large replay and tree-picker fixtures also assert that freed heap memory returns to the operating system.
 
 ### Terminal and job coverage
 
-Pseudo-terminal tests exercise input, paste, resize, OSC 2, OSC 7, OSC 11, OSC 52, and OSC 7501 handling, modal priority, transcript navigation, expanded details, and shell output while it is still running. Job tests cover both plain pipes and controlling terminals, including input writes, key encoding, `Ctrl+C`, `Ctrl+D`, terminal dimensions, idle detection, notices, timeout, kill, and shutdown cleanup.
+Terminal tests run `lofi` in a PTY to cover keyboard input, paste, resize, and OSC 2, 7, 11, 52, and 7501 sequences. On top of raw terminal I/O, they test modal priority, transcript cursor movement, expanded details, and live `!` shell streaming. Background-job tests cover both piped processes and interactive PTY jobs. Those cases test `jobType`, `jobKeyPress`, `Ctrl+C`, `Ctrl+D`, terminal dimensions, idle detection, wake-up notices, `jobKill`, and shutdown cleanup.
 
 ## Current boundaries
 
-The following areas intentionally remain in lower-level tests or need broader process coverage:
+Some narrow or host-dependent behaviors belong in crate unit tests rather than full-process E2E tests. Two heap-release tests require Linux with glibc, whereas the rest of the suite targets POSIX process and PTY semantics without Windows support. Crate-level tests cover the following areas directly:
 
-- QuickJS heap, stack, CPU, log, conversion, and cancellation limits.
-- Malformed UTF-8 SSE, oversized event buffers, and detailed parser permutations.
-- Exhaustive configuration precedence, cache corruption, image limits, and pricing totals.
-- Exhaustive modal navigation, Unicode width, focus events, and terminal input permutations.
-- Concurrent transcript writers and additional transcript migration fixtures.
-- Release installation, Nix packaging, and the supported Unix platform matrix.
-
-Two memory-release tests require Linux with glibc. Other E2E tests target Unix process and pseudo-terminal semantics. Windows is not supported.
+- QuickJS heap, stack, synchronous CPU, log buffer, value conversion, and interrupt limits.
+- Malformed UTF-8 SSE frames, oversized SSE event buffers, and detailed wire-parser permutations.
+- Exhaustive configuration precedence matrices, corrupted discovery caches, JPEG quality sweeps, and token price arithmetic.
+- Fine-grained Unicode display widths, focus events, and raw terminal escape permutations.
+- Concurrent transcript writers and older synthetic transcript migration fixtures.
+- Release binaries, Nix flake packaging, and non-Linux Unix platforms.
 
 ## Add a test
 
-1. Put the test in the module that owns the public workflow.
-2. Reuse `Fixture`, `MockServer`, `MockResponse`, and `Tui`.
-3. Keep all network traffic local and all state under the fixture directories.
-4. Use bounded wait helpers instead of unbounded sleeps or loops.
-5. Assert process-visible behavior and durable state, not private implementation details.
-6. Run the focused test, then `just e2e`.
-7. Update this page when a module, major coverage area, or documented boundary changes.
+When adding coverage for a new feature or bug fix, keep the test deterministic and isolated from the host machine. That isolation lets Cargo run E2E tests in parallel without port collisions or shared state leaks. Follow these steps when adding a test:
+
+1. Place the test in the `lofi/e2e/` module that owns the user-facing workflow.
+2. Build the test environment with `Fixture`, `MockServer`, `MockResponse`, and `Tui`.
+3. Keep all HTTP traffic on `127.0.0.1` and all files inside the fixture directories.
+4. Wait for asynchronous state with the bounded polling helpers in `support.rs` instead of fixed `sleep` calls.
+5. Assert process-visible outputs and saved files rather than internal Rust types.
+6. Run the single test with `cargo test -p lofi --test e2e --offline <name>`, then run `just e2e`.
+7. Update the coverage map on this page when module counts or boundaries change.
