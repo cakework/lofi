@@ -15,7 +15,7 @@ use lofi_types::{Api, Message, Model, ProviderConfig, StreamingEvent};
 
 use lofi_error::{Error, Result};
 
-pub use ir::anthropic_messages::ANTHROPIC_VERSION;
+use ir::anthropic_messages::ANTHROPIC_VERSION;
 use ir::{
     AnthropicMessagesIr, GoogleGenerativeAiIr, OpenAiCompletionsIr, OpenAiResponsesIr, ProtocolIr,
 };
@@ -286,7 +286,7 @@ pub(crate) async fn send_stream_request(
 }
 
 #[allow(clippy::must_use_candidate, clippy::implicit_hasher)]
-pub fn apply_headers(
+pub(crate) fn apply_headers(
     mut builder: reqwest::RequestBuilder,
     headers: &HashMap<String, String>,
 ) -> reqwest::RequestBuilder {

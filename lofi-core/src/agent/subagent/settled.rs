@@ -4,7 +4,7 @@ use lofi_types::{SessionEvent, SessionEventKind};
 use serde_json::{json, Value};
 
 use super::registry::{Rollup, SubagentRegistry};
-use super::runner::{cap_at_boundary, ChildUsage};
+use super::runner::cap_at_boundary;
 use super::{
     Status, DEFAULT_OUTPUT_LIMIT, NOTICE_DETAIL_CAP, SETTLED_MARKER_LIMIT, SETTLED_TAIL_WINDOW,
 };
@@ -152,22 +152,14 @@ pub(super) fn record_settled(
     result: Option<&str>,
     error: Option<&str>,
     stopped: Option<&str>,
-    totals: &ChildUsage,
+    totals: &Rollup,
     carried: &Rollup,
 ) -> bool {
     let Some(cursor) = cursor else { return false };
-    let (usage, cost) = if totals.seen {
-        (
-            Some(lofi_types::Usage {
-                input_tokens: totals.input,
-                output_tokens: totals.output,
-                cache_read_tokens: totals.cache_read,
-                cache_write_tokens: totals.cache_write,
-            }),
-            Some(totals.cost),
-        )
-    } else {
+    let (usage, cost) = if totals.is_empty() {
         (None, None)
+    } else {
+        (Some(totals.usage()), Some(totals.cost))
     };
     // Callers already cap both texts at DEFAULT_OUTPUT_LIMIT; the measure
     // loop is the hard guarantee that escaping and multi-byte UTF-8 cannot

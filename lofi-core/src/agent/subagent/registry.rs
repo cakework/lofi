@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::AbortHandle;
 
 use super::child::restore_entry;
-use super::runner::{ChildUsage, RunRejection};
+use super::runner::RunRejection;
 use super::{
     attach_mailbox_journal, Status, SubagentLive, SubagentNotice, SubagentNoticeKind,
     SubagentRunning, SubagentSupport, EVENT_CAP, KILL_GRACE, MAX_ENTRIES,
@@ -82,7 +82,7 @@ pub(super) struct Entry {
     pub(super) model: Option<String>,
     // Spend of the current run, shared with the settle guard: the event
     // drain adds every `RoundUsage` here while the run is live.
-    pub(super) totals: Option<Arc<std::sync::Mutex<ChildUsage>>>,
+    pub(super) totals: Option<Arc<std::sync::Mutex<Rollup>>>,
     // Spend of the runs this entry already paid for. A resume replaces the
     // run's own totals, so the fold of a child session adds these back.
     pub(super) carried: Rollup,
@@ -759,7 +759,12 @@ pub(super) fn entry_usage(entry: &Entry) -> Option<Value> {
         .outcome
         .as_ref()
         .and_then(|outcome| outcome.get("usage").cloned())
-        .or_else(|| entry.totals.as_ref().and_then(|totals| lock(totals).json()))
+        .or_else(|| {
+            entry
+                .totals
+                .as_ref()
+                .and_then(|totals| lock(totals).run_usage_json())
+        })
 }
 
 /// Transcript id of an entry, whether the cursor is open (live or resumed
@@ -773,8 +778,8 @@ pub(super) fn entry_session_id(entry: &Entry) -> Option<String> {
     })
 }
 
-/// Sum of the runs `subagentUsage` folds, and of the child spend an exec
-/// result reports.
+/// Sum of the runs `subagentUsage` folds, of the child spend an exec result
+/// reports, and of the live `RoundUsage` events a running subagent drains.
 #[derive(Clone, Default)]
 pub(in crate::agent) struct Rollup {
     runs: u64,
@@ -783,6 +788,7 @@ pub(in crate::agent) struct Rollup {
     cache_read: u64,
     cache_write: u64,
     pub(super) cost: f64,
+    turn_cost: f64,
 }
 
 impl Rollup {
@@ -792,6 +798,61 @@ impl Rollup {
         self.add_rollup(&entry.carried);
         if let Some(usage) = entry_usage(entry) {
             self.add_usage(&usage);
+        }
+    }
+
+    /// Accumulate one `RoundUsage` event from a live subagent run.
+    pub(super) fn add_round(&mut self, cost: f64, usage: &lofi_types::Usage) {
+        self.runs = 1;
+        self.input += usage.input_tokens;
+        self.output += usage.output_tokens;
+        self.cache_read += usage.cache_read_tokens;
+        self.cache_write += usage.cache_write_tokens;
+        // RoundUsage reports the turn's cumulative cost: add what this turn
+        // billed on top of the run's other turns.
+        self.cost += cost - self.turn_cost;
+        self.turn_cost = cost;
+    }
+
+    /// Start another turn of the same run: its cost counts from zero again.
+    pub(super) fn start_turn(&mut self) {
+        self.turn_cost = 0.0;
+    }
+
+    /// Total tokens across every category the provider reports.
+    pub(super) fn total_tokens(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    pub(super) fn usage(&self) -> lofi_types::Usage {
+        lofi_types::Usage {
+            input_tokens: self.input,
+            output_tokens: self.output,
+            cache_read_tokens: self.cache_read,
+            cache_write_tokens: self.cache_write,
+        }
+    }
+
+    pub(super) fn run_usage_json(&self) -> Option<Value> {
+        (!self.is_empty()).then(|| {
+            json!({
+                "input_tokens": self.input,
+                "output_tokens": self.output,
+                "cache_read_tokens": self.cache_read,
+                "cache_write_tokens": self.cache_write,
+                "cost": self.cost,
+            })
+        })
+    }
+
+    /// Fold the run totals into the session's unreported subagent spend.
+    pub(super) fn report(&self, unreported: &mut (f64, lofi_types::Usage)) {
+        if !self.is_empty() {
+            unreported.0 += self.cost;
+            unreported.1.input_tokens += self.input;
+            unreported.1.output_tokens += self.output;
+            unreported.1.cache_read_tokens += self.cache_read;
+            unreported.1.cache_write_tokens += self.cache_write;
         }
     }
 
@@ -866,6 +927,7 @@ impl From<&lofi_types::RunSpend> for Rollup {
             cache_read: spent.usage.cache_read_tokens,
             cache_write: spent.usage.cache_write_tokens,
             cost: spent.cost,
+            turn_cost: 0.0,
         }
     }
 }

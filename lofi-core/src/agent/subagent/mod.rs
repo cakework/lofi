@@ -15,6 +15,7 @@ mod ops;
 mod registry;
 mod runner;
 mod settled;
+mod watchdog;
 
 #[cfg(test)]
 mod tests;
@@ -189,7 +190,7 @@ impl Agent {
     /// Build the `lofi.subagent*` hook for this agent, or `None` when the
     /// agent has no subagent support (nested subagent agents).
     #[must_use]
-    pub fn subagent_hook(&self) -> Option<SubagentFn> {
+    pub(crate) fn subagent_hook(&self) -> Option<SubagentFn> {
         let Some(support) = self.executor.subagent_support.clone() else {
             // A child cannot manage runs, but it keeps the mailbox: the hook
             // answers the three mailbox ops and reports every other op as
@@ -204,21 +205,10 @@ impl Agent {
     }
 
     /// Attach subagent support so the agent's sandbox exposes `lofi.subagent`.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_subagent_support(mut self, support: SubagentSupport) -> Self {
+    pub(crate) fn with_subagent_support(mut self, support: SubagentSupport) -> Self {
         self.executor = self.executor.with_subagent_support(support);
-        self
-    }
-
-    /// Toggle transcript persistence for spawned subagents. No-op when the
-    /// agent has no subagent support.
-    #[must_use]
-    pub fn with_subagent_persistence(mut self, persist_sessions: bool) -> Self {
-        if let Some(support) = self.executor.subagent_support.take() {
-            self.executor = self
-                .executor
-                .with_subagent_support(support.with_persistence(persist_sessions));
-        }
         self
     }
 }

@@ -33,7 +33,7 @@ pub struct ToolExecutor {
     pub(in crate::agent) tmp_lease: Option<Arc<state::SessionTempDir>>,
     pub(in crate::agent) bash_env: BashEnv,
     pub(in crate::agent) shell_policy: ResolvedPolicy,
-    pub(in crate::agent) truncate: lofi_code::TruncatedCap,
+    pub(in crate::agent) truncate: lofi_types::TruncateConfig,
     pub(in crate::agent) image: lofi_types::ImageConfig,
     pub(in crate::agent) confirm_tx: Option<tokio::sync::mpsc::UnboundedSender<ConfirmRequest>>,
     pub(in crate::agent) confirm_counter: Arc<AtomicU64>,
@@ -82,7 +82,7 @@ pub struct ToolExecutor {
 
 /// Hooks for one tool call. All callbacks belong to the owning session.
 #[derive(Clone, Default)]
-pub struct ToolCallContext {
+pub(crate) struct ToolCallContext {
     pub events: Option<crate::agent::turn_session::EventSink>,
     pub session: Option<crate::session::store::SessionCursor>,
     pub recall: Option<RecallFn>,
@@ -106,40 +106,16 @@ impl ToolExecutor {
         env: &[(String, String)],
     ) -> Result<Self> {
         let lease = state::create_session_tmp_dir(root)?;
-        let ids = lofi_types::IdSpace::new();
-        Ok(Self {
-            root: root.to_path_buf(),
-            tmp_dir: lease.path().to_path_buf(),
-            tmp_lease: Some(Arc::new(lease)),
-            bash_env: crate::bash_env::resolve_bash_env(&config.bash, env),
-            shell_policy: lofi_code::policy::defaults::resolve(&config.shell_policy),
-            truncate: lofi_code::TruncatedCap {
-                max_lines: config.truncate.max_lines,
-                max_bytes: config.truncate.max_bytes,
-            },
-            image: config.image,
-            confirm_tx: None,
-            confirm_counter: Arc::new(AtomicU64::new(0)),
-            confirm_watch: Arc::new(ConfirmWatch::default()),
-            activity: Arc::new(ActivityWatch::default()),
-            auto_mode: None,
-            auto_mode_config: None,
-            auto_mode_hints: super::auto_mode::hint_handle(),
-            policy_override: lofi_code::policy::PolicyOverride::default(),
-            skills_dir: None,
-            grants: super::granted_dirs(&config.permissions),
-            memory: state::WorkspaceMemory::open(root).ok().map(Into::into),
-            jobs: lofi_code::tools::JobRegistry::with_ids(ids.clone()),
-            timers: lofi_code::tools::TimerRegistry::with_ids(ids.clone()),
-            job_owner: None,
-            exec_worker: Arc::new(std::sync::OnceLock::new()),
-            subagent: None,
-            mailbox: None,
-            subagents: SubagentRegistry::with_ids(ids),
-            subagent_support: None,
-            models: None,
-            session_cache: Arc::new(std::sync::OnceLock::new()),
-        })
+        let mut exec = Self::in_memory(root);
+        exec.tmp_dir = lease.path().to_path_buf();
+        exec.tmp_lease = Some(Arc::new(lease));
+        exec.bash_env = crate::bash_env::resolve_bash_env(&config.bash, env);
+        exec.shell_policy = lofi_code::policy::defaults::resolve(&config.shell_policy);
+        exec.truncate = config.truncate;
+        exec.image = config.image;
+        exec.grants = super::granted_dirs(&config.permissions);
+        exec.memory = state::WorkspaceMemory::open(root).ok().map(Into::into);
+        Ok(exec)
     }
 
     /// Construct execution state in memory without creating a temporary
@@ -154,10 +130,7 @@ impl ToolExecutor {
             tmp_lease: None,
             bash_env: crate::bash_env::resolve_bash_env(&config.bash, &[]),
             shell_policy: lofi_code::policy::defaults::resolve(&config.shell_policy),
-            truncate: lofi_code::TruncatedCap {
-                max_lines: config.truncate.max_lines,
-                max_bytes: config.truncate.max_bytes,
-            },
+            truncate: config.truncate,
             image: config.image,
             confirm_tx: None,
             confirm_counter: Arc::new(AtomicU64::new(0)),
@@ -425,7 +398,7 @@ impl ToolExecutor {
     /// Execute through the same path as the native agent.
     /// # Errors
     /// Returns an error if the consumer disconnects or execution cannot start.
-    pub async fn execute(
+    pub(crate) async fn execute(
         &self,
         id: &str,
         input: &serde_json::Value,

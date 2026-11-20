@@ -22,7 +22,6 @@ mod spawn;
 mod text;
 mod transcript;
 use transcript::{Transcript, TranscriptLayout};
-mod tree;
 mod tty_events;
 mod types;
 pub mod view;
@@ -31,7 +30,7 @@ pub mod view;
 mod tests;
 
 #[allow(clippy::wildcard_imports)]
-use {input::*, replay::*, resume::*, spawn::*, text::*, tree::*};
+use {input::*, replay::*, resume::*, spawn::*, text::*};
 
 use std::any::Any;
 use std::cell::RefCell;

@@ -1,26 +1,10 @@
-pub const DEFAULT_MAX_LINES: usize = 2000;
-pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
-pub const GREP_MAX_LINE_LENGTH: usize = 500;
-
-/// The line/byte caps a tool applies to its visible output. File reads and
-/// bash output share one cap by design.
-/// Defaults match [`DEFAULT_MAX_LINES`] / [`DEFAULT_MAX_BYTES`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TruncatedCap {
-    pub max_lines: usize,
-    pub max_bytes: usize,
-}
-
-impl Default for TruncatedCap {
-    fn default() -> Self {
-        Self {
-            max_lines: DEFAULT_MAX_LINES,
-            max_bytes: DEFAULT_MAX_BYTES,
-        }
-    }
-}
+#[cfg(test)]
+pub(crate) const DEFAULT_MAX_LINES: usize = 2000;
+#[cfg(test)]
+pub(crate) const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
 pub struct Truncated {
     pub content: String,
     pub truncated: bool,
@@ -30,13 +14,14 @@ pub struct Truncated {
     pub output_bytes: usize,
 }
 
+#[cfg(test)]
 #[must_use]
-pub fn truncate_head(content: &str) -> Truncated {
+pub(crate) fn truncate_head(content: &str) -> Truncated {
     truncate_head_with(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES)
 }
 
 #[must_use]
-pub fn truncate_head_with(content: &str, max_lines: usize, max_bytes: usize) -> Truncated {
+pub(crate) fn truncate_head_with(content: &str, max_lines: usize, max_bytes: usize) -> Truncated {
     let total_bytes = content.len();
     let total_lines = content.split('\n').count();
 
@@ -80,11 +65,6 @@ pub fn truncate_head_with(content: &str, max_lines: usize, max_bytes: usize) -> 
         total_bytes,
         output_bytes,
     }
-}
-
-#[must_use]
-pub fn truncate_tail(content: &str) -> Truncated {
-    truncate_tail_with(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES)
 }
 
 #[must_use]
@@ -135,21 +115,7 @@ pub fn truncate_tail_with(content: &str, max_lines: usize, max_bytes: usize) -> 
 }
 
 #[must_use]
-pub fn truncate_line(line: &str) -> String {
-    truncate_line_with(line, GREP_MAX_LINE_LENGTH)
-}
-
-#[must_use]
-pub fn truncate_line_with(line: &str, max_chars: usize) -> String {
-    if line.chars().count() <= max_chars {
-        return line.to_string();
-    }
-    let kept: String = line.chars().take(max_chars).collect();
-    format!("{kept}...")
-}
-
-#[must_use]
-pub fn format_size(bytes: usize) -> String {
+pub(crate) fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes}B")
     } else if bytes < 1024 * 1024 {
@@ -208,15 +174,6 @@ mod tests {
         assert!(t.content.contains("line99"));
         assert!(t.content.contains("line90"));
         assert!(!t.content.contains("line89"));
-    }
-
-    #[test]
-    fn line_truncation_appends_ellipsis() {
-        assert_eq!(truncate_line_with("short", 10), "short");
-        let long = "x".repeat(20);
-        let t = truncate_line_with(&long, 10);
-        assert!(t.ends_with("..."));
-        assert_eq!(t.chars().count(), 13); // 10 + "..."
     }
 
     #[test]

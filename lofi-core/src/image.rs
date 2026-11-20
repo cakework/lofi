@@ -6,9 +6,9 @@ use image::{DynamicImage, GenericImageView};
 use lofi_error::{Error, Result};
 use lofi_types::ImageConfig;
 
-/// JPEG media type produced by [`normalize`]. Re-encoding always targets JPEG
-/// regardless of the source format, so the output media type is constant.
-pub const OUTPUT_MEDIA_TYPE: &str = "image/jpeg";
+/// JPEG media type produced by [`normalize_reader`]. Re-encoding always targets
+/// JPEG regardless of the source format, so the output media type is constant.
+const OUTPUT_MEDIA_TYPE: &str = "image/jpeg";
 
 /// Quality sweep bounds. Step from 90 down to 40, halving dimensions once
 /// if the lowest quality still overflows.
@@ -20,11 +20,8 @@ const QUALITY_STEP: u8 = 10;
 /// `cfg.max_width`×`cfg.max_height` (preserving aspect ratio), and re-encode
 /// as JPEG no larger than `cfg.max_bytes`. Returns the JPEG bytes and
 /// [`OUTPUT_MEDIA_TYPE`].
-///
-/// # Errors
-/// Returns [`Error::Tool`] when `bytes` is not a decodable image in an enabled
-/// format, or when no quality/dimension combination fits `cfg.max_bytes`.
-pub fn normalize(bytes: &[u8], cfg: &ImageConfig) -> Result<(Vec<u8>, String)> {
+#[cfg(test)]
+fn normalize(bytes: &[u8], cfg: &ImageConfig) -> Result<(Vec<u8>, String)> {
     normalize_reader(std::io::Cursor::new(bytes), cfg)
 }
 
@@ -34,7 +31,7 @@ pub fn normalize(bytes: &[u8], cfg: &ImageConfig) -> Result<(Vec<u8>, String)> {
 /// # Errors
 /// Returns [`Error::Tool`] when the source is not a supported image or cannot
 /// be encoded within the configured limits.
-pub fn normalize_reader<R>(reader: R, cfg: &ImageConfig) -> Result<(Vec<u8>, String)>
+pub(crate) fn normalize_reader<R>(reader: R, cfg: &ImageConfig) -> Result<(Vec<u8>, String)>
 where
     R: std::io::BufRead + std::io::Seek,
 {

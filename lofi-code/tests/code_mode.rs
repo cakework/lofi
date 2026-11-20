@@ -734,7 +734,7 @@ async fn exec_honours_configured_truncate_cap() {
     )
     .unwrap();
     let mut c = ctx(dir.path());
-    std::sync::Arc::make_mut(&mut c.session).truncate = lofi_code::TruncatedCap {
+    std::sync::Arc::make_mut(&mut c.session).truncate = lofi_types::TruncateConfig {
         max_lines: 3,
         max_bytes: 1 << 30,
     };

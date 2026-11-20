@@ -1,5 +1,6 @@
 //! Backends own the model loop. Tool execution stays session-scoped in Lofi,
 //! so an HTTP provider and a CLI child run through the same interface.
+mod binding;
 mod claude;
 mod claude_engine;
 mod contract;

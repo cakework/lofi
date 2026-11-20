@@ -1,4 +1,4 @@
-use lofi_types::{ContentBlock, EditConfig, Message, SessionEvent, SessionEventKind};
+use lofi_types::{ContentBlock, EditConfig, Message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cat {
@@ -49,8 +49,9 @@ fn trim_tool_use_input(input: &serde_json::Value, event_id: &str) -> serde_json:
 /// `kept` is the list of `(event_id, message)` pairs that would otherwise be
 /// carried verbatim as the post-compaction prefix. Returns a new message
 /// list with old tool results / thinking / tool-call code elided per `opts`.
+#[cfg(test)]
 #[must_use]
-pub fn edit_tail(kept: &[(String, Message)], opts: &EditConfig) -> Vec<Message> {
+fn edit_tail(kept: &[(String, Message)], opts: &EditConfig) -> Vec<Message> {
     let refs: Vec<(&str, &Message)> = kept
         .iter()
         .map(|(id, message)| (id.as_str(), message))
@@ -59,7 +60,7 @@ pub fn edit_tail(kept: &[(String, Message)], opts: &EditConfig) -> Vec<Message> 
 }
 
 #[must_use]
-pub fn edit_tail_refs(kept: &[(&str, &Message)], opts: &EditConfig) -> Vec<Message> {
+pub(crate) fn edit_tail_refs(kept: &[(&str, &Message)], opts: &EditConfig) -> Vec<Message> {
     if !opts.enabled || kept.is_empty() {
         return kept.iter().map(|(_, message)| (*message).clone()).collect();
     }
@@ -144,7 +145,7 @@ pub fn edit_tail_refs(kept: &[(&str, &Message)], opts: &EditConfig) -> Vec<Messa
 }
 
 #[must_use]
-pub fn recover_message_content(msg: &Message) -> Option<String> {
+pub(crate) fn recover_message_content(msg: &Message) -> Option<String> {
     let results: Vec<&str> = msg
         .blocks
         .iter()
@@ -162,15 +163,6 @@ pub fn recover_message_content(msg: &Message) -> Option<String> {
         }
         _ => None,
     })
-}
-
-#[must_use]
-pub fn recover_event_content(events: &[SessionEvent], id: &str) -> Option<String> {
-    let event = events.iter().find(|event| event.id == id)?;
-    let SessionEventKind::Message(message) = &event.kind else {
-        return None;
-    };
-    recover_message_content(message)
 }
 
 #[cfg(test)]

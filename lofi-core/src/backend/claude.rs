@@ -386,12 +386,6 @@ impl ClaudeSession {
         self.context_window
     }
 
-    /// The usage of the last assistant frame of the current turn.
-    #[allow(dead_code)]
-    pub fn round_usage(&self) -> Option<lofi_types::Usage> {
-        self.round_usage
-    }
-
     /// The stop reason of the last assistant frame of the current turn.
     pub fn stop_reason(&self) -> Option<lofi_types::StopReason> {
         self.stop_reason

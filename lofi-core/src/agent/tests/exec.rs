@@ -46,7 +46,7 @@ fn cap_exec_result_uses_larger_outer_limit() {
 
 #[test]
 fn exec_schema_uses_code_contract() {
-    let schema = exec_tool_schema();
+    let schema = exec_tool_schema_ref();
     assert_eq!(schema.name, lofi_code::EXEC_TOOL_NAME);
     assert_eq!(schema.description, lofi_code::EXEC_TOOL_DESCRIPTION);
     assert_eq!(schema.input_schema, lofi_code::exec_tool_input_schema());

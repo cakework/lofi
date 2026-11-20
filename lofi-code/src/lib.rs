@@ -37,6 +37,5 @@ pub use ctx::{
 };
 pub use run::exec;
 pub use tools::fs::canonicalize_up;
-pub use tools::truncate::TruncatedCap;
 pub use tools::BashEnv;
 pub use worker::ExecWorker;

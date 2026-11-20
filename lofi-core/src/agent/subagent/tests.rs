@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 
 use super::ops::{mailbox_hook, release_op, usage_op};
 use super::registry::Activity;
-use super::runner::{holds_work, Deadlines, Expiry, RunProgress};
+use super::runner::holds_work;
+use super::watchdog::{Deadlines, Expiry, RunProgress};
 use super::*;
 use crate::agent::mailbox::{Mailbox, MailboxScope, PARENT_ADDRESS};
 use crate::agent::tool_executor::{ActivityWatch, ConfirmWatch};

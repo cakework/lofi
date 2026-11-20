@@ -477,11 +477,7 @@ fn take_pending_image(value: &mut Json, tools: &BuiltinTools) -> Option<ExecImag
         return None;
     }
     let token = object.remove("image_token")?.as_u64()?;
-    let pending = tools.take_image(token)?;
-    Some(ExecImage {
-        file: pending.file,
-        bytes: pending.bytes,
-    })
+    tools.take_image(token)
 }
 
 #[allow(clippy::too_many_arguments)]

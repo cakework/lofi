@@ -806,7 +806,7 @@ impl TurnIo {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = input;
     }
 
-    pub fn tool_context(&self) -> ToolCallContext {
+    pub(crate) fn tool_context(&self) -> ToolCallContext {
         self.inner.context.clone()
     }
 

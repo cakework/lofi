@@ -1,18 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// Split a `provider/model:level` query into the model and its effort.
-#[allow(dead_code)]
-fn split_thinking_suffix(query: &str) -> (&str, Option<ThinkingLevel>) {
-    match query.rsplit_once(':') {
-        Some((head, tail)) if !head.is_empty() => match ThinkingLevel::parse(tail) {
-            Some(level) => (head, Some(level)),
-            None => (query, None),
-        },
-        _ => (query, None),
-    }
-}
-
 /// How many events one wake drains before it yields to the select loop.
 pub(super) const RUN_BATCH: usize = 64;
 const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(16);

@@ -1181,9 +1181,13 @@ fn tree_exec_label_shows_native_tools() {
     // optimization cannot silently degrade exec rows to raw result previews.
     let cursor = a.session.cursor.as_ref().unwrap();
     let snapshot = cursor.tree_index().unwrap();
-    let skeletons = build_tree_entry_skeletons(&snapshot.index, snapshot.leaf_pos, cursor);
+    let skeletons = lofi_core::session::tree::build_tree_row_skeletons(
+        &snapshot.index,
+        snapshot.leaf_pos,
+        cursor,
+    );
     let mut hydrated = Vec::new();
-    hydrate_tree_entry_window(
+    lofi_core::session::tree::hydrate_tree_window(
         &snapshot.index,
         cursor,
         &skeletons,

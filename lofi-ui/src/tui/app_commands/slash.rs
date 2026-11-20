@@ -133,18 +133,6 @@ impl App {
         self.prompt.slash_complete = None;
     }
 
-    pub(in crate::tui) fn slash_complete_up(&mut self) {
-        if let Some(sc) = self.prompt.slash_complete.as_mut() {
-            sc.up();
-        }
-    }
-
-    pub(in crate::tui) fn slash_complete_down(&mut self) {
-        if let Some(sc) = self.prompt.slash_complete.as_mut() {
-            sc.down();
-        }
-    }
-
     pub(in crate::tui) fn show_help(&mut self) {
         let t = self.theme;
         let mut lines = vec![info_section("Keys")];

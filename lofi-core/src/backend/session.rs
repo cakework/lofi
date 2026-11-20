@@ -1,19 +1,15 @@
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lofi_error::{Error, Result};
-use lofi_types::{ContentBlock, Message, ModelChoice, Role, RunModel};
-use tokio::sync::{mpsc, oneshot};
+use lofi_types::ModelChoice;
+use tokio::sync::mpsc;
 
-use super::claude::ClaudeSession;
-use super::claude_engine::{reply, run_exchange, ClaudeEngine};
+use super::claude_engine::{spawn_worker, ClaudeEngine, Work, WorkerInit};
 use super::contract::{Backend, BackendRef, Completion, CompletionRequest, ModelSelection};
-use crate::agent::turn_session::{Exchange, ExchangeDriver, ExchangeFailure, TurnIo, TurnPolicy};
+use crate::agent::turn_session::{ExchangeDriver, TurnPolicy};
 use crate::agent::ToolExecutor;
-use crate::lifecycle::{lineage_catch_up, CatchUp};
-use crate::session::store::SessionCursor;
 
 /// The thinking levels one CLI backend accepts. The picker and the check read
 /// this one table, so they cannot disagree.
@@ -25,7 +21,7 @@ fn levels() -> Vec<lofi_types::ThinkingLevel> {
 /// Whether a CLI backend runs at a level. Off always means "pass no effort
 /// flag", so it needs no entry in the table.
 #[must_use]
-pub(crate) fn accepts(level: &lofi_types::ThinkingLevel) -> bool {
+pub(super) fn accepts(level: &lofi_types::ThinkingLevel) -> bool {
     *level == lofi_types::ThinkingLevel::Off || levels().contains(level)
 }
 
@@ -89,7 +85,7 @@ fn model_ids(config: &lofi_types::BackendConfig) -> Vec<String> {
 /// # Errors
 /// Returns [`Error::Config`] for a model outside the config, a service tier
 /// other than `auto`, or a level the backend does not accept.
-pub(crate) fn check_selection(
+pub(super) fn check_selection(
     config: &lofi_types::BackendConfig,
     backend: &str,
     model: &str,
@@ -125,18 +121,18 @@ pub(crate) fn check_selection(
 }
 
 #[derive(Clone)]
-pub struct ExternalBackend {
-    pub(super) name: String,
-    pub(super) model: Option<String>,
-    pub(super) config: lofi_types::BackendConfig,
-    pub(super) root: PathBuf,
-    pub(super) system_prompt: String,
-    pub(super) executor: ToolExecutor,
-    pub(super) thinking: lofi_types::ThinkingLevel,
+pub(super) struct ExternalBackend {
+    name: String,
+    model: Option<String>,
+    config: lofi_types::BackendConfig,
+    root: PathBuf,
+    system_prompt: String,
+    executor: ToolExecutor,
+    thinking: lofi_types::ThinkingLevel,
     worker: Arc<Mutex<Option<mpsc::Sender<Work>>>>,
     /// The context window the CLI reported for the current model. Shared by
     /// every clone, so the picker and the gauge learn it.
-    pub(super) context_window: Arc<Mutex<Option<u64>>>,
+    context_window: Arc<Mutex<Option<u64>>>,
     /// The selection the live worker serves. The subagent hook is installed
     /// once, when the worker starts, so a child forks from this cell instead
     /// of the fields its template was copied with: a model switch reuses the
@@ -145,16 +141,16 @@ pub struct ExternalBackend {
     /// The compaction config, so this transport stops at the same fill the
     /// provider path does. Lofi owns the cap on this transport too, so the child
     /// is never asked to decide when the context is full.
-    pub(super) compaction: lofi_types::CompactionConfig,
+    compaction: lofi_types::CompactionConfig,
     /// The same retry ladder the native path applies to a failed request.
-    pub(super) retry: crate::retry::RetryPolicy,
+    retry: crate::retry::RetryPolicy,
 }
 
 impl ExternalBackend {
     /// Configure a CLI backend without starting it or reading credentials.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn configure(
+    pub(super) fn configure(
         name: String,
         config: lofi_types::BackendConfig,
         root: PathBuf,
@@ -184,7 +180,7 @@ impl ExternalBackend {
     /// Apply the session retry ladder. The factory holds the config that
     /// declares it; the backend only carries the resolved policy.
     #[must_use]
-    pub(crate) fn with_retry(mut self, retry: crate::retry::RetryPolicy) -> Self {
+    pub(super) fn with_retry(mut self, retry: crate::retry::RetryPolicy) -> Self {
         self.retry = retry;
         self
     }
@@ -237,7 +233,7 @@ impl ExternalBackend {
     }
 
     /// Start the worker thread, or hand back the one already running.
-    pub(super) fn open_worker(&self) -> Result<mpsc::Sender<Work>> {
+    fn open_worker(&self) -> Result<mpsc::Sender<Work>> {
         let mut worker = self
             .worker
             .lock()
@@ -245,9 +241,6 @@ impl ExternalBackend {
         if let Some(tx) = worker.as_ref() {
             return Ok(tx.clone());
         }
-        let (tx, mut rx) = mpsc::channel::<Work>(1);
-        let config = self.config.clone();
-        let root = self.root.clone();
         // The bridge reports lofi.subagent availability from the hook it
         // carries, so install the run-management hook here where the backend
         // exists.
@@ -255,426 +248,18 @@ impl ExternalBackend {
             .executor
             .clone()
             .with_subagent_hook(self.subagent_hook());
-        let name = self.name.clone();
-        // The child's system prompt comes from the backend, not from the
-        // executor: a fork carries the role prompt its subagent was given.
-        let system_prompt = self.system_prompt.clone();
-        let live = self.live.clone();
-        std::thread::Builder::new()
-            .name("lofi-backend".into())
-            .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                runtime.block_on(async move {
-                    let mut session: Option<ClaudeSession> = None;
-                    let mut owner = None;
-                    let mut bound_model = BoundModel::Unchecked;
-                    let mut history_len = 0;
-                    let mut effort = lofi_types::ThinkingLevel::Off;
-                    while let Some(mut work) = rx.recv().await {
-                        if work.done.is_closed() {
-                            continue;
-                        }
-                        // Reuse the child only when it stays in the same
-                        // session and effort, and only when the CLI context is
-                        // still a prefix of the lineage. A rewritten history
-                        // (/compact, a new system prompt) or another session
-                        // makes the child stale. A user shell does not: its
-                        // output travels as a delta.
-                        let path = work
-                            .cursor
-                            .as_ref()
-                            .map(|cursor| cursor.path().to_path_buf());
-                        let sync = match exchange_catch_up(&name, &root, &work) {
-                            Ok(sync) => sync,
-                            Err(error) => {
-                                let _ = work.done.send(reply(
-                                    Err(ExchangeFailure::failed(error)),
-                                    &work.fold,
-                                    Facts::default(),
-                                    &mut session,
-                                    &work.reported,
-                                ));
-                                continue;
-                            }
-                        };
-                        // Publish the selection this turn runs with, so a
-                        // subagent started by it forks on the same model even
-                        // when the backend that sent the work was replaced.
-                        if let Ok(mut cell) = live.lock() {
-                            *cell = (work.model.clone(), work.effort.clone());
-                        }
-                        let fresh = child_is_fresh(
-                            &work,
-                            sync.as_ref(),
-                            path.as_deref(),
-                            owner.as_deref(),
-                            history_len,
-                        );
-                        // A cancelled or failed turn closes the child; it
-                        // cannot take another prompt, so the next turn must
-                        // reopen the session from the checkpoint.
-                        let live = session.as_ref().is_none_or(|s| !s.is_closed());
-                        if session.is_some() && (!fresh || !live || work.effort != effort) {
-                            if let Some(mut previous) = session.take() {
-                                let _ = previous.close().await;
-                            }
-                            owner = None;
-                            bound_model = BoundModel::Unchecked;
-                        }
-                        effort = work.effort.clone();
-                        let out = run_exchange(
-                            &name,
-                            &config,
-                            &root,
-                            &executor,
-                            &system_prompt,
-                            &mut session,
-                            &mut owner,
-                            &mut bound_model,
-                            &mut work,
-                            sync.as_ref(),
-                        )
-                        .await;
-                        // The driver dropped mid-exchange: the child took output
-                        // no transcript will hold, so a checkpoint that named
-                        // this turn's leaf would gate the next resume on a delta
-                        // the disk lacks.
-                        if work.abandoned.load(Ordering::Acquire) {
-                            abandon_exchange(&work, &mut session, &mut owner, &mut bound_model)
-                                .await;
-                        }
-                        history_len = work.base_len + out.appended.len();
-                        let _ = work.done.send(out);
-                    }
-                    if let Some(mut session) = session {
-                        let _ = session.close().await;
-                    }
-                });
-            })?;
+        let tx = spawn_worker(WorkerInit {
+            name: self.name.clone(),
+            config: self.config.clone(),
+            root: self.root.clone(),
+            executor,
+            // The child's system prompt comes from the backend, not from the
+            // executor: a fork carries the role prompt its subagent was given.
+            system_prompt: self.system_prompt.clone(),
+            live: self.live.clone(),
+        })?;
         *worker = Some(tx.clone());
         Ok(tx)
-    }
-}
-
-/// Drop what a turn that lost its driver left behind: the checkpoint names a
-/// leaf no transcript holds, and the child carries the context it built.
-async fn abandon_exchange(
-    work: &Work,
-    session: &mut Option<ClaudeSession>,
-    owner: &mut Option<PathBuf>,
-    bound_model: &mut BoundModel,
-) {
-    if let Some(cursor) = work.cursor.as_ref() {
-        remove_checkpoint(cursor);
-    }
-    if let Some(mut previous) = session.take() {
-        let _ = previous.close().await;
-    }
-    *owner = None;
-    *bound_model = BoundModel::Unchecked;
-}
-
-pub(super) async fn open_external(
-    config: &lofi_types::BackendConfig,
-    root: &Path,
-    executor: ToolExecutor,
-    resume: Option<&str>,
-    selected_model: Option<&str>,
-    effort: lofi_types::ThinkingLevel,
-    system_prompt: &str,
-) -> Result<ClaudeSession> {
-    let executable = std::env::current_exe()?;
-    match config {
-        lofi_types::BackendConfig::ClaudeCode {
-            command,
-            frame_idle_timeout_ms,
-            ..
-        } => {
-            ClaudeSession::open(
-                super::claude::Launch {
-                    command,
-                    model: selected_model,
-                    effort,
-                    resume,
-                    system_prompt,
-                    frame_idle: frame_idle_timeout_ms.map(std::time::Duration::from_millis),
-                },
-                root,
-                &executable,
-                executor,
-            )
-            .await
-        }
-    }
-}
-
-/// The catch-up the exchange's child needs.
-///
-/// Read after the previous turn settled: a checkpoint captured earlier can
-/// name a leaf it already moved past, and the delta would resend the child its
-/// own reply. Only the turn's first exchange compares the child with the
-/// transcript; a settle is what moves the leaf, so every later exchange of the
-/// same turn sees a child that is ahead of it by design and must continue it
-/// rather than resync it.
-fn exchange_catch_up(name: &str, root: &Path, work: &Work) -> Result<Option<CatchUp>> {
-    let Some(cursor) = work.cursor.as_ref().filter(|_| work.first) else {
-        return Ok(None);
-    };
-    catch_up(name, root, cursor, work.io.frontier().frontier.as_deref()).map(Some)
-}
-
-/// Whether the live child still holds this exchange's context.
-fn child_is_fresh(
-    work: &Work,
-    sync: Option<&CatchUp>,
-    path: Option<&Path>,
-    owner: Option<&Path>,
-    history_len: usize,
-) -> bool {
-    if !work.first {
-        // A later exchange of the same turn continues the child the previous
-        // one left: the transcript cannot show that child's own work.
-        return path == owner;
-    }
-    match sync {
-        Some(CatchUp::Diverged) => false,
-        Some(_) => path == owner,
-        // No cursor: the history length is the only signal.
-        None => work.base_len == history_len,
-    }
-}
-
-#[derive(Default, PartialEq, Eq)]
-pub(super) enum BoundModel {
-    #[default]
-    Unchecked,
-    Known(Option<String>),
-}
-
-impl BoundModel {
-    pub(super) fn matches(&self, model: Option<&str>) -> bool {
-        matches!(self, Self::Known(bound) if bound.as_deref() == model)
-    }
-}
-
-/// One exchange handed to the worker thread.
-pub(super) struct Work {
-    pub(super) model: Option<String>,
-    pub(super) effort: lofi_types::ThinkingLevel,
-    /// Whether non-system messages exist before this turn's admission frontier.
-    pub(super) has_prior: bool,
-    /// On-demand channel requesting prior history only when a fresh child with
-    /// no valid binding needs history transfer.
-    pub(super) prior_tx: Option<oneshot::Sender<oneshot::Sender<Vec<Message>>>>,
-    /// Total length of the caller's history at the start of this exchange.
-    pub(super) base_len: usize,
-    pub(super) io: TurnIo,
-    pub(super) cursor: Option<SessionCursor>,
-    /// The identity the child reported for itself, so the terminal marker and
-    /// the next resume carry the same label.
-    pub(super) reported: Arc<Mutex<Option<RunModel>>>,
-    /// The fold of this turn's child events. The tool recorder writes into the
-    /// same one, so a block the child's tool produced keeps its order.
-    pub(super) fold: Arc<Mutex<Fold>>,
-    /// First exchange of its turn: the child's spend counter restarts.
-    pub(super) first: bool,
-    /// The driver dropped without settling. This thread writes the binding, so
-    /// the checkpoint is removed here and not on the caller's.
-    pub(super) abandoned: Arc<AtomicBool>,
-    pub(super) done: oneshot::Sender<Reply>,
-}
-
-/// What one exchange produced.
-pub(super) struct Reply {
-    pub(super) exchange: std::result::Result<Exchange, ExchangeFailure>,
-    /// Messages this exchange appended, in order.
-    pub(super) appended: Vec<Message>,
-    pub(super) facts: Facts,
-    pub(super) window: Option<u64>,
-    pub(super) reported: Option<RunModel>,
-}
-
-/// What the settle step needs to know about the child.
-#[derive(Default, Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)]
-pub(super) struct Facts {
-    /// This turn wrote the binding.
-    pub(super) created: bool,
-    /// The child reported init, so the session exists.
-    pub(super) initialized: bool,
-    /// The child took a prompt this turn and may hold context the transcript
-    /// does not.
-    pub(super) child_holds_turn: bool,
-    /// The exchange failed: the child's state may be ahead of the transcript,
-    /// so the binding may not name this turn's leaf.
-    pub(super) failed: bool,
-}
-
-impl Facts {
-    /// Keep what an earlier exchange of the turn learned. A later exchange
-    /// that returns early reports nothing, and its defaults must not erase a
-    /// prompt the turn already wrote.
-    pub(super) fn merge(&mut self, later: Self) {
-        self.created |= later.created;
-        self.initialized |= later.initialized;
-        self.child_holds_turn |= later.child_holds_turn;
-        self.failed |= later.failed;
-    }
-}
-
-/// Compare the saved backend checkpoint with the session lineage.
-///
-/// The worker runs this per exchange, not the caller: an abandoned turn can
-/// still be settling when the next one is enqueued, and a checkpoint read
-/// before that settlement would name a leaf the turn already moved past.
-fn catch_up(
-    name: &str,
-    root: &Path,
-    cursor: &SessionCursor,
-    frontier: Option<&str>,
-) -> Result<CatchUp> {
-    let binding = read_binding(cursor)?;
-    let Some(binding) = binding.filter(|b| b.backend == name && b.cwd == root) else {
-        return Ok(CatchUp::Diverged);
-    };
-    lineage_catch_up(cursor, frontier, binding.leaf_id.as_deref())
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct Binding {
-    pub(super) backend: String,
-    pub(super) session_id: String,
-    pub(super) cwd: PathBuf,
-    pub(super) model: Option<String>,
-    pub(super) leaf_id: Option<String>,
-}
-
-fn binding_path(cursor: &SessionCursor) -> PathBuf {
-    cursor.path().with_extension("backend.json")
-}
-
-/// Drop a checkpoint the child cannot be resumed from. The file is kept when
-/// it already names the current leaf: a failed directory sync can still leave
-/// it correct, and removing it would resend the whole history.
-pub(super) fn drop_checkpoint(cursor: &SessionCursor) {
-    let leaf = cursor.leaf_id();
-    match read_binding(cursor) {
-        Ok(Some(binding)) if binding.leaf_id == leaf => {}
-        Ok(_) | Err(_) => remove_checkpoint(cursor),
-    }
-}
-
-pub(super) fn remove_checkpoint(cursor: &SessionCursor) {
-    let path = binding_path(cursor);
-    if !path.exists() {
-        return;
-    }
-    if let Err(error) = std::fs::remove_file(&path) {
-        tracing::warn!(error = %error, "backend checkpoint removal failed");
-    }
-}
-
-pub(super) fn read_binding(cursor: &SessionCursor) -> Result<Option<Binding>> {
-    match std::fs::read(binding_path(cursor)) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub(super) fn write_binding(cursor: &SessionCursor, binding: &Binding) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = binding_path(cursor);
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::State("session path has no parent".into()))?;
-    let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("backend.json")
-    ));
-    let bytes = serde_json::to_vec(binding).map_err(|e| Error::State(e.to_string()))?;
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    crate::state::ensure_private_file(&path)?;
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
-}
-
-/// The frame a silent continuation sends. A provider round continues from the
-/// same history; a stdio child needs a message to produce output.
-pub(super) const CONTINUE_PROMPT: &str = "Continue the task from where you left off.";
-
-/// Render a history for a continuation frame: each image becomes a pointer,
-/// and its bytes are appended to images in reference order. Base64 never
-/// enters model-visible text.
-pub(super) fn render_transfer(
-    history: &[Message],
-    images: &mut Vec<ContentBlock>,
-) -> Result<String> {
-    let mut budget = crate::agent::MAX_REQUEST_IMAGE_BYTES;
-    let mut rendered = Vec::with_capacity(history.len());
-    for message in history {
-        let mut blocks = Vec::with_capacity(message.blocks.len());
-        for block in &message.blocks {
-            if let ContentBlock::Image { bytes, media_type } = block {
-                let size = bytes.len() as u64 * 4 / 3 + 4;
-                if size <= budget {
-                    budget -= size;
-                    images.push(ContentBlock::Image {
-                        bytes: bytes.clone(),
-                        media_type: media_type.clone(),
-                    });
-                    blocks.push(ContentBlock::Text {
-                        text: format!("[image {}]", images.len()),
-                    });
-                } else {
-                    blocks.push(ContentBlock::Text {
-                        text: "[image omitted: transfer budget]".into(),
-                    });
-                }
-            } else {
-                blocks.push(block.clone());
-            }
-        }
-        rendered.push(Message {
-            blocks,
-            ..message.clone()
-        });
-    }
-    serde_json::to_string(&rendered).map_err(|e| Error::State(e.to_string()))
-}
-
-/// The identity the terminal marker carries before the child reports one.
-pub(super) fn run_model_for(
-    name: &str,
-    model: Option<&str>,
-    effort: &lofi_types::ThinkingLevel,
-) -> RunModel {
-    let selected = model.unwrap_or("default").to_owned();
-    RunModel {
-        provider: name.into(),
-        id: selected.clone(),
-        selected,
-        display: None,
-        thinking: effort.clone(),
-        service_tier: lofi_types::ServiceTier::Auto,
     }
 }
 
@@ -819,19 +404,15 @@ impl Backend for ExternalBackend {
         })
     }
 
-    async fn run_turn(
-        &self,
-        messages: &mut Vec<Message>,
-        request: crate::agent::TurnRequest,
-        events: mpsc::Sender<crate::agent::AgentEvent>,
-        cursor: Option<&SessionCursor>,
-        controls: crate::agent::RunControls,
-    ) -> Result<crate::session::recorder::TurnOutcome> {
-        crate::agent::turn_session::run(self, messages, request, events, cursor, controls).await
-    }
-
     fn open_turn(&self) -> Result<Box<dyn ExchangeDriver>> {
-        Ok(Box::new(ClaudeEngine::open(self.clone())?))
+        let worker = self.open_worker()?;
+        Ok(Box::new(ClaudeEngine::open(
+            worker,
+            &self.name,
+            self.model.clone(),
+            self.thinking.clone(),
+            self.context_window.clone(),
+        )))
     }
 
     fn turn_policy(&self) -> TurnPolicy {
@@ -857,117 +438,5 @@ impl Backend for ExternalBackend {
             &request,
         )
         .await
-    }
-}
-
-/// The role a recorded block belongs to.
-pub(super) fn block_role(block: &ContentBlock) -> Role {
-    if matches!(block, ContentBlock::ToolUse { .. }) {
-        Role::Assistant
-    } else {
-        Role::Tool
-    }
-}
-
-/// The fold of a child's event stream into messages.
-///
-/// Text and thinking arrive as deltas and coalesce into blocks until the next
-/// role boundary: one assistant message per CLI round, not one per token.
-#[derive(Default)]
-pub(super) struct Fold {
-    pending: Vec<ContentBlock>,
-    turn_messages: Vec<Message>,
-    appended_from: usize,
-}
-
-impl Fold {
-    pub(super) fn reset(&mut self, turn_prefix: Vec<Message>) {
-        self.pending.clear();
-        self.appended_from = turn_prefix.len();
-        self.turn_messages = turn_prefix;
-    }
-
-    pub(super) fn take_appended(&mut self) -> Vec<Message> {
-        let start = self.appended_from.min(self.turn_messages.len());
-        self.turn_messages.drain(start..).collect()
-    }
-
-    pub(super) fn flush(&mut self, io: &TurnIo) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let blocks = std::mem::take(&mut self.pending);
-        self.append(
-            io,
-            Message {
-                role: Role::Assistant,
-                kind: lofi_types::PromptKind::User,
-                origin: None,
-                blocks,
-            },
-        );
-    }
-
-    fn append(&mut self, io: &TurnIo, message: Message) {
-        self.turn_messages.push(message);
-        // Best effort: the recorder keeps its counts, so the next commit
-        // retries the same suffix. A byte this one wrote stays pending in the
-        // turn and travels with that commit's range.
-        if let Err(error) = io.record_turn_suffix(&self.turn_messages) {
-            tracing::warn!(error = %error, "backend checkpoint write failed");
-        }
-    }
-
-    pub(super) fn push(
-        &mut self,
-        io: &TurnIo,
-        role: Role,
-        kind: lofi_types::PromptKind,
-        block: ContentBlock,
-    ) {
-        self.flush(io);
-        self.append(
-            io,
-            Message {
-                role,
-                kind,
-                origin: None,
-                blocks: vec![block],
-            },
-        );
-    }
-
-    pub(super) fn event(&mut self, io: &TurnIo, event: &crate::agent::AgentEvent) {
-        match event {
-            crate::agent::AgentEvent::Text(text) => {
-                if text.is_empty() {
-                    return;
-                }
-                if let Some(ContentBlock::Text { text: last }) = self.pending.last_mut() {
-                    last.push_str(text);
-                } else {
-                    self.pending.push(ContentBlock::Text { text: text.clone() });
-                }
-            }
-            crate::agent::AgentEvent::Thinking(text) => {
-                if text.is_empty() {
-                    return;
-                }
-                if let Some(ContentBlock::Thinking { text: last, .. }) = self.pending.last_mut() {
-                    last.push_str(text);
-                } else {
-                    self.pending.push(ContentBlock::Thinking {
-                        text: text.clone(),
-                        signature: None,
-                        redacted: false,
-                    });
-                }
-            }
-            // A usage or context report closes the open block first, so the
-            // assistant message it describes is already in the transcript.
-            crate::agent::AgentEvent::ContextReported { .. }
-            | crate::agent::AgentEvent::RoundUsage { .. } => self.flush(io),
-            _ => {}
-        }
     }
 }

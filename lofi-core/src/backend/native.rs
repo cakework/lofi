@@ -3,14 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lofi_error::{Error, Result};
 use lofi_types::{ContentBlock, Message, ModelChoice, PromptKind, Role, ThinkingLevel};
-use tokio::sync::mpsc;
 
 use super::contract::{Backend, BackendRef, Completion, CompletionRequest, ModelSelection};
 use crate::agent::native::NativeEngine;
 use crate::agent::turn_session::{ExchangeDriver, TurnPolicy};
 use crate::agent::{collect_text, usage_cost, Agent, ToolExecutor};
 use crate::models::ModelRegistry;
-use crate::session::store::SessionCursor;
 
 /// What a native backend needs to open another transport: the registry that
 /// resolves a query and the config that credentials were resolved into.
@@ -111,17 +109,6 @@ impl Backend for Agent {
 
     fn fork(&self, executor: ToolExecutor) -> BackendRef {
         Arc::new(self.forked(&executor))
-    }
-
-    async fn run_turn(
-        &self,
-        messages: &mut Vec<Message>,
-        request: crate::agent::TurnRequest,
-        events: mpsc::Sender<crate::agent::AgentEvent>,
-        cursor: Option<&SessionCursor>,
-        controls: crate::agent::RunControls,
-    ) -> Result<crate::session::recorder::TurnOutcome> {
-        crate::agent::turn_session::run(self, messages, request, events, cursor, controls).await
     }
 
     fn open_turn(&self) -> Result<Box<dyn ExchangeDriver>> {

@@ -1,7 +1,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::tui::tree::tree_entry_loading_label;
 use crate::tui::{PickerList, PickerState, TreeEntry, TreePickerState};
+use lofi_core::session::tree::loading_label as tree_entry_loading_label;
 
 fn relative_age(then: std::time::SystemTime) -> String {
     let seconds = std::time::SystemTime::now()

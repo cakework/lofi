@@ -61,17 +61,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 pulldown-cmark = { version = "0.13", default-features = false }
 
 # TypeScript sandbox: swc strip + QuickJS.
-# "full" minus "chrono": we never convert JS dates to chrono types, and the
-# feature is the only thing keeping chrono in the tree.
-rquickjs = { version = "0.9", features = [
-    "loader",
-    "dyn-load",
-    "either",
-    "indexmap",
-    "macro",
-    "phf",
-    "futures",
-] }
+rquickjs = { version = "0.9", features = ["futures"] }
 swc_common = "27"
 swc_ecma_ast = "30"
 swc_ecma_parser = "47"

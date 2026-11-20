@@ -9,7 +9,7 @@ use super::{collect_text, ProtocolIr};
 use crate::ToolSchema;
 use lofi_error::{Error, Result};
 
-pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 fn to_anthropic_request_parts<'a>(
     messages: impl IntoIterator<Item = &'a Message>,

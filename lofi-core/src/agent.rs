@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,8 +11,8 @@ use crate::backend;
 use crate::models::ModelRegistry;
 use crate::state;
 use lofi_error::{Error, Result};
+use lofi_providers::Provider;
 use lofi_providers::ToolSchema;
-use lofi_providers::{open, Provider};
 use lofi_types::BashConfig;
 #[cfg(test)]
 use lofi_types::StreamingEvent;
@@ -38,12 +37,12 @@ pub(crate) use tool_executor::ActivityWatch;
 pub(crate) mod turn;
 pub(crate) mod turn_session;
 pub use lofi_code::SubagentOp;
-pub(crate) use subagent::{backend_hook, settled_cost};
+pub(crate) use subagent::{backend_hook, settled_cost, SubagentSupport};
 pub use subagent::{
     SubagentLive, SubagentNotice, SubagentNoticeKind, SubagentRegistry, SubagentRunning,
-    SubagentSupport,
 };
-pub use tool_executor::{ConfirmRequest, ConfirmResponse, ToolCallContext, ToolExecutor};
+pub(crate) use tool_executor::ToolCallContext;
+pub use tool_executor::{ConfirmRequest, ConfirmResponse, ToolExecutor};
 pub(crate) use turn_session::ToolRecorder;
 pub use turn_session::{new_cancel_flag, signal_cancel, RunControls, TurnInput, TurnRequest};
 
@@ -52,21 +51,21 @@ mod tests;
 
 pub(crate) use auto_mode::collect_text;
 pub use event::AgentEvent;
-#[cfg(test)]
-pub(crate) use exec::extract_code_prefix;
+pub use exec::exec_result_display;
 pub(crate) use exec::{
-    cap_description, exec_timeout_ms, exec_tool_schema_bytes, exec_tool_schema_ref,
-    normalize_exec_input, normalize_exec_input_in_place,
+    cap_description, exec_input_code_and_label, exec_timeout_ms, exec_tool_schema_bytes,
+    exec_tool_schema_ref, normalize_exec_input, normalize_exec_input_in_place, parse_exec_input,
 };
 pub(crate) use exec::{cap_exec_envelope, cap_exec_result, cap_tool_result, CodePrefixDecoder};
-pub use exec::{
-    exec_input_code_and_label, exec_label, exec_result_display, exec_tool_schema, parse_exec_input,
+#[cfg(test)]
+use exec::{exec_label, extract_code_prefix};
+#[cfg(test)]
+use model::select_model_with_level;
+pub(crate) use model::{
+    parse_model_query, select_model, select_model_for_subagent, NO_MODELS_HINT,
 };
-pub(crate) use model::select_model_for_subagent;
-pub(crate) use model::{parse_model_query, NO_MODELS_HINT};
-pub use model::{rebuild_agent, select_model, select_model_with_level};
 
-pub const SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
+pub(crate) const SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
 
 /// Resolves `[[permissions]]` entries into granted directories: `~` is
 /// expanded, then the deepest existing ancestor is canonicalized and the
@@ -116,7 +115,7 @@ pub(crate) const BYTE_BUDGET_CONTINUATION_PROMPT: &str = "Your previous response
 /// Spend of one complete usage report, or `None` when the model carries no
 /// price. The same arithmetic bills a finished round and a one-shot call.
 #[must_use]
-pub fn usage_cost(model: &Model, usage: Usage) -> Option<f64> {
+pub(crate) fn usage_cost(model: &Model, usage: Usage) -> Option<f64> {
     let (Some(input), Some(output)) = (model.input_price, model.output_price) else {
         return model.per_request_price;
     };
@@ -169,46 +168,14 @@ impl Agent {
         image: lofi_types::ImageConfig,
         shell_policy_config: &lofi_types::ShellPolicyConfig,
     ) -> Self {
-        let bash_env = crate::bash_env::resolve_bash_env(bash, env);
-        let truncate = lofi_code::TruncatedCap {
-            max_lines: truncate.max_lines,
-            max_bytes: truncate.max_bytes,
-        };
-        let shell_policy = lofi_code::policy::defaults::resolve(shell_policy_config);
-        // One handle space for everything this session owns, so a job, a
-        // subagent, and a timer can never share an id.
-        let ids = lofi_types::IdSpace::new();
         let memory = state::WorkspaceMemory::open(&root).ok().map(Into::into);
-        let executor = ToolExecutor {
-            root,
-            tmp_dir,
-            tmp_lease: None,
-            bash_env,
-            shell_policy,
-            truncate,
-            image,
-            confirm_tx: None,
-            confirm_counter: Arc::new(AtomicU64::new(0)),
-            confirm_watch: Arc::new(tool_executor::ConfirmWatch::default()),
-            activity: Arc::new(tool_executor::ActivityWatch::default()),
-            auto_mode: None,
-            auto_mode_config: None,
-            auto_mode_hints: auto_mode::hint_handle(),
-            policy_override: lofi_code::policy::PolicyOverride::default(),
-            skills_dir: None,
-            grants: Vec::new(),
-            memory,
-            jobs: lofi_code::tools::JobRegistry::with_ids(ids.clone()),
-            timers: lofi_code::tools::TimerRegistry::with_ids(ids.clone()),
-            job_owner: None,
-            exec_worker: std::sync::Arc::new(std::sync::OnceLock::new()),
-            subagent: None,
-            mailbox: None,
-            subagents: SubagentRegistry::with_ids(ids),
-            subagent_support: None,
-            models: None,
-            session_cache: Arc::new(std::sync::OnceLock::new()),
-        };
+        let mut executor = ToolExecutor::in_memory(root);
+        executor.tmp_dir = tmp_dir;
+        executor.bash_env = crate::bash_env::resolve_bash_env(bash, env);
+        executor.shell_policy = lofi_code::policy::defaults::resolve(shell_policy_config);
+        executor.truncate = truncate;
+        executor.image = image;
+        executor.memory = memory;
         Self::from_executor(provider, model, executor, system_prompt, compaction)
             .with_max_output_tokens(max_output_tokens)
     }
@@ -244,32 +211,8 @@ impl Agent {
         self
     }
 
-    /// Attaches config-sourced granted directories outside the workspace
-    /// root. A model switch keeps them because every rebuild clones the
-    /// executor.
     #[must_use]
-    pub fn with_grants(mut self, grants: Vec<lofi_code::GrantedDir>) -> Self {
-        self.executor.grants = grants;
-        self.executor.invalidate_session();
-        self
-    }
-
-    /// The config-sourced grants, for the grant hook and the paths manager.
-    #[must_use]
-    pub fn grants(&self) -> &[lofi_code::GrantedDir] {
-        &self.executor.grants
-    }
-
-    fn with_tmp_lease(mut self, lease: state::SessionTempDir) -> Self {
-        let lease = Arc::new(lease);
-        self.executor.tmp_dir = lease.path().to_path_buf();
-        self.executor.tmp_lease = Some(lease);
-        self.executor.invalidate_session();
-        self
-    }
-
-    #[must_use]
-    pub fn with_model(&self, provider: Box<dyn Provider>, model: Model) -> Self {
+    pub(crate) fn with_model(&self, provider: Box<dyn Provider>, model: Model) -> Self {
         Self {
             provider: Arc::from(provider),
             model,
@@ -278,23 +221,16 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn with_system_prompt(&self, system_prompt: String) -> Self {
+    pub(crate) fn with_system_prompt(&self, system_prompt: String) -> Self {
         Self {
             system_prompt,
             ..self.clone()
         }
     }
 
-    #[must_use]
-    pub fn with_skills_dir(&self, skills_dir: Option<PathBuf>) -> Self {
-        let mut next = self.clone();
-        next.executor = next.executor.with_skills_dir(skills_dir);
-        next
-    }
-
     /// Replace every session-scoped field from an executor.
     #[must_use]
-    pub fn with_executor(&self, executor: &ToolExecutor) -> Self {
+    pub(crate) fn with_executor(&self, executor: &ToolExecutor) -> Self {
         let mut next = self.clone();
         next.executor = executor.clone();
         if next.executor.models.is_none() && next.executor.subagent_support.is_some() {
@@ -311,7 +247,7 @@ impl Agent {
     /// A new conversation that shares the backend configuration and nothing
     /// else: its own transcript slot, its own nested-subagent scope.
     #[must_use]
-    pub fn forked(&self, executor: &ToolExecutor) -> Self {
+    pub(crate) fn forked(&self, executor: &ToolExecutor) -> Self {
         let mut child = self.with_executor(executor);
         child.executor.mailbox = None;
         child.executor.subagent = None;
@@ -323,30 +259,16 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn with_source(&self, source: Arc<backend::NativeSource>) -> Self {
+    pub(crate) fn with_source(&self, source: Arc<backend::NativeSource>) -> Self {
         Self {
             source: Some(source),
             ..self.clone()
         }
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn source(&self) -> Option<&Arc<backend::NativeSource>> {
-        self.source.as_ref()
-    }
-
-    #[must_use]
-    pub fn model(&self) -> &Model {
-        &self.model
-    }
-
-    #[must_use]
-    pub fn provider(&self) -> &Arc<dyn Provider> {
-        &self.provider
-    }
-
-    #[must_use]
-    pub fn with_confirm_tx(
+    pub(crate) fn with_confirm_tx(
         &self,
         confirm_tx: tokio::sync::mpsc::UnboundedSender<ConfirmRequest>,
     ) -> Self {
@@ -357,7 +279,7 @@ impl Agent {
 
     /// Share the session's jobs, policy and sandbox with a backend.
     #[must_use]
-    pub fn tool_executor(&self) -> ToolExecutor {
+    pub(crate) fn tool_executor(&self) -> ToolExecutor {
         let mut executor = self.executor.clone();
         executor.subagent = self.subagent_hook();
         if executor.models.is_none() && executor.subagent_support.is_some() {
@@ -371,8 +293,9 @@ impl Agent {
     }
 
     /// Keep execution state when switching from another backend.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_tool_executor(mut self, mut executor: ToolExecutor) -> Self {
+    pub(crate) fn with_tool_executor(mut self, mut executor: ToolExecutor) -> Self {
         if let Some(support) = self.executor.subagent_support {
             executor.models = Some(support.models_fn());
             executor.subagent_support = Some(support);
@@ -388,8 +311,9 @@ impl Agent {
         self
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn with_auto_mode(&self, auto_mode: lofi_code::AutoModeFn) -> Self {
+    pub(crate) fn with_auto_mode(&self, auto_mode: lofi_code::AutoModeFn) -> Self {
         let mut next = self.clone();
         next.executor = next.executor.with_auto_mode(Some(auto_mode));
         next
@@ -397,58 +321,23 @@ impl Agent {
 
     /// The turn-context handle the evaluator reads. The turn loop replaces
     /// its contents at the start of every turn.
+    #[cfg(test)]
     #[must_use]
-    pub fn auto_mode_hints(&self) -> &lofi_code::AutoModeHintHandle {
+    pub(crate) fn auto_mode_hints(&self) -> &lofi_code::AutoModeHintHandle {
         &self.executor.auto_mode_hints
     }
 
-    #[must_use]
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
-    }
-
-    #[must_use]
-    pub fn root(&self) -> &PathBuf {
-        &self.executor.root
-    }
-
-    #[must_use]
-    pub fn tmp_dir(&self) -> &PathBuf {
-        &self.executor.tmp_dir
-    }
-
-    /// The session-scoped `/policy` approval override handle; the TUI
-    /// writes to it, every exec reads from it.
-    #[must_use]
-    pub fn policy_override(&self) -> &lofi_code::policy::PolicyOverride {
-        &self.executor.policy_override
-    }
-
     /// Whether auto-mode approval evaluation is configured for this agent.
+    #[cfg(test)]
     #[must_use]
-    pub fn has_auto_mode(&self) -> bool {
+    pub(crate) fn has_auto_mode(&self) -> bool {
         self.executor.auto_mode.is_some()
-    }
-
-    /// The session's background-job registry. Cheap to clone (shares the
-    /// same map); the UI clones it once to render the job list and badge
-    /// and to kill jobs from the `/job` modal.
-    #[must_use]
-    pub fn jobs(&self) -> lofi_code::tools::JobRegistry {
-        self.executor.jobs.clone()
-    }
-
-    /// Session-scoped wake-up timers, for a host to poll the notices fired
-    /// since its last pull.
-    #[must_use]
-    pub fn timers(&self) -> lofi_code::tools::TimerRegistry {
-        self.executor.timers.clone()
     }
 
     /// The session's subagent registry (shared by every clone). The UI keeps
     /// a handle so a new session can drop the entries of the old one.
     #[must_use]
-    pub fn subagents(&self) -> SubagentRegistry {
+    pub(crate) fn subagents(&self) -> SubagentRegistry {
         self.executor.subagents.clone()
     }
 
@@ -459,7 +348,7 @@ impl Agent {
     /// renders it to `provider/id:level` at display time rather than storing
     /// a formatted string.
     #[must_use]
-    pub fn run_model(&self) -> RunModel {
+    pub(crate) fn run_model(&self) -> RunModel {
         RunModel {
             provider: self.model.provider.clone(),
             id: self.model.id.clone(),
@@ -471,20 +360,15 @@ impl Agent {
     }
 
     #[must_use]
-    pub fn with_retry(mut self, retry: crate::retry::RetryPolicy) -> Self {
+    pub(crate) fn with_retry(mut self, retry: crate::retry::RetryPolicy) -> Self {
         self.retry = retry;
         self
     }
 
     #[must_use]
-    pub fn with_auto_continue(mut self, policy: lofi_types::AutoContinuePolicy) -> Self {
+    pub(crate) fn with_auto_continue(mut self, policy: lofi_types::AutoContinuePolicy) -> Self {
         self.auto_continue = policy;
         self
-    }
-
-    #[must_use]
-    pub fn max_output_tokens(&self) -> Option<u64> {
-        self.max_output_tokens
     }
 
     /// Effective `max_tokens` for the next request, clipped so the request

@@ -203,38 +203,10 @@ fn model() -> Model {
 }
 
 fn agent_with(rounds: Vec<Vec<StreamingEvent>>, root: &std::path::Path) -> Agent {
-    let executor = ToolExecutor {
-        root: root.to_path_buf(),
-        tmp_dir: std::env::temp_dir().join("lofi-agent-test"),
-        tmp_lease: None,
-        bash_env: lofi_code::BashEnv::default(),
-        shell_policy: lofi_code::policy::defaults::resolve(
-            &lofi_types::ShellPolicyConfig::default(),
-        ),
-        truncate: lofi_code::TruncatedCap::default(),
-        image: lofi_types::ImageConfig::default(),
-        confirm_tx: None,
-        confirm_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        confirm_watch: std::sync::Arc::new(super::tool_executor::ConfirmWatch::default()),
-        activity: std::sync::Arc::new(super::tool_executor::ActivityWatch::default()),
-        auto_mode: None,
-        auto_mode_config: None,
-        auto_mode_hints: super::auto_mode::hint_handle(),
-        policy_override: lofi_code::policy::PolicyOverride::default(),
-        skills_dir: None,
-        grants: Vec::new(),
-        memory: None,
-        jobs: lofi_code::tools::JobRegistry::new(),
-        timers: lofi_code::tools::TimerRegistry::new(),
-        job_owner: None,
-        exec_worker: std::sync::Arc::new(std::sync::OnceLock::new()),
-        subagent: None,
-        mailbox: None,
-        subagents: SubagentRegistry::default(),
-        subagent_support: None,
-        models: None,
-        session_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
-    };
+    let mut executor = ToolExecutor::in_memory(root);
+    executor.tmp_dir = std::env::temp_dir().join("lofi-agent-test");
+    executor.shell_policy =
+        lofi_code::policy::defaults::resolve(&lofi_types::ShellPolicyConfig::default());
     Agent {
         provider: Arc::new(MockProvider::new(rounds)),
         model: model(),

@@ -1132,10 +1132,9 @@ fn slash_complete_filters_and_accepts() {
     assert!(a.prompt.slash_complete.is_none());
     a.prompt.text = "/".to_string();
     a.refresh_slash_complete();
-    a.slash_complete_down(); // index 1 = /compact
-    a.slash_complete_down(); // index 2 = /debug
-    a.slash_complete_down(); // index 3 = /exit
-    a.slash_complete_down(); // index 4 = /help
+    for _ in 0..4 {
+        a.prompt.slash_complete.as_mut().unwrap().down();
+    }
     a.slash_complete_accept();
     assert_eq!(a.prompt.text, "/help");
     assert_eq!(a.prompt.cursor, a.prompt.text.len());

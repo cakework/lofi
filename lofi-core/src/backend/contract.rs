@@ -42,10 +42,23 @@ pub struct Completion {
     pub cost: Option<f64>,
 }
 
+/// Coerces any concrete [`Backend`] implementor to `&dyn Backend` so default
+/// trait methods can delegate to [`crate::agent::turn_session::run`] without
+/// losing dyn-compatibility.
+pub trait AsBackend {
+    fn as_backend(&self) -> &dyn Backend;
+}
+
+impl<T: Backend> AsBackend for T {
+    fn as_backend(&self) -> &dyn Backend {
+        self
+    }
+}
+
 /// The abstraction above the transport. Callers never learn whether the model
 /// is an HTTP endpoint or a child process.
 #[async_trait]
-pub trait Backend: Send + Sync {
+pub trait Backend: AsBackend + Send + Sync {
     /// The provider or backend key this instance was configured under.
     fn name(&self) -> &str;
 
@@ -149,7 +162,17 @@ pub trait Backend: Send + Sync {
         events: mpsc::Sender<AgentEvent>,
         cursor: Option<&SessionCursor>,
         controls: RunControls,
-    ) -> Result<TurnOutcome>;
+    ) -> Result<TurnOutcome> {
+        crate::agent::turn_session::run(
+            self.as_backend(),
+            messages,
+            request,
+            events,
+            cursor,
+            controls,
+        )
+        .await
+    }
 
     /// Answer one prompt with text only.
     ///

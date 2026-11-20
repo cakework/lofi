@@ -113,58 +113,6 @@ fn project_boundary(start: &std::path::Path) -> Option<PathBuf> {
     lofi_types::project::nearest_any(start).map(|root| root.dir)
 }
 
-/// The startup path passes `None` and gets a fresh agent (a new tmp dir).
-/// The `/model` selector passes the live agent so the switch doesn't orphan
-/// `lofi.bash` full-output logs or `lofi.bash_read` state. This is sync and
-/// side-effect-free beyond provider construction, so a switch never blocks
-/// the UI on remote discovery — the registry is retained from startup.
-/// # Errors
-/// Propagates [`Error`] from model resolution, thinking-level validation,
-/// or provider construction.
-pub fn rebuild_agent(
-    existing: Option<&Agent>,
-    registry: &ModelRegistry,
-    config: &lofi_types::Config,
-    model: Option<&str>,
-    root: &std::path::Path,
-    env: &[(String, String)],
-) -> Result<(Agent, Model, ThinkingLevel)> {
-    let (mut model_obj, level) = select_model(registry, config, model)?;
-    model_obj.thinking = level.clone();
-
-    let provider_cfg = config
-        .providers
-        .get(&model_obj.provider)
-        .ok_or_else(|| Error::Config(format!("provider not found: {}", model_obj.provider)))?;
-    let provider = open(model_obj.api, provider_cfg)?;
-    let auto_continue = registry.auto_continue_policy(&config.agent, &model_obj);
-
-    let agent = if let Some(a) = existing {
-        a.with_model(provider, model_obj.clone())
-    } else {
-        let tmp_lease = state::create_session_tmp_dir(root)?;
-        Agent::new(
-            provider,
-            model_obj.clone(),
-            root.to_path_buf(),
-            tmp_lease.path().to_path_buf(),
-            SYSTEM_PROMPT.to_string(),
-            None,
-            config.compaction.clone(),
-            &config.bash,
-            env,
-            config.truncate,
-            config.image,
-            &config.shell_policy,
-        )
-        .with_tmp_lease(tmp_lease)
-        .with_grants(super::granted_dirs(&config.permissions))
-        .with_retry(crate::retry::RetryPolicy::from(config.retry))
-    };
-    let agent = agent.with_auto_continue(auto_continue);
-    Ok((agent, model_obj, level))
-}
-
 pub(crate) struct ModelQuery {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -229,7 +177,7 @@ pub(crate) const NO_MODELS_HINT: &str = "No models configured.";
 /// model's provider is disabled (no credentials); [`Error::Config`] for an
 /// unresolvable query, an unknown model/provider, or an unsupported thinking
 /// level.
-pub fn select_model(
+pub(crate) fn select_model(
     registry: &ModelRegistry,
     config: &lofi_types::Config,
     model_query: Option<&str>,
@@ -239,10 +187,8 @@ pub fn select_model(
 
 /// Like [`select_model`], but an explicit thinking level takes precedence
 /// over a level embedded in the query and over configured defaults.
-/// # Errors
-/// Propagates [`Error`] from query parsing, model resolution, and thinking
-/// level validation.
-pub fn select_model_with_level(
+#[cfg(test)]
+pub(in crate::agent) fn select_model_with_level(
     registry: &ModelRegistry,
     config: &lofi_types::Config,
     model_query: Option<&str>,
@@ -251,9 +197,9 @@ pub fn select_model_with_level(
     select_model_impl(registry, config, model_query, Some(level), None)
 }
 
-/// Like [`select_model_with_level`], but a subagent also keeps the session's
-/// non-`auto` service tier when the query carries no `@tier` and the target
-/// model declares it.
+/// Like [`select_model`], with an optional thinking-level override and
+/// inheritance of the session's non-`auto` service tier when the query carries
+/// no `@tier` and the target model declares it.
 /// # Errors
 /// Propagates [`Error`] from query parsing, model resolution, and level
 /// validation.

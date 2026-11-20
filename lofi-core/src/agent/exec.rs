@@ -133,11 +133,6 @@ static EXEC_TOOL_SCHEMA: std::sync::LazyLock<(ToolSchema, usize)> =
         (schema, bytes)
     });
 
-#[must_use]
-pub fn exec_tool_schema() -> ToolSchema {
-    EXEC_TOOL_SCHEMA.0.clone()
-}
-
 pub(crate) fn exec_tool_schema_ref() -> &'static ToolSchema {
     &EXEC_TOOL_SCHEMA.0
 }
@@ -413,13 +408,13 @@ pub fn normalize_exec_input(input: &serde_json::Value) -> serde_json::Value {
 }
 
 #[must_use]
-pub fn exec_label(description: &str) -> Option<String> {
+pub(crate) fn exec_label(description: &str) -> Option<String> {
     let s = description.trim();
     (!s.is_empty()).then(|| s.to_string())
 }
 
 #[must_use]
-pub fn exec_input_code_and_label(input: &serde_json::Value) -> (String, Option<String>) {
+pub(crate) fn exec_input_code_and_label(input: &serde_json::Value) -> (String, Option<String>) {
     let (code, _strings, description) = parse_exec_input(input);
     (code, exec_label(&description))
 }

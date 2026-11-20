@@ -6,41 +6,44 @@ use serde_json::Value;
 
 use crate::ToolEvent;
 use lofi_error::{Error, Result};
+#[cfg(test)]
 use lofi_types::HostFile;
-pub mod bash;
+pub(crate) mod bash;
 mod bash_env;
-pub mod edit;
-pub mod find;
-pub mod grep;
-pub mod ls;
-pub mod patch;
-pub mod read;
+mod edit;
+mod find;
+mod grep;
+mod ls;
+mod patch;
+mod read;
 
 mod bash_util;
 pub(crate) mod fs;
-pub mod jobs;
-pub mod memory;
+mod jobs;
+pub(crate) mod memory;
 pub mod skills;
 mod steer;
-pub mod timers;
-pub mod truncate;
-pub mod write;
+mod timers;
+pub(crate) mod truncate;
+mod write;
 
 pub use bash_env::BashEnv;
-pub use bash_util::{read_capped, wait_for_cancel, PgrpKillGuard};
+pub(crate) use bash_util::wait_for_cancel;
+pub use bash_util::{read_capped, PgrpKillGuard};
+#[cfg(test)]
+use fs::canonicalize_up;
 use fs::{
-    atomic_write, canonicalize_up, create_dir_with_mode, find_walk, grant_candidate,
-    is_outside_error, parse_grep_args, reject_non_regular, reject_symlink_leaf, resolve_for_read,
-    set_file_mode, walk_files_capped, WalkCeilings, WalkLimit, OUTSIDE_ROOT_ERROR,
+    atomic_write, create_dir_with_mode, find_walk, grant_candidate, is_outside_error,
+    parse_grep_args, reject_non_regular, reject_symlink_leaf, resolve_for_read, set_file_mode,
+    walk_files_capped, WalkCeilings, WalkLimit, OUTSIDE_ROOT_ERROR,
 };
 pub use jobs::{
     JobAttributes, JobColor, JobInfo, JobNotice, JobRegistry, JobScreen, JobScreenLine, JobSpan,
     JobStyle,
 };
 pub use timers::{TimerInfo, TimerRegistry};
-pub use truncate::{
-    format_size, truncate_head, truncate_head_with, truncate_tail, truncate_tail_with, Truncated,
-};
+pub(crate) use truncate::{format_size, truncate_head_with};
+pub use truncate::{truncate_tail_with, Truncated};
 
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 
@@ -85,19 +88,13 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct PendingImage {
-    pub file: std::fs::File,
-    pub bytes: usize,
-}
-
 #[derive(Clone)]
-pub struct BuiltinTools {
+pub(crate) struct BuiltinTools {
     session: Arc<crate::ToolSession>,
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
     tool_counter: Arc<AtomicU64>,
     image_counter: Arc<AtomicU64>,
-    pending_images: Arc<Mutex<std::collections::HashMap<u64, PendingImage>>>,
+    pending_images: Arc<Mutex<std::collections::HashMap<u64, crate::ExecImage>>>,
     confirm: Option<crate::ConfirmFn>,
     /// The exec call's stated `description`, carried from the call's
     /// context so the gate judges the call's commands with the call's own
@@ -149,6 +146,7 @@ impl BuiltinTools {
         self
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn with_tool_cb(
         root: PathBuf,
@@ -170,6 +168,7 @@ impl BuiltinTools {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn with_skills_dir(
@@ -217,24 +216,17 @@ impl BuiltinTools {
     /// Shares the owning session's job registry. Without this each exec
     /// would get a fresh registry and `jobStatus` on the next call could
     /// not see a job spawned by the previous one.
+    #[cfg(test)]
     #[must_use]
     pub fn with_jobs(mut self, jobs: JobRegistry) -> Self {
         Arc::make_mut(&mut self.session).jobs = jobs;
         self
     }
 
-    /// Shares the owning session's wake-up timer registry. Without this
-    /// each exec would get a fresh registry and a notice scheduled by one
-    /// call could not fire on the next.
-    #[must_use]
-    pub fn with_timers(mut self, timers: TimerRegistry) -> Self {
-        Arc::make_mut(&mut self.session).timers = timers;
-        self
-    }
-
     /// Tags spawned jobs and timers with the owning subagent run id so a
     /// subagent cancellation kills exactly its own process tree and
     /// `notifyCancel` drops exactly its own timers.
+    #[cfg(test)]
     #[must_use]
     pub fn with_job_owner(mut self, owner: Option<String>) -> Self {
         Arc::make_mut(&mut self.session).job_owner = owner;
@@ -248,6 +240,7 @@ impl BuiltinTools {
     }
 
     /// Shares the session-scoped `/policy` approval override.
+    #[cfg(test)]
     #[must_use]
     pub fn with_policy_override(mut self, policy_override: crate::policy::PolicyOverride) -> Self {
         Arc::make_mut(&mut self.session).policy_override = policy_override;
@@ -264,6 +257,7 @@ impl BuiltinTools {
     /// Attaches granted directories, canonicalized through missing
     /// trailing components so a grant for a not-yet-created path still
     /// matches what a later resolution computes.
+    #[cfg(test)]
     #[must_use]
     pub fn with_grants(mut self, grants: Vec<crate::GrantedDir>) -> Self {
         let session = Arc::make_mut(&mut self.session);
@@ -278,12 +272,14 @@ impl BuiltinTools {
     }
 
     /// Sets the visible-output cap applied to reads and bash output.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_truncate(mut self, truncate: truncate::TruncatedCap) -> Self {
+    pub fn with_truncate(mut self, truncate: lofi_types::TruncateConfig) -> Self {
         Arc::make_mut(&mut self.session).truncate = truncate;
         self
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.session.root
@@ -300,11 +296,11 @@ impl BuiltinTools {
                 "exec exceeded {MAX_PENDING_IMAGES}-image limit"
             )));
         }
-        images.insert(id, PendingImage { file, bytes });
+        images.insert(id, crate::ExecImage { file, bytes });
         Ok(id)
     }
 
-    pub(super) fn take_image(&self, id: u64) -> Option<PendingImage> {
+    pub(crate) fn take_image(&self, id: u64) -> Option<crate::ExecImage> {
         self.pending_images
             .lock()
             .ok()
@@ -314,26 +310,6 @@ impl BuiltinTools {
     #[must_use]
     pub fn tmp_dir(&self) -> &Path {
         &self.session.tmp_dir
-    }
-
-    #[must_use]
-    pub fn bash_env(&self) -> &BashEnv {
-        &self.session.bash_env
-    }
-
-    #[must_use]
-    pub fn shell_policy(&self) -> &crate::policy::ResolvedPolicy {
-        &self.session.shell_policy
-    }
-
-    #[must_use]
-    pub fn confirm(&self) -> Option<&crate::ConfirmFn> {
-        self.confirm.as_ref()
-    }
-
-    #[must_use]
-    pub fn auto_mode(&self) -> Option<&crate::AutoModeFn> {
-        self.session.auto_mode.as_ref()
     }
 
     /// Set how long an auto-mode ask prompt waits before auto mode denies
@@ -351,15 +327,11 @@ impl BuiltinTools {
         self
     }
 
-    #[must_use]
-    pub fn skills_dir(&self) -> Option<&Path> {
-        self.session.skills_dir.as_deref()
-    }
-
     /// Attaches the workspace memory file `lofi.memory` reports. The path
     /// and the modes are host-chosen and never resolved from guest input.
     /// It registers the file as a root the file tools accept for read and
     /// write without a prompt.
+    #[cfg(test)]
     #[must_use]
     pub fn with_memory(mut self, memory: Option<HostFile>) -> Self {
         let session = Arc::make_mut(&mut self.session);
@@ -1181,7 +1153,7 @@ mod tests {
             let (d, t) = tools();
             (
                 d,
-                t.with_truncate(crate::tools::truncate::TruncatedCap {
+                t.with_truncate(lofi_types::TruncateConfig {
                     max_lines: 20,
                     max_bytes: 4096,
                 }),
