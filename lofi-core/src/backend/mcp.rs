@@ -46,14 +46,14 @@ impl Drop for FinishOnDrop {
 
 pub(super) struct Bridge {
     pub config: Value,
-    active: Arc<Mutex<Option<ToolCallContext>>>,
+    active: Arc<Mutex<Option<(ToolExecutor, ToolCallContext)>>>,
     finished: Arc<AtomicBool>,
     done: Arc<Notify>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl Bridge {
-    pub async fn start(executor: ToolExecutor, executable: &std::path::Path) -> Result<Self> {
+    pub async fn start(executable: &std::path::Path) -> Result<Self> {
         ensure_bridge_executable(executable)?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -81,7 +81,7 @@ impl Bridge {
             if hello["method"] != "_lofi/connect" || hello["params"]["token"] != token {
                 return Err(Error::State("exec bridge authentication failed".into()));
             }
-            serve(&mut reader, &mut writer, executor, state).await
+            serve(&mut reader, &mut writer, state).await
         });
         Ok(Self {
             config,
@@ -92,11 +92,11 @@ impl Bridge {
         })
     }
 
-    pub fn activate(&self, context: ToolCallContext) {
+    pub fn activate(&self, executor: ToolExecutor, context: ToolCallContext) {
         *self
             .active
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((executor, context));
     }
 
     pub fn deactivate(&self) {
@@ -175,8 +175,7 @@ impl Drop for Bridge {
 async fn serve(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    executor: ToolExecutor,
-    active: Arc<Mutex<Option<ToolCallContext>>>,
+    active: Arc<Mutex<Option<(ToolExecutor, ToolCallContext)>>>,
 ) -> Result<()> {
     let mut initialized = false;
     let mut ready = false;
@@ -215,11 +214,11 @@ async fn serve(
                     .await?;
                     continue;
                 }
-                let context = active
+                let active_turn = active
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                let Some(context) = context else {
+                let Some((executor, context)) = active_turn else {
                     rpc::write(writer, &rpc::error(id, -32600, "no active Lofi turn")).await?;
                     continue;
                 };
@@ -295,10 +294,7 @@ mod tests {
     async fn start_refuses_a_replaced_executable() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("lofi (deleted)");
-        let executor =
-            crate::agent::ToolExecutor::new(dir.path(), &lofi_types::Config::default(), &[])
-                .unwrap();
-        let error = match Bridge::start(executor, &gone).await {
+        let error = match Bridge::start(&gone).await {
             Ok(_) => panic!("a replaced executable must be refused"),
             Err(error) => error.to_string(),
         };

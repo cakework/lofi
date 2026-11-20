@@ -268,12 +268,7 @@ pub(super) struct ClaudeSession {
 }
 
 impl ClaudeSession {
-    pub async fn open(
-        launch: Launch<'_>,
-        root: &Path,
-        executable: &Path,
-        executor: ToolExecutor,
-    ) -> Result<Self> {
+    pub async fn open(launch: Launch<'_>, root: &Path, executable: &Path) -> Result<Self> {
         let Launch {
             command,
             model,
@@ -305,8 +300,8 @@ impl ClaudeSession {
         .await
         .map_err(|error| Error::State(format!("preparing the exec bridge: {error}")))?;
         let executable = executable?;
-        let activity = executor.activity.clone();
-        let bridge = Bridge::start(executor, &executable).await?;
+        let activity = Arc::new(crate::agent::ActivityWatch::default());
+        let bridge = Bridge::start(&executable).await?;
         let files = private_files(dir, system_prompt, &mcp_config(&bridge)?)?;
         let mut process = Command::new(command);
         process.args(FIXED_ARGS);
@@ -391,12 +386,18 @@ impl ClaudeSession {
         self.stop_reason
     }
 
-    pub async fn prompt(&mut self, frame: Value, mut context: ToolCallContext) -> Result<String> {
+    pub async fn prompt(
+        &mut self,
+        frame: Value,
+        executor: ToolExecutor,
+        mut context: ToolCallContext,
+    ) -> Result<String> {
         if self.poisoned {
             return Err(Error::State(
                 "backend session disconnected; explicit resume required".into(),
             ));
         }
+        self.activity = executor.activity.clone();
         self.prompt_written = false;
         self.reported = false;
         // Usage belongs to the turn that reported it: a turn that ends
@@ -437,7 +438,7 @@ impl ClaudeSession {
         // lives, so the select runs in its own scope and drops it before the
         // failure path touches the session again.
         let (result, lost_child) = {
-            let prompt = self.prompt_inner(frame, &context);
+            let prompt = self.prompt_inner(frame, &executor, &context);
             tokio::pin!(prompt);
             let mut lost_child = false;
             let result = tokio::select! {
@@ -611,12 +612,17 @@ impl ClaudeSession {
         }
     }
 
-    async fn prompt_inner(&mut self, frame: Value, context: &ToolCallContext) -> Result<String> {
+    async fn prompt_inner(
+        &mut self,
+        frame: Value,
+        executor: &ToolExecutor,
+        context: &ToolCallContext,
+    ) -> Result<String> {
         self.round_usage = None;
         self.stop_reason = None;
         self.send_model(context).await?;
         if self.initialized {
-            self.bridge.activate(context.clone());
+            self.bridge.activate(executor.clone(), context.clone());
         }
         // Writing is the other side of the same deadline: a child that stops
         // reading its input wedges a prompt far past any frame gap.
@@ -645,7 +651,7 @@ impl ClaudeSession {
                         .map(str::to_owned);
                     self.report_model(&message["model"], context).await?;
                     self.initialized = true;
-                    self.bridge.activate(context.clone());
+                    self.bridge.activate(executor.clone(), context.clone());
                 }
                 Some("result") => {
                     self.close_thinking(context).await?;

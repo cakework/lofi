@@ -241,18 +241,10 @@ impl ExternalBackend {
         if let Some(tx) = worker.as_ref() {
             return Ok(tx.clone());
         }
-        // The bridge reports lofi.subagent availability from the hook it
-        // carries, so install the run-management hook here where the backend
-        // exists.
-        let executor = self
-            .executor
-            .clone()
-            .with_subagent_hook(self.subagent_hook());
         let tx = spawn_worker(WorkerInit {
             name: self.name.clone(),
             config: self.config.clone(),
             root: self.root.clone(),
-            executor,
             // The child's system prompt comes from the backend, not from the
             // executor: a fork carries the role prompt its subagent was given.
             system_prompt: self.system_prompt.clone(),
@@ -406,11 +398,18 @@ impl Backend for ExternalBackend {
 
     fn open_turn(&self) -> Result<Box<dyn ExchangeDriver>> {
         let worker = self.open_worker()?;
+        // Build the turn executor per turn so updates via with_tool_executor
+        // and with_confirm_tx reach an already-running worker and bridge.
+        let executor = self
+            .executor
+            .clone()
+            .with_subagent_hook(self.subagent_hook());
         Ok(Box::new(ClaudeEngine::open(
             worker,
             &self.name,
             self.model.clone(),
             self.thinking.clone(),
+            executor,
             self.context_window.clone(),
         )))
     }
@@ -438,5 +437,252 @@ impl Backend for ExternalBackend {
             &request,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::agent::{ConfirmRequest, ConfirmResponse, RunControls, TurnInput, TurnRequest};
+
+    fn write_fake_claude_script(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-claude");
+        let exe = std::env::current_exe().unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" > claude-args\nLOFI_CORE_FAKE_CLAUDE=1 exec '{}' --exact backend::session::tests::fake_cli_child --nocapture 3>&1 1>/dev/null\n",
+                exe.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    fn read_json_line(reader: &mut impl BufRead) -> Value {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "unexpected EOF");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn send_json_line(writer: &mut impl Write, value: &Value) {
+        writeln!(writer, "{value}").unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn fake_cli_child() {
+        if std::env::var_os("LOFI_CORE_FAKE_CLAUDE").is_none() {
+            return;
+        }
+        let args = std::fs::read_to_string("claude-args").unwrap();
+        let args: Vec<_> = args.trim_end_matches('\0').split('\0').collect();
+        let flag_val = |flag| args[args.iter().position(|a| *a == flag).unwrap() + 1];
+        let session_arg = args
+            .iter()
+            .find(|a| a.starts_with("--session-id=") || a.starts_with("--resume="))
+            .unwrap();
+        let (_, id) = session_arg.split_once('=').unwrap();
+        std::fs::write("child-pid", std::process::id().to_string()).unwrap();
+
+        let mcp_cfg: Value =
+            serde_json::from_slice(&std::fs::read(flag_val("--mcp-config")).unwrap()).unwrap();
+        let env = &mcp_cfg["mcpServers"]["lofi"]["env"];
+        let addr = env["LOFI_EXEC_ADDRESS"].as_str().unwrap();
+        let token = env["LOFI_EXEC_TOKEN"].as_str().unwrap();
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut bridge_in = stream.try_clone().unwrap();
+        let mut bridge_out = BufReader::new(stream);
+        send_json_line(
+            &mut bridge_in,
+            &json!({"jsonrpc":"2.0","method":"_lofi/connect","params":{"token":token}}),
+        );
+        send_json_line(
+            &mut bridge_in,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        );
+        let _ = read_json_line(&mut bridge_out);
+        send_json_line(
+            &mut bridge_in,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        );
+
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/fd/3")
+            .unwrap();
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let mut next_id = 2u64;
+        let mut initialized = false;
+        loop {
+            let mut line = String::new();
+            if input.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let prompt: Value = serde_json::from_str(&line).unwrap();
+            if !initialized {
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": id,
+                        "tools": ["mcp__lofi__exec"],
+                        "mcp_servers": [{"name": "lofi", "status": "connected"}],
+                        "model": "test-model",
+                    }),
+                );
+                initialized = true;
+            }
+            let text = prompt["message"]["content"].as_str().unwrap_or("");
+            if text == "run bash" {
+                send_json_line(
+                    &mut bridge_in,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": next_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {
+                                "code": r#"return await lofi.bash({cmd:"echo ok",timeoutMs:2000})"#,
+                                "description": "test exec"
+                            }
+                        }
+                    }),
+                );
+                next_id += 1;
+                let resp = read_json_line(&mut bridge_out);
+                assert!(
+                    resp.get("error").is_none(),
+                    "unexpected bridge error: {resp}"
+                );
+            }
+            send_json_line(
+                &mut output,
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "session_id": id,
+                    "result": "done",
+                }),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_confirm_tx_updates_a_live_worker_executor() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let script = write_fake_claude_script(dir.path());
+            let store = crate::session::store::SessionStore::new(dir.path().join("sessions"));
+            let cursor = store
+                .create_cursor(dir.path(), &"claude/test-model".into())
+                .unwrap();
+            let (first_send, mut first_recv) =
+                tokio::sync::mpsc::unbounded_channel::<ConfirmRequest>();
+            let executor = ToolExecutor::in_memory(dir.path()).with_confirm_tx(first_send);
+            let backend: BackendRef = Arc::new(ExternalBackend::configure(
+                "claude".into(),
+                lofi_types::BackendConfig::ClaudeCode {
+                    command: script.display().to_string(),
+                    model: Some("test-model".into()),
+                    models: vec!["test-model".into()],
+                    context_window: Some(200_000),
+                    frame_idle_timeout_ms: Some(10_000),
+                },
+                dir.path().to_path_buf(),
+                executor,
+                Some("test-model".into()),
+                lofi_types::ThinkingLevel::Off,
+                "You are lofi".into(),
+                lofi_types::CompactionConfig::default(),
+            ));
+
+            // Turn 1 starts the live worker and child process.
+            let mut messages = Vec::new();
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+            let drain = tokio::spawn(async move { while ev_rx.recv().await.is_some() {} });
+            backend
+                .run_turn(
+                    &mut messages,
+                    TurnRequest {
+                        input: TurnInput::Prompt {
+                            text: "warmup".into(),
+                            kind: lofi_types::PromptKind::User,
+                            attachments: Vec::new(),
+                        },
+                        notices: Vec::new(),
+                    },
+                    ev_tx,
+                    Some(&cursor),
+                    RunControls::default(),
+                )
+                .await
+                .unwrap();
+            let _ = drain.await;
+            let pid_before = std::fs::read_to_string(dir.path().join("child-pid")).unwrap();
+
+            // Update confirm_tx after the worker is already live.
+            let (second_send, mut second_recv) =
+                tokio::sync::mpsc::unbounded_channel::<ConfirmRequest>();
+            let updated = backend.with_confirm_tx(second_send);
+
+            let saw_on_second = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let saw_flag = saw_on_second.clone();
+            let approver = tokio::spawn(async move {
+                tokio::select! {
+                    Some(req) = second_recv.recv() => {
+                        saw_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = req.respond.send(ConfirmResponse::Allow);
+                    }
+                    Some(req) = first_recv.recv() => {
+                        let _ = req.respond.send(ConfirmResponse::Allow);
+                    }
+                }
+            });
+
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+            let drain = tokio::spawn(async move { while ev_rx.recv().await.is_some() {} });
+            updated
+                .run_turn(
+                    &mut messages,
+                    TurnRequest {
+                        input: TurnInput::Prompt {
+                            text: "run bash".into(),
+                            kind: lofi_types::PromptKind::User,
+                            attachments: Vec::new(),
+                        },
+                        notices: Vec::new(),
+                    },
+                    ev_tx,
+                    Some(&cursor),
+                    RunControls::default(),
+                )
+                .await
+                .unwrap();
+            let _ = drain.await;
+            approver.abort();
+
+            assert!(
+                saw_on_second.load(std::sync::atomic::Ordering::SeqCst),
+                "confirm request went to the stale ToolExecutor instead of the updated one"
+            );
+            let pid_after = std::fs::read_to_string(dir.path().join("child-pid")).unwrap();
+            assert_eq!(pid_before, pid_after, "child should be reused in place");
+        })
+        .await
+        .unwrap();
     }
 }

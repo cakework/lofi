@@ -26,7 +26,6 @@ pub(super) struct WorkerInit {
     pub(super) name: String,
     pub(super) config: lofi_types::BackendConfig,
     pub(super) root: PathBuf,
-    pub(super) executor: ToolExecutor,
     pub(super) system_prompt: String,
     pub(super) live: Arc<Mutex<(Option<String>, ThinkingLevel)>>,
 }
@@ -37,7 +36,6 @@ pub(super) fn spawn_worker(init: WorkerInit) -> Result<mpsc::Sender<Work>> {
         name,
         config,
         root,
-        executor,
         system_prompt,
         live,
     } = init;
@@ -113,7 +111,6 @@ pub(super) fn spawn_worker(init: WorkerInit) -> Result<mpsc::Sender<Work>> {
                         &name,
                         &config,
                         &root,
-                        &executor,
                         &system_prompt,
                         &mut session,
                         &mut owner,
@@ -161,7 +158,6 @@ async fn abandon_exchange(
 async fn open_external(
     config: &lofi_types::BackendConfig,
     root: &Path,
-    executor: ToolExecutor,
     resume: Option<&str>,
     selected_model: Option<&str>,
     effort: ThinkingLevel,
@@ -185,7 +181,6 @@ async fn open_external(
                 },
                 root,
                 &executable,
-                executor,
             )
             .await
         }
@@ -232,6 +227,7 @@ fn child_is_fresh(
 pub(super) struct Work {
     model: Option<String>,
     effort: ThinkingLevel,
+    executor: ToolExecutor,
     /// Whether non-system messages exist before this turn's admission frontier.
     has_prior: bool,
     /// On-demand channel requesting prior history only when a fresh child with
@@ -415,7 +411,6 @@ async fn run_exchange(
     name: &str,
     config: &lofi_types::BackendConfig,
     root: &Path,
-    executor: &ToolExecutor,
     system_prompt: &str,
     session: &mut Option<ClaudeSession>,
     owner: &mut Option<PathBuf>,
@@ -476,7 +471,6 @@ async fn run_exchange(
         let opened = match open_external(
             config,
             root,
-            executor.clone(),
             binding.as_ref().map(|binding| binding.session_id.as_str()),
             work.model.as_deref(),
             work.effort.clone(),
@@ -685,7 +679,7 @@ async fn run_exchange(
     let mut rx = Some(rx);
     let mut context = io.tool_context();
     context.events = Some(EventSink::new(tx, None));
-    let operation = child.prompt(frame, context);
+    let operation = child.prompt(frame, work.executor.clone(), context);
     let consumer = async {
         let mut failure = None;
         while let Some(receiver) = rx.as_mut() {
@@ -768,6 +762,7 @@ pub(super) struct ClaudeEngine {
     worker: mpsc::Sender<Work>,
     selected_model: Option<String>,
     thinking: ThinkingLevel,
+    executor: ToolExecutor,
     context_window: Arc<Mutex<Option<u64>>>,
     /// The fold of this exchange's turn suffix, shared with the tool recorder
     /// so a block the child's tool produced lands in the same order.
@@ -797,6 +792,7 @@ impl ClaudeEngine {
         name: &str,
         selected_model: Option<String>,
         thinking: ThinkingLevel,
+        executor: ToolExecutor,
         context_window: Arc<Mutex<Option<u64>>>,
     ) -> Self {
         let model = run_model_for(name, selected_model.as_deref(), &thinking);
@@ -804,6 +800,7 @@ impl ClaudeEngine {
             worker,
             selected_model,
             thinking,
+            executor,
             context_window,
             fold: Arc::new(Mutex::new(Fold::default())),
             io: Arc::new(Mutex::new(None)),
@@ -841,6 +838,7 @@ impl ExchangeDriver for ClaudeEngine {
         let work = Work {
             model: self.selected_model.clone(),
             effort: self.thinking.clone(),
+            executor: self.executor.clone(),
             has_prior,
             prior_tx: Some(prior_tx),
             base_len: history.len(),
