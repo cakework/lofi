@@ -10,8 +10,8 @@ use lofi_types::{ContentBlock, Message, Role, RunModel, ThinkingLevel};
 use tokio::sync::{mpsc, oneshot};
 
 use super::binding::{
-    block_role, catch_up, drop_checkpoint, read_binding, remove_checkpoint, render_transfer,
-    run_model_for, write_binding, Binding, BoundModel, CONTINUE_PROMPT,
+    block_role, catch_up, drop_checkpoint, ensure_frame_fits, read_binding, remove_checkpoint,
+    render_transfer, run_model_for, write_binding, Binding, BoundModel, CONTINUE_PROMPT,
 };
 use super::claude::ClaudeSession;
 use crate::agent::turn_session::{
@@ -669,6 +669,15 @@ async fn run_exchange(
         );
     }
     let frame = super::claude::content_value(&prompt, &images);
+    if let Err(error) = ensure_frame_fits(&frame) {
+        return reply(
+            Err(ExchangeFailure::stopped(error)),
+            &fold,
+            facts,
+            session,
+            &work.reported,
+        );
+    }
     // The child's events arrive on their own channel so the fold sees them
     // before the UI does: a message must reach the transcript and the screen
     // in the same order.

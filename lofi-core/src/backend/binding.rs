@@ -113,9 +113,60 @@ pub(super) fn write_binding(cursor: &SessionCursor, binding: &Binding) -> Result
 /// same history; a stdio child needs a message to produce output.
 pub(super) const CONTINUE_PROMPT: &str = "Continue the task from where you left off.";
 
+/// Headroom reserved for the JSON-RPC user-frame wrapper around `content`.
+const FRAME_ENVELOPE_HEADROOM: u64 = 4096;
+
+struct ByteCounter(u64);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Reject a frame that would exceed the child write limit before sending it so
+/// the turn loop can recover through hard compaction instead of failing on a
+/// write error.
+pub(super) fn ensure_frame_fits(frame: &serde_json::Value) -> Result<()> {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, frame).map_err(|e| Error::State(e.to_string()))?;
+    let limit = super::rpc::MAX_WRITE_FRAME_BYTES.saturating_sub(FRAME_ENVELOPE_HEADROOM);
+    if counter.0 >= limit {
+        return Err(Error::ContextPressure(format!(
+            "backend prompt frame totals {} bytes",
+            counter.0
+        )));
+    }
+    Ok(())
+}
+
+fn extract_image(
+    bytes: &std::sync::Arc<[u8]>,
+    media_type: &str,
+    budget: &mut u64,
+    images: &mut Vec<ContentBlock>,
+) -> String {
+    let size = bytes.len() as u64 * 4 / 3 + 4;
+    if size <= *budget {
+        *budget -= size;
+        images.push(ContentBlock::Image {
+            bytes: bytes.clone(),
+            media_type: media_type.to_owned(),
+        });
+        format!("[image {}]", images.len())
+    } else {
+        "[image omitted: transfer budget]".into()
+    }
+}
+
 /// Render a history for a continuation frame: each image becomes a pointer,
 /// and its bytes are appended to images in reference order. Base64 never
-/// enters model-visible text.
+/// enters model-visible text, and provider-only replay blobs are omitted.
 pub(super) fn render_transfer(
     history: &[Message],
     images: &mut Vec<ContentBlock>,
@@ -125,30 +176,61 @@ pub(super) fn render_transfer(
     for message in history {
         let mut blocks = Vec::with_capacity(message.blocks.len());
         for block in &message.blocks {
-            if let ContentBlock::Image { bytes, media_type } = block {
-                let size = bytes.len() as u64 * 4 / 3 + 4;
-                if size <= budget {
-                    budget -= size;
-                    images.push(ContentBlock::Image {
-                        bytes: bytes.clone(),
-                        media_type: media_type.clone(),
-                    });
+            match block {
+                ContentBlock::Image { bytes, media_type } => {
                     blocks.push(ContentBlock::Text {
-                        text: format!("[image {}]", images.len()),
-                    });
-                } else {
-                    blocks.push(ContentBlock::Text {
-                        text: "[image omitted: transfer budget]".into(),
+                        text: extract_image(bytes, media_type, &mut budget, images),
                     });
                 }
-            } else {
-                blocks.push(block.clone());
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    images: tool_images,
+                } => {
+                    if tool_images.is_empty() {
+                        blocks.push(block.clone());
+                    } else {
+                        let mut text = content.clone();
+                        for image in tool_images {
+                            let pointer =
+                                extract_image(&image.bytes, &image.media_type, &mut budget, images);
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&pointer);
+                        }
+                        blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: text,
+                            is_error: *is_error,
+                            images: Vec::new(),
+                        });
+                    }
+                }
+                ContentBlock::PartSignature { .. } => {}
+                ContentBlock::Thinking { text, redacted, .. } => {
+                    if !*redacted && !text.is_empty() {
+                        blocks.push(ContentBlock::Thinking {
+                            text: text.clone(),
+                            signature: None,
+                            redacted: false,
+                        });
+                    }
+                }
+                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => {
+                    blocks.push(block.clone());
+                }
             }
         }
-        rendered.push(Message {
-            blocks,
-            ..message.clone()
-        });
+        if !blocks.is_empty() {
+            rendered.push(Message {
+                origin: None,
+                blocks,
+                role: message.role,
+                kind: message.kind,
+            });
+        }
     }
     serde_json::to_string(&rendered).map_err(|e| Error::State(e.to_string()))
 }
@@ -176,5 +258,125 @@ pub(super) fn block_role(block: &ContentBlock) -> Role {
         Role::Assistant
     } else {
         Role::Tool
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use lofi_types::{PartSignatureFormat, PromptKind, ToolResultImage};
+
+    #[test]
+    fn render_transfer_extracts_tool_result_images_without_base64_in_text() {
+        let history = vec![Message {
+            role: Role::Tool,
+            kind: PromptKind::User,
+            origin: None,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "read image".into(),
+                is_error: false,
+                images: vec![ToolResultImage {
+                    bytes: vec![1, 2, 3, 4, 5, 6].into(),
+                    media_type: "image/png".into(),
+                }],
+            }],
+        }];
+        let mut images = Vec::new();
+        let json = render_transfer(&history, &mut images).unwrap();
+        assert_eq!(images.len(), 1);
+        assert!(matches!(
+            &images[0],
+            ContentBlock::Image { bytes, media_type }
+                if bytes.as_ref() == [1, 2, 3, 4, 5, 6] && media_type == "image/png"
+        ));
+        // Base64 of [1, 2, 3, 4, 5, 6] is "AQIDBAUG"
+        assert!(!json.contains("AQIDBAUG"), "raw base64 leaked: {json}");
+        assert!(json.contains("[image 1]"), "missing image pointer: {json}");
+    }
+
+    #[test]
+    fn render_transfer_strips_provider_replay_metadata() {
+        let history = vec![Message {
+            role: Role::Assistant,
+            kind: PromptKind::User,
+            origin: Some(lofi_types::ModelOrigin {
+                provider: "google".into(),
+                api: lofi_types::Api::GoogleGenerativeAi,
+                model: "gemini-3".into(),
+            }),
+            blocks: vec![
+                ContentBlock::Thinking {
+                    text: "plan".into(),
+                    signature: Some("opaque-thinking-sig".into()),
+                    redacted: false,
+                },
+                ContentBlock::Thinking {
+                    text: "redacted".into(),
+                    signature: Some("opaque-redacted-blob".into()),
+                    redacted: true,
+                },
+                ContentBlock::PartSignature {
+                    provider: "google".into(),
+                    model: "gemini-3".into(),
+                    format: PartSignatureFormat::Google,
+                    signature: "opaque-part-sig".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+        }];
+        let mut images = Vec::new();
+        let json = render_transfer(&history, &mut images).unwrap();
+        assert!(json.contains("plan"), "kept thinking text: {json}");
+        assert!(json.contains("answer"), "kept answer text: {json}");
+        assert!(!json.contains("opaque-thinking-sig"), "sig leaked: {json}");
+        assert!(
+            !json.contains("opaque-redacted-blob"),
+            "redacted leaked: {json}"
+        );
+        assert!(!json.contains("opaque-part-sig"), "part sig leaked: {json}");
+        assert!(
+            !json.contains("part_signature"),
+            "part_signature kept: {json}"
+        );
+        assert!(!json.contains("\"origin\""), "origin leaked: {json}");
+    }
+
+    #[test]
+    fn render_transfer_omits_tool_result_images_beyond_budget() {
+        let oversized = vec![0u8; (crate::agent::MAX_REQUEST_IMAGE_BYTES as usize) + 16];
+        let history = vec![Message {
+            role: Role::Tool,
+            kind: PromptKind::User,
+            origin: None,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "read image".into(),
+                is_error: false,
+                images: vec![ToolResultImage {
+                    bytes: oversized.into(),
+                    media_type: "image/png".into(),
+                }],
+            }],
+        }];
+        let mut images = Vec::new();
+        let json = render_transfer(&history, &mut images).unwrap();
+        assert!(images.is_empty());
+        assert!(json.contains("[image omitted: transfer budget]"), "{json}");
+    }
+
+    #[test]
+    fn ensure_frame_fits_reports_context_pressure_over_limit() {
+        let small = serde_json::Value::String("ok".into());
+        assert!(ensure_frame_fits(&small).is_ok());
+
+        let huge = serde_json::Value::String(
+            "x".repeat(super::super::rpc::MAX_WRITE_FRAME_BYTES as usize),
+        );
+        let err = ensure_frame_fits(&huge).unwrap_err();
+        assert!(matches!(err, Error::ContextPressure(_)), "{err:?}");
     }
 }
