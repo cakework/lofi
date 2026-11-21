@@ -13,7 +13,7 @@ use super::binding::{
     block_role, catch_up, drop_checkpoint, ensure_frame_fits, read_binding, remove_checkpoint,
     render_transfer, run_model_for, write_binding, Binding, BoundModel, CONTINUE_PROMPT,
 };
-use super::claude::ClaudeSession;
+use super::claude::{ClaudeSession, MidTurnStop, PromptControls, PromptOutcome};
 use crate::agent::turn_session::{
     EventSink, Exchange, ExchangeDriver, ExchangeFailure, Rollback, Settlement, ToolRecorder,
     TurnIo,
@@ -349,6 +349,13 @@ impl Fold {
                 blocks: vec![block],
             },
         );
+        // Observe completed `(Assistant, Tool)` pairs incrementally so a
+        // multi-round CLI turn triggers loop detection before the next round.
+        if role == Role::Tool && self.turn_messages.len() >= 2 {
+            let last = self.turn_messages.len() - 1;
+            io.events()
+                .observe_tool_round_live(&self.turn_messages[last - 1], &self.turn_messages[last]);
+        }
     }
 
     fn event(&mut self, io: &TurnIo, event: &AgentEvent) {
@@ -677,11 +684,17 @@ async fn run_exchange(
     // in the same order.
     let (tx, rx) = mpsc::channel(64);
     let mut rx = Some(rx);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
     let mut context = io.tool_context();
     context.events = Some(EventSink::new(tx, None));
-    let operation = child.prompt(frame, work.executor.clone(), context);
+    let controls = PromptControls {
+        hard_cap: io.hard_cap(),
+        stop_rx: Some(stop_rx),
+    };
+    let operation = child.prompt(frame, work.executor.clone(), context, controls);
     let consumer = async {
         let mut failure = None;
+        let mut stopping = false;
         while let Some(receiver) = rx.as_mut() {
             let event = tokio::select! {
                 biased;
@@ -709,8 +722,22 @@ async fn run_exchange(
                     });
                 }
             }
-            if !io.events().emit(event).await {
-                break;
+            let is_tool_end = matches!(&event, AgentEvent::ToolEnd { .. });
+            let keep_going = io.events().emit(event).await;
+            if !stopping {
+                if !keep_going {
+                    if io.events().is_loop_stopped() {
+                        // Signal the child to stop while keeping `rx` open so
+                        // `report_partial` still delivers usage and context.
+                        let _ = stop_tx.send(Some(MidTurnStop::LoopDetected));
+                        stopping = true;
+                    } else {
+                        break;
+                    }
+                } else if is_tool_end && io.is_preempted() {
+                    let _ = stop_tx.send(Some(MidTurnStop::Preempt));
+                    stopping = true;
+                }
             }
         }
         // The child watches its own sink to stop a turn nobody listens to. A
@@ -726,17 +753,34 @@ async fn run_exchange(
     facts.initialized = session.as_ref().is_some_and(ClaudeSession::is_initialized);
     facts.child_holds_turn = session.as_ref().is_some_and(ClaudeSession::prompt_written);
     let stopped = session.as_ref().and_then(ClaudeSession::stop_reason);
+    let mid_turn_stopped =
+        matches!(&result, Ok(PromptOutcome::Stopped)) || stop_tx.borrow().is_some();
+    if mid_turn_stopped {
+        // The child was stopped mid-turn before its `result` frame, so a saved
+        // binding could name a truncated CLI session; drop the checkpoint now
+        // so any recovery or follow-up exchange transfers Lofi's exact history.
+        if let Some(cursor) = &work.cursor {
+            remove_checkpoint(cursor);
+        }
+    }
     // A cancelled error is a cancel whatever the flag says; a reply the child
     // finished is only a cancel when the caller cancelled.
     let cancelled = io.cancel().is_cancelled()
-        || matches!(&result, Ok(reason) if reason == "cancelled")
+        || matches!(&result, Ok(PromptOutcome::Completed(reason)) if reason == "cancelled")
         || matches!(&result, Err(Error::Cancelled));
     let exchange = match (result, failure) {
-        (Ok(_), None) => {
+        (Ok(PromptOutcome::Completed(_)), None) => {
             if cancelled {
                 Err(ExchangeFailure::stopped(Error::Cancelled))
             } else {
                 Ok(Exchange::done(stopped))
+            }
+        }
+        (Ok(PromptOutcome::Stopped), None) => {
+            if cancelled {
+                Err(ExchangeFailure::stopped(Error::Cancelled))
+            } else {
+                Ok(Exchange::continued(stopped))
             }
         }
         (Err(_), None) if cancelled => Err(ExchangeFailure::stopped(Error::Cancelled)),
@@ -746,14 +790,15 @@ async fn run_exchange(
             rollback: Rollback::Stop,
         }),
     };
-    // A failed exchange reached a child whose own rounds are not in the
-    // transcript; the settle step must drop the checkpoint rather than name a
-    // leaf the child is ahead of. A cancel is not that: the turn records the
-    // cancellation and the child reopens on the next turn.
-    facts.failed = match &exchange {
-        Err(failure) => !matches!(failure.error, Error::Cancelled),
-        Ok(_) => false,
-    };
+    // A failed or mid-turn-stopped exchange left a child whose state may differ
+    // from the transcript; the settle step must drop the checkpoint rather than
+    // name a leaf the child is ahead of. A cancel is not that: the turn records
+    // the cancellation and the child reopens on the next turn.
+    facts.failed = mid_turn_stopped
+        || match &exchange {
+            Err(failure) => !matches!(failure.error, Error::Cancelled),
+            Ok(_) => false,
+        };
     reply(exchange, &fold, facts, session, &work.reported)
 }
 
@@ -831,7 +876,12 @@ impl ExchangeDriver for ClaudeEngine {
         self.cursor = io.cursor().cloned();
         let reported = Arc::new(Mutex::new(None));
         let (done, mut reply) = oneshot::channel();
-        let has_prior = history[..upto]
+        let prior_end = if self.first {
+            upto
+        } else {
+            history.len().saturating_sub(1)
+        };
+        let has_prior = history[..prior_end]
             .iter()
             .any(|message| message.role != Role::System);
         let (prior_tx, mut prior_rx) = oneshot::channel();
@@ -860,7 +910,7 @@ impl ExchangeDriver for ClaudeEngine {
             }
             req = &mut prior_rx => {
                 if let Ok(respond) = req {
-                    let prior = history[..upto]
+                    let prior = history[..prior_end]
                         .iter()
                         .filter(|message| message.role != Role::System)
                         .cloned()

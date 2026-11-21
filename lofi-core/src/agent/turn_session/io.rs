@@ -43,6 +43,7 @@ pub struct EventSink {
 struct LoopState {
     guard: LoopGuard,
     stop: Option<LoopStop>,
+    observed_live_tool_rounds: bool,
 }
 
 /// What stopped a round.
@@ -98,11 +99,43 @@ impl EventSink {
         let mut loops = self.loops();
         loops.guard.start_round();
         loops.stop = None;
+        loops.observed_live_tool_rounds = false;
     }
 
     /// The pattern that stopped a round, once the turn repairs it.
     pub(crate) fn take_loop_stop(&self) -> Option<LoopStop> {
         self.loops().stop.take()
+    }
+
+    /// Whether loop detection has stopped the current round.
+    pub(crate) fn is_loop_stopped(&self) -> bool {
+        self.loops().stop.is_some()
+    }
+
+    /// Whether a transport already fed completed tool rounds into the loop
+    /// guard incrementally during this exchange.
+    pub(crate) fn observed_tool_rounds_live(&self) -> bool {
+        self.loops().observed_live_tool_rounds
+    }
+
+    /// Observe one completed `(assistant, tool)` round as soon as its tool
+    /// result lands, so a multi-round CLI turn can stop mid-turn on a loop.
+    pub(crate) fn observe_tool_round_live(&self, assistant: &Message, result: &Message) {
+        if assistant.role != lofi_types::Role::Assistant || result.role != lofi_types::Role::Tool {
+            return;
+        }
+        let fingerprint = tool_round_fingerprint(assistant, result);
+        let mut loops = self.loops();
+        loops.observed_live_tool_rounds = true;
+        if loops.stop.is_none() {
+            loops.stop = loops
+                .guard
+                .add_tool_round(fingerprint)
+                .map(|detail| LoopStop {
+                    detail,
+                    in_message: false,
+                });
+        }
     }
 
     /// Whether a tool cycle repeated across the round's own messages.
@@ -565,6 +598,8 @@ pub struct TurnIoInner {
     input: Mutex<ExchangeInput>,
     context: ToolCallContext,
     cancel: CancelToken,
+    preempt: Option<Arc<AtomicBool>>,
+    hard_cap: Option<u64>,
     turn_start: Instant,
     /// The session this turn writes to, when it has one. The transport needs
     /// it for its own resume bookkeeping.
@@ -578,6 +613,7 @@ pub struct TurnIo {
 }
 
 impl TurnIo {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         sink: EventSink,
         recorder: Option<SessionRecorder>,
@@ -585,6 +621,8 @@ impl TurnIo {
         input: ExchangeInput,
         context: ToolCallContext,
         cancel: CancelToken,
+        preempt: Option<Arc<AtomicBool>>,
+        hard_cap: Option<u64>,
         cursor: Option<SessionCursor>,
     ) -> Self {
         let alive = Arc::new(AtomicBool::new(true));
@@ -604,10 +642,25 @@ impl TurnIo {
                 input: Mutex::new(input),
                 context,
                 cancel,
+                preempt,
+                hard_cap,
                 turn_start: Instant::now(),
                 cursor,
             }),
         }
+    }
+
+    /// The hard context fill ceiling for this turn, when configured.
+    pub(crate) fn hard_cap(&self) -> Option<u64> {
+        self.inner.hard_cap
+    }
+
+    /// Whether the caller asked this turn to finish after the current tool round.
+    pub(crate) fn is_preempted(&self) -> bool {
+        self.inner
+            .preempt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// The guard that ends this turn's ability to record. The turn owns it and

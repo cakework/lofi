@@ -163,6 +163,8 @@ impl Agent {
             super::ToolCallContext::default(),
             super::turn_session::CancelToken::default(),
             None,
+            None,
+            None,
         );
         let mut state = NativeTurnState::default();
         let result = self.run_exchange(&io, messages, &mut state).await;

@@ -258,6 +258,7 @@ async fn session_prompt_surfaces_child_stderr_on_early_exit() {
             Value::String("hi".into()),
             executor,
             ToolCallContext::default(),
+            PromptControls::default(),
         )
         .await
         .unwrap_err()

@@ -259,6 +259,34 @@ pub(super) struct Launch<'a> {
     pub frame_idle: Option<Duration>,
 }
 
+/// Why a multi-round CLI turn was stopped cleanly by the engine consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MidTurnStop {
+    Preempt,
+    LoopDetected,
+}
+
+/// How one CLI prompt exchange ended.
+#[derive(Debug)]
+pub(super) enum PromptOutcome {
+    Completed(String),
+    /// Stopped cleanly at a round boundary (hard context cap or preemption).
+    Stopped,
+}
+
+/// Mid-turn controls passed into one CLI prompt exchange.
+#[derive(Default)]
+pub(super) struct PromptControls {
+    pub hard_cap: Option<u64>,
+    pub stop_rx: Option<tokio::sync::watch::Receiver<Option<MidTurnStop>>>,
+}
+
+enum InterruptReason {
+    Cancelled,
+    MidTurn(MidTurnStop),
+    BridgeStopped,
+}
+
 #[allow(clippy::struct_excessive_bools)] // transport state flags
 pub(super) struct ClaudeSession {
     child: Child,
@@ -403,12 +431,14 @@ impl ClaudeSession {
         self.stop_reason
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn prompt(
         &mut self,
         frame: Value,
         executor: ToolExecutor,
         mut context: ToolCallContext,
-    ) -> Result<String> {
+        controls: PromptControls,
+    ) -> Result<PromptOutcome> {
         if self.poisoned {
             return Err(Error::State(
                 "backend session disconnected; explicit resume required".into(),
@@ -430,6 +460,8 @@ impl ClaudeSession {
         context.cancel = Some(tool_cancel.clone());
         let events = context.events.clone();
         let bridge = self.bridge.watcher();
+        let hard_cap = controls.hard_cap;
+        let mut stop_rx = controls.stop_rx;
         // The watcher reports why it fired. A set flag or a closed consumer is
         // a cancellation; a dead bridge is a transport failure. Reporting both
         // as `Cancelled` settled the turn as a detach and answered the prompt
@@ -441,35 +473,51 @@ impl ClaudeSession {
                     None => std::future::pending().await,
                 }
             };
+            let mid_turn_stop = async {
+                let Some(rx) = stop_rx.as_mut() else {
+                    return std::future::pending::<MidTurnStop>().await;
+                };
+                loop {
+                    if let Some(stop) = *rx.borrow_and_update() {
+                        return stop;
+                    }
+                    if rx.changed().await.is_err() {
+                        return std::future::pending::<MidTurnStop>().await;
+                    }
+                }
+            };
             tokio::select! {
                 biased;
                 () = crate::agent::turn_session::wait_cancel_flag(
                     &cancel,
                     cancel_notify.as_ref(),
-                ) => Error::Cancelled,
-                () = events_closed => Error::Cancelled,
-                () = bridge.wait() => Error::State("Claude Code tool bridge stopped".into()),
+                ) => InterruptReason::Cancelled,
+                () = events_closed => InterruptReason::Cancelled,
+                stop = mid_turn_stop => InterruptReason::MidTurn(stop),
+                () = bridge.wait() => InterruptReason::BridgeStopped,
             }
         };
         // The prompt future holds the mutable borrow of self for as long as it
         // lives, so the select runs in its own scope and drops it before the
         // failure path touches the session again.
         let (result, lost_child) = {
-            let prompt = self.prompt_inner(frame, &executor, &context);
+            let prompt = self.prompt_inner(frame, &executor, &context, hard_cap);
             tokio::pin!(prompt);
             let mut lost_child = false;
             let result = tokio::select! {
                 biased;
                 reason = interrupted => match reason {
                     // A set flag is the user's: nothing may wait after it.
-                    Error::Cancelled => Err(Error::Cancelled),
+                    InterruptReason::Cancelled
+                    | InterruptReason::MidTurn(MidTurnStop::LoopDetected) => Err(Error::Cancelled),
+                    InterruptReason::MidTurn(MidTurnStop::Preempt) => Ok(PromptOutcome::Stopped),
                     // A child that writes its result frame and exits leaves a
                     // dead bridge and a finished answer in the same poll
                     // window, and a biased select reads the death first. The
                     // exchange gets a short grace to deliver the answer it
                     // already has, so a completed turn is not reported as a
                     // transport failure.
-                    error => match tokio::time::timeout(BRIDGE_GRACE, &mut prompt).await {
+                    InterruptReason::BridgeStopped => match tokio::time::timeout(BRIDGE_GRACE, &mut prompt).await {
                         Ok(answer) => {
                             lost_child = true;
                             // The grace is the only window where the
@@ -485,7 +533,7 @@ impl ClaudeSession {
                                 answer
                             }
                         }
-                        Err(_) => Err(error),
+                        Err(_) => Err(Error::State("Claude Code tool bridge stopped".into())),
                     },
                 },
                 result = &mut prompt => result,
@@ -496,6 +544,13 @@ impl ClaudeSession {
         // A finished turn serves no tool call: the context holds a clone of the
         // turn's event sender, and a live one would keep the sink open.
         self.bridge.deactivate();
+        if matches!(result, Ok(PromptOutcome::Stopped)) {
+            // Report partial usage while the internal consumer channel is still
+            // open, then close the killed child so the next turn starts fresh.
+            self.report_partial(&context).await;
+            let _ = self.close().await;
+            return result;
+        }
         if lost_child {
             // The answer is the turn's, but the session that wrote it lost its
             // bridge: it can serve no tool call and its child is gone. Giving
@@ -636,9 +691,11 @@ impl ClaudeSession {
         frame: Value,
         executor: &ToolExecutor,
         context: &ToolCallContext,
-    ) -> Result<String> {
+        hard_cap: Option<u64>,
+    ) -> Result<PromptOutcome> {
         self.round_usage = None;
         self.stop_reason = None;
+        let mut cap_crossed = false;
         self.send_model(context).await?;
         if self.initialized {
             self.bridge.activate(executor.clone(), context.clone());
@@ -683,10 +740,20 @@ impl ClaudeSession {
                             "Claude Code returned a result before initialization".into(),
                         ));
                     }
-                    return Ok("end_turn".into());
+                    return Ok(PromptOutcome::Completed("end_turn".into()));
                 }
                 Some("stream_event") if self.initialized => {
-                    self.handle_stream_event(&message["event"], context).await?;
+                    let event = &message["event"];
+                    if cap_crossed && event["type"] == "message_start" {
+                        return Ok(PromptOutcome::Stopped);
+                    }
+                    self.handle_stream_event(event, context).await?;
+                    if hard_cap.is_some_and(|cap| {
+                        self.round_usage
+                            .is_some_and(|usage| usage.context_tokens() > cap)
+                    }) {
+                        cap_crossed = true;
+                    }
                 }
                 Some("assistant")
                     if self.initialized && message["parent_tool_use_id"].is_null() =>
@@ -699,6 +766,17 @@ impl ClaudeSession {
                     }
                     if let Some(reason) = message["message"]["stop_reason"].as_str() {
                         self.stop_reason = Some(stop_reason(reason));
+                    }
+                    if hard_cap.is_some_and(|cap| {
+                        self.round_usage
+                            .is_some_and(|usage| usage.context_tokens() > cap)
+                    }) {
+                        cap_crossed = true;
+                        if self.stop_reason == Some(lofi_types::StopReason::ToolUse)
+                            || has_tool_use(&message["message"]["content"])
+                        {
+                            return Ok(PromptOutcome::Stopped);
+                        }
                     }
                 }
                 // Complete assistant messages repeat the partial stream. Tool
@@ -901,6 +979,12 @@ impl ClaudeSession {
         self.child.wait().await?;
         Ok(())
     }
+}
+
+fn has_tool_use(content: &Value) -> bool {
+    content
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
 }
 
 fn stop_reason(reason: &str) -> lofi_types::StopReason {

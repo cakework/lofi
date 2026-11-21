@@ -196,6 +196,8 @@ pub async fn run(
         exchange_input,
         context,
         cancel,
+        preempt.clone(),
+        policy.hard_cap,
         session.cloned(),
     );
     // The turn's own lifetime reaches the transports: a driver may keep a
@@ -271,8 +273,11 @@ pub async fn run(
         io.set_model(driver.run_model());
         if result.is_ok() {
             // A tool cycle repeats across the messages the exchange appended,
-            // whatever transport appended them.
-            io.events().observe_tool_rounds(&messages[round_start..]);
+            // whatever transport appended them. Skip when the transport already
+            // fed rounds incrementally so a clean round is not double-counted.
+            if !io.events().observed_tool_rounds_live() {
+                io.events().observe_tool_rounds(&messages[round_start..]);
+            }
             if let Some(attempt) = retry.reset_after_progress() {
                 let _ = io
                     .events()
@@ -417,15 +422,21 @@ pub async fn run(
                 // The transport abandoned the round because the turn stopped
                 // it: a pattern the turn judges is not the user's interrupt.
                 if let Some(stop) = &loop_stop {
-                    let removed = messages.len() - round_start;
-                    if removed > 0 {
-                        let discarded = discard_round(&io, messages, removed, &stop.detail).await;
-                        if let Err(discard_error) = discarded {
-                            keep_partial(messages, round_start);
-                            let _ = io.commit_durable(messages).await;
-                            break 'turn Err(discard_error);
+                    if stop.in_message {
+                        let removed = messages.len() - round_start;
+                        if removed > 0 {
+                            let discarded =
+                                discard_round(&io, messages, removed, &stop.detail).await;
+                            if let Err(discard_error) = discarded {
+                                keep_partial(messages, round_start);
+                                let _ = io.commit_durable(messages).await;
+                                break 'turn Err(discard_error);
+                            }
+                            messages.truncate(round_start);
                         }
-                        messages.truncate(round_start);
+                    } else {
+                        keep_partial(messages, round_start);
+                        io.commit(messages).await;
                     }
                     if let Some(plan) =
                         handle_loop_detection(Some(&stop.detail), None, &mut loop_recovered)

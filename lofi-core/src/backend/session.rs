@@ -480,6 +480,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fake_cli_child() {
         if std::env::var_os("LOFI_CORE_FAKE_CLAUDE").is_none() {
             return;
@@ -568,6 +569,175 @@ mod tests {
                     resp.get("error").is_none(),
                     "unexpected bridge error: {resp}"
                 );
+            } else if text == "hard cap multi-tool" {
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "assistant",
+                        "session_id": id,
+                        "parent_tool_use_id": null,
+                        "message": {
+                            "model": "test-model",
+                            "stop_reason": "tool_use",
+                            "usage": {"input_tokens": 50, "output_tokens": 5},
+                            "content": [{"type": "tool_use", "id": "tu_1", "name": "mcp__lofi__exec", "input": {}}]
+                        }
+                    }),
+                );
+                let mut counts = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("tool-count")
+                    .unwrap();
+                writeln!(counts, "1").unwrap();
+                drop(counts);
+                send_json_line(
+                    &mut bridge_in,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": next_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {
+                                "code": r#"return "round-1""#,
+                                "description": "round 1"
+                            }
+                        }
+                    }),
+                );
+                next_id += 1;
+                let _ = read_json_line(&mut bridge_out);
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "assistant",
+                        "session_id": id,
+                        "parent_tool_use_id": null,
+                        "message": {
+                            "model": "test-model",
+                            "stop_reason": "tool_use",
+                            "usage": {"input_tokens": 95, "output_tokens": 5},
+                            "content": [{"type": "tool_use", "id": "tu_2", "name": "mcp__lofi__exec", "input": {}}]
+                        }
+                    }),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let mut counts = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("tool-count")
+                    .unwrap();
+                writeln!(counts, "2").unwrap();
+                drop(counts);
+                send_json_line(
+                    &mut bridge_in,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": next_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {
+                                "code": r#"return "round-2""#,
+                                "description": "round 2"
+                            }
+                        }
+                    }),
+                );
+                next_id += 1;
+                let _ = read_json_line(&mut bridge_out);
+            } else if text == "preempt multi-tool" {
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "assistant",
+                        "session_id": id,
+                        "parent_tool_use_id": null,
+                        "message": {
+                            "model": "test-model",
+                            "stop_reason": "tool_use",
+                            "usage": {"input_tokens": 20, "output_tokens": 5},
+                            "content": [{"type": "tool_use", "id": "tu_1", "name": "mcp__lofi__exec", "input": {}}]
+                        }
+                    }),
+                );
+                send_json_line(
+                    &mut bridge_in,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": next_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {
+                                "code": r#"return "preempt-round-1""#,
+                                "description": "round 1"
+                            }
+                        }
+                    }),
+                );
+                next_id += 1;
+                let _ = read_json_line(&mut bridge_out);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::fs::write("tool-2-ran", "yes").unwrap();
+                send_json_line(
+                    &mut bridge_in,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": next_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {
+                                "code": r#"return "preempt-round-2""#,
+                                "description": "round 2"
+                            }
+                        }
+                    }),
+                );
+                next_id += 1;
+                let _ = read_json_line(&mut bridge_out);
+            } else if text == "loop multi-tool" {
+                for step in 1..=10u32 {
+                    let mut log = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("loop-calls")
+                        .unwrap();
+                    writeln!(log, "{step}").unwrap();
+                    drop(log);
+                    send_json_line(
+                        &mut bridge_in,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": next_id,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "exec",
+                                "arguments": {
+                                    "code": r#"return "stuck""#,
+                                    "description": "repeat"
+                                }
+                            }
+                        }),
+                    );
+                    next_id += 1;
+                    let _ = read_json_line(&mut bridge_out);
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            } else if text.contains("A potential loop was detected") {
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "stream_event",
+                        "session_id": id,
+                        "event": {
+                            "type": "content_block_delta",
+                            "delta": {"type": "text_delta", "text": "recovered cleanly"}
+                        }
+                    }),
+                );
             }
             send_json_line(
                 &mut output,
@@ -583,7 +753,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn with_confirm_tx_updates_a_live_worker_executor() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let dir = tempfile::tempdir().unwrap();
             let script = write_fake_claude_script(dir.path());
@@ -688,8 +860,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn external_backend_complete_forces_thinking_off() {
         use std::os::unix::fs::PermissionsExt;
+
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake-eval");
@@ -735,5 +910,200 @@ mod tests {
             !args.contains("--effort="),
             "one-shot evaluator must not inherit session thinking effort: {args}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_hard_cap_stops_mid_turn_before_next_tool_round() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let script = write_fake_claude_script(dir.path());
+            let backend: BackendRef = Arc::new(ExternalBackend::configure(
+                "claude".into(),
+                lofi_types::BackendConfig::ClaudeCode {
+                    command: script.display().to_string(),
+                    model: Some("test-model".into()),
+                    models: vec!["test-model".into()],
+                    context_window: Some(100),
+                    frame_idle_timeout_ms: Some(10_000),
+                },
+                dir.path().to_path_buf(),
+                ToolExecutor::in_memory(dir.path()),
+                Some("test-model".into()),
+                lofi_types::ThinkingLevel::Off,
+                "You are lofi".into(),
+                lofi_types::CompactionConfig {
+                    reserved_context_tokens: 20,
+                    ..lofi_types::CompactionConfig::default()
+                },
+            ));
+
+            let mut messages = Vec::new();
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+            let drain = tokio::spawn(async move { while ev_rx.recv().await.is_some() {} });
+            let outcome = backend
+                .run_turn(
+                    &mut messages,
+                    TurnRequest::prompt("hard cap multi-tool".into(), lofi_types::PromptKind::User),
+                    ev_tx,
+                    None,
+                    RunControls::default(),
+                )
+                .await
+                .unwrap();
+            let _ = drain.await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    crate::session::recorder::TurnOutcome::ContextPressure { resume: true }
+                ),
+                "unexpected outcome: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("tool-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "round 2 tool must not run once context exceeds hard_cap"
+            );
+            assert!(
+                messages.iter().any(|m| m.role == lofi_types::Role::Tool),
+                "round 1 tool result must be preserved in messages"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_preempt_stops_mid_turn_after_completed_tool_round() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let script = write_fake_claude_script(dir.path());
+            let backend: BackendRef = Arc::new(ExternalBackend::configure(
+                "claude".into(),
+                lofi_types::BackendConfig::ClaudeCode {
+                    command: script.display().to_string(),
+                    model: Some("test-model".into()),
+                    models: vec!["test-model".into()],
+                    context_window: Some(200_000),
+                    frame_idle_timeout_ms: Some(10_000),
+                },
+                dir.path().to_path_buf(),
+                ToolExecutor::in_memory(dir.path()),
+                Some("test-model".into()),
+                lofi_types::ThinkingLevel::Off,
+                "You are lofi".into(),
+                lofi_types::CompactionConfig::default(),
+            ));
+
+            let preempt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let preempt_watch = preempt.clone();
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+            let drain = tokio::spawn(async move {
+                while let Some(ev) = ev_rx.recv().await {
+                    if matches!(ev, crate::agent::AgentEvent::ToolStart { .. }) {
+                        preempt_watch.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+            let mut messages = Vec::new();
+            let outcome = backend
+                .run_turn(
+                    &mut messages,
+                    TurnRequest::prompt("preempt multi-tool".into(), lofi_types::PromptKind::User),
+                    ev_tx,
+                    None,
+                    RunControls {
+                        cancel: None,
+                        preempt: Some(preempt),
+                    },
+                )
+                .await
+                .unwrap();
+            let _ = drain.await;
+
+            assert!(
+                matches!(outcome, crate::session::recorder::TurnOutcome::Finished),
+                "unexpected outcome: {outcome:?}"
+            );
+            assert!(
+                !dir.path().join("tool-2-ran").exists(),
+                "round 2 tool must not run after preempt"
+            );
+            assert!(
+                messages.iter().any(|m| m.role == lofi_types::Role::Tool),
+                "completed round 1 tool result must be preserved"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_tool_loop_interrupts_mid_turn_and_recovers() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let script = write_fake_claude_script(dir.path());
+            let backend: BackendRef = Arc::new(ExternalBackend::configure(
+                "claude".into(),
+                lofi_types::BackendConfig::ClaudeCode {
+                    command: script.display().to_string(),
+                    model: Some("test-model".into()),
+                    models: vec!["test-model".into()],
+                    context_window: Some(200_000),
+                    frame_idle_timeout_ms: Some(10_000),
+                },
+                dir.path().to_path_buf(),
+                ToolExecutor::in_memory(dir.path()),
+                Some("test-model".into()),
+                lofi_types::ThinkingLevel::Off,
+                "You are lofi".into(),
+                lofi_types::CompactionConfig::default(),
+            ));
+
+            let mut messages = Vec::new();
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+            let drain = tokio::spawn(async move { while ev_rx.recv().await.is_some() {} });
+            let outcome = backend
+                .run_turn(
+                    &mut messages,
+                    TurnRequest::prompt("loop multi-tool".into(), lofi_types::PromptKind::User),
+                    ev_tx,
+                    None,
+                    RunControls::default(),
+                )
+                .await
+                .unwrap();
+            let _ = drain.await;
+
+            assert!(
+                matches!(outcome, crate::session::recorder::TurnOutcome::Finished),
+                "unexpected outcome: {outcome:?}"
+            );
+            let calls = std::fs::read_to_string(dir.path().join("loop-calls"))
+                .unwrap()
+                .lines()
+                .count();
+            assert!(
+                calls <= 5,
+                "tool loop should interrupt mid-turn at 5 repetitions, ran {calls}"
+            );
+            let has_recovered = messages.iter().any(|m| {
+                m.blocks.iter().any(|b| {
+                    matches!(b, lofi_types::ContentBlock::Text { text } if text.contains("recovered cleanly"))
+                })
+            });
+            assert!(has_recovered, "turn should recover after loop interruption");
+        })
+        .await
+        .unwrap();
     }
 }
