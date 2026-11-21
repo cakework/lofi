@@ -990,7 +990,7 @@ fn clip_detail(text: &str, limit: usize) -> String {
 
 /// The reported value, cut short so a large policy list cannot fill the
 /// screen. A missing field reads as `null`, which is itself the answer.
-fn observed(value: &Value) -> String {
+pub(super) fn observed(value: &Value) -> String {
     const LIMIT: usize = 200;
     let text = value.to_string();
     match text.char_indices().nth(LIMIT) {

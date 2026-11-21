@@ -429,11 +429,12 @@ impl Backend for ExternalBackend {
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
         let lofi_types::BackendConfig::ClaudeCode { command, .. } = &self.config;
+        // One-shot evaluation runs with thinking off, matching Agent::complete.
         super::oneshot::complete(
             command,
             &self.root,
             self.model.as_deref(),
-            &self.thinking,
+            &lofi_types::ThinkingLevel::Off,
             &request,
         )
         .await
@@ -684,5 +685,55 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_backend_complete_forces_thinking_off() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-eval");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > eval-args\nread -r _\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let backend = ExternalBackend::configure(
+            "claude".into(),
+            lofi_types::BackendConfig::ClaudeCode {
+                command: script.display().to_string(),
+                model: Some("test-model".into()),
+                models: vec!["test-model".into()],
+                context_window: Some(200_000),
+                frame_idle_timeout_ms: Some(10_000),
+            },
+            dir.path().to_path_buf(),
+            ToolExecutor::in_memory(dir.path()),
+            Some("test-model".into()),
+            lofi_types::ThinkingLevel::High,
+            "You are lofi".into(),
+            lofi_types::CompactionConfig::default(),
+        );
+
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.complete(CompletionRequest {
+                system: "evaluator prompt".into(),
+                prompt: "echo hi".into(),
+                max_tokens: Some(64),
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(completion.text, "ok");
+
+        let args = std::fs::read_to_string(dir.path().join("eval-args")).unwrap();
+        assert!(
+            !args.contains("--effort="),
+            "one-shot evaluator must not inherit session thinking effort: {args}"
+        );
     }
 }
