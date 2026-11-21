@@ -340,7 +340,7 @@ impl ClaudeSession {
         .map_err(|error| Error::State(format!("preparing the exec bridge: {error}")))?;
         let executable = executable?;
         let activity = Arc::new(crate::agent::ActivityWatch::default());
-        let bridge = Bridge::start(&executable).await?;
+        let bridge = Bridge::start(&executable, dir.path())?;
         let files = private_files(dir, system_prompt, &mcp_config(&bridge)?)?;
         let mut child =
             build_command(command, model, &effort, resume.is_some(), &id, &files, root).spawn()?;

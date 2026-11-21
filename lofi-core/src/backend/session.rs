@@ -444,7 +444,7 @@ impl Backend for ExternalBackend {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
+    use std::os::unix::net::UnixStream;
 
     use serde_json::{json, Value};
 
@@ -496,10 +496,10 @@ mod tests {
         let mcp_cfg: Value =
             serde_json::from_slice(&std::fs::read(flag_val("--mcp-config")).unwrap()).unwrap();
         let env = &mcp_cfg["mcpServers"]["lofi"]["env"];
-        let addr = env["LOFI_EXEC_ADDRESS"].as_str().unwrap();
+        let socket = env["LOFI_EXEC_SOCKET"].as_str().unwrap();
         let token = env["LOFI_EXEC_TOKEN"].as_str().unwrap();
 
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = UnixStream::connect(socket).unwrap();
         let mut bridge_in = stream.try_clone().unwrap();
         let mut bridge_out = BufReader::new(stream);
         send_json_line(
