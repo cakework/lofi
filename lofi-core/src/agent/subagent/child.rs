@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use lofi_error::{Error, Result};
 use lofi_types::{Config, ContentBlock, Message, Role, ThinkingLevel};
@@ -24,7 +24,7 @@ use crate::session::store::{SessionCursor, SessionFile, SessionStore};
 /// What the hook needs to resolve subagent model overrides.
 #[derive(Clone)]
 pub struct SubagentSupport {
-    pub(super) registry: ModelRegistry,
+    pub(super) registry: Arc<RwLock<ModelRegistry>>,
     pub(super) config: Config,
     /// Workspace root the subagent transcript is filed under.
     pub(super) cwd: PathBuf,
@@ -42,6 +42,15 @@ pub struct SubagentSupport {
 impl SubagentSupport {
     #[must_use]
     pub fn new(registry: ModelRegistry, config: Config, cwd: PathBuf) -> Self {
+        Self::with_shared_registry(Arc::new(RwLock::new(registry)), config, cwd)
+    }
+
+    #[must_use]
+    pub(crate) fn with_shared_registry(
+        registry: Arc<RwLock<ModelRegistry>>,
+        config: Config,
+        cwd: PathBuf,
+    ) -> Self {
         Self {
             registry,
             config,
@@ -74,13 +83,13 @@ impl SubagentSupport {
     /// a spawn without an override keeps the template's own selection and
     /// never resolves another provider.
     ///
-    /// The factory carries this catalog, so an override can name a model the
-    /// provider discovered at startup.
+    /// The factory shares this live catalog, so overrides see models
+    /// discovered after startup and propagate any newly discovered models back.
     #[allow(clippy::unnecessary_wraps)]
     pub(in crate::agent) fn factory(&self) -> Result<BackendFactory> {
-        Ok(BackendFactory::from_resolved(
+        Ok(BackendFactory::from_shared_registry(
             self.config.clone(),
-            self.registry.clone(),
+            Arc::clone(&self.registry),
             &self.cwd,
             self.env.clone(),
         )
@@ -88,23 +97,29 @@ impl SubagentSupport {
         .with_subagent_persistence(self.persist_sessions))
     }
 
-    /// Build the `lofi.models` hook: the registry's available choices as JSON.
+    /// Build the `lofi.models` hook: reads the live registry's available
+    /// choices as JSON on each call so mid-session `auto_models` discovery is
+    /// immediately visible.
     #[must_use]
     pub fn models_fn(&self) -> lofi_code::ModelsFn {
-        let choices: Vec<Value> = self
-            .registry
-            .choices()
-            .iter()
-            .map(|c| {
-                json!({
-                    "model": format!("{}/{}", c.provider, c.id),
-                    "name": c.name,
-                    "thinking_levels": c.thinking_levels.iter().map(lofi_types::ThinkingLevel::as_str).collect::<Vec<_>>(),
-                    "service_tiers": c.service_tiers.iter().map(lofi_types::ServiceTier::as_str).collect::<Vec<_>>(),
+        let registry = Arc::clone(&self.registry);
+        Arc::new(move || {
+            let choices: Vec<Value> = registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .choices()
+                .iter()
+                .map(|c| {
+                    json!({
+                        "model": format!("{}/{}", c.provider, c.id),
+                        "name": c.name,
+                        "thinking_levels": c.thinking_levels.iter().map(lofi_types::ThinkingLevel::as_str).collect::<Vec<_>>(),
+                        "service_tiers": c.service_tiers.iter().map(lofi_types::ServiceTier::as_str).collect::<Vec<_>>(),
+                    })
                 })
-            })
-            .collect();
-        Arc::new(move || json!({ "models": choices }))
+                .collect();
+            json!({ "models": choices })
+        })
     }
 }
 
@@ -128,7 +143,12 @@ pub(in crate::agent) fn isolate_auto_mode(executor: &mut ToolExecutor, support: 
         return;
     };
     let mut child = executor.clone();
-    match auto_mode::attach(&mut child, &config, &support.registry) {
+    let registry = support
+        .registry
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match auto_mode::attach(&mut child, &config, &registry) {
         Ok(()) => {
             executor.auto_mode = child.auto_mode;
             executor.auto_mode_config = child.auto_mode_config;

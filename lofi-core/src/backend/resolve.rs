@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use lofi_error::{Error, Result};
 use lofi_types::{Config, ModelChoice, ServiceTier, ThinkingLevel};
@@ -39,7 +39,7 @@ pub(crate) fn parse_query(query: &str) -> Result<ParsedQuery> {
 #[derive(Clone)]
 pub struct BackendFactory {
     config: Arc<Config>,
-    registry: ModelRegistry,
+    registry: Arc<RwLock<ModelRegistry>>,
     root: PathBuf,
     env: Arc<Vec<(String, String)>>,
     skills_dir: Option<PathBuf>,
@@ -76,6 +76,16 @@ impl BackendFactory {
         root: &Path,
         env: Vec<(String, String)>,
     ) -> Self {
+        Self::from_shared_registry(config, Arc::new(RwLock::new(registry)), root, env)
+    }
+
+    #[must_use]
+    pub(crate) fn from_shared_registry(
+        config: Config,
+        registry: Arc<RwLock<ModelRegistry>>,
+        root: &Path,
+        env: Vec<(String, String)>,
+    ) -> Self {
         Self {
             config: Arc::new(config),
             registry,
@@ -92,8 +102,11 @@ impl BackendFactory {
     }
 
     #[must_use]
-    pub fn registry(&self) -> &ModelRegistry {
-        &self.registry
+    pub fn registry(&self) -> ModelRegistry {
+        self.registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[must_use]
@@ -124,7 +137,10 @@ impl BackendFactory {
     /// Every model of every transport, as the picker lists them.
     #[must_use]
     pub fn choices(&self) -> Vec<ModelChoice> {
-        self.registry.choices()
+        self.registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .choices()
     }
 
     /// The session-scoped state a backend opened by this factory starts with.
@@ -139,8 +155,8 @@ impl BackendFactory {
     /// What a subagent hook resolves model overrides with.
     #[must_use]
     pub fn support(&self) -> crate::SubagentSupport {
-        crate::SubagentSupport::new(
-            self.registry.clone(),
+        crate::SubagentSupport::with_shared_registry(
+            Arc::clone(&self.registry),
             (*self.config).clone(),
             self.root.clone(),
         )
@@ -179,6 +195,12 @@ impl BackendFactory {
             Ok(registry) => registry,
             Err(_) => ModelRegistry::load(&config)?,
         };
+        // Propagate freshly discovered models back into the shared catalog so
+        // the active picker, `lofi.models()`, and subagent overrides see them.
+        self.registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .merge_from(&registry);
         BackendFactory::from_resolved(config, registry, &self.root, self.env.to_vec())
             .with_skills_dir(self.skills_dir.clone())
             .with_subagent_persistence(self.persist_sessions)
@@ -206,8 +228,8 @@ impl BackendFactory {
                 known.join(", ")
             )));
         }
-        let (mut model, level) =
-            crate::agent::select_model(&self.registry, &self.config, Some(&query))?;
+        let registry = self.registry();
+        let (mut model, level) = crate::agent::select_model(&registry, &self.config, Some(&query))?;
         model.thinking = level;
         let provider_cfg = self
             .config
@@ -215,9 +237,7 @@ impl BackendFactory {
             .get(&model.provider)
             .ok_or_else(|| Error::Config(format!("provider not found: {}", model.provider)))?;
         let provider = lofi_providers::open(model.api, provider_cfg)?;
-        let auto_continue = self
-            .registry
-            .auto_continue_policy(&self.config.agent, &model);
+        let auto_continue = registry.auto_continue_policy(&self.config.agent, &model);
         // The prompt is the executor's own: it states the tools and the exec
         // contract, and the backend only carries it.
         let executor = executor.with_skills_dir(self.skills_dir.clone());
@@ -233,7 +253,7 @@ impl BackendFactory {
             .with_retry(self.config.retry.into())
             .with_auto_continue(auto_continue)
             .with_source(crate::backend::NativeSource::new(
-                self.registry.clone(),
+                registry,
                 (*self.config).clone(),
             )),
         ))
@@ -243,8 +263,11 @@ impl BackendFactory {
     /// already resolved remote models passes them through instead of
     /// rebuilding a catalog that cannot name them.
     #[must_use]
-    pub fn with_resolved_registry(mut self, registry: ModelRegistry) -> Self {
-        self.registry = registry;
+    pub fn with_resolved_registry(self, registry: ModelRegistry) -> Self {
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = registry;
         self
     }
 
@@ -345,8 +368,9 @@ impl BackendFactory {
                 tier.as_str()
             ));
         }
+        let registry = self.registry();
         let (model, thinking) = crate::agent::select_model_for_subagent(
-            &self.registry,
+            &registry,
             &self.config,
             query,
             level,
@@ -369,6 +393,7 @@ impl BackendFactory {
         if let Some(default) = self.config.default_model.clone() {
             return Ok(default);
         }
+        let registry = self.registry();
         if let Some(name) = self.config.default_provider.clone() {
             if let Some(config) = self.config.backends.get(&name) {
                 let model = config
@@ -377,18 +402,13 @@ impl BackendFactory {
                     .unwrap_or("default");
                 return Ok(format!("{name}/{model}"));
             }
-            if let Some(choice) = self
-                .registry
-                .choices()
-                .into_iter()
-                .find(|c| c.provider == name)
-            {
+            if let Some(choice) = registry.choices().into_iter().find(|c| c.provider == name) {
                 return Ok(format!("{name}/{}", choice.id));
             }
         }
         // Config order, not picker order: the first model the user wrote is
         // the default, not the alphabetically first one.
-        if let Some(model) = self.registry.available().first() {
+        if let Some(model) = registry.available().first() {
             return Ok(format!("{}/{}", model.provider, model.id));
         }
         if let Some((name, config)) = self.config.backends.first() {
@@ -494,4 +514,147 @@ pub fn constrain_backend_query(
         })
         .unwrap_or("default");
     Ok(Some(format!("{name}/{model}")))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use indexmap::IndexMap;
+    use lofi_types::{Api, AutoModelsConfig, Config, FieldMappings, ProviderConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    struct RestoreEnv(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    fn auto_models_test_config(addr: std::net::SocketAddr) -> Config {
+        let mut api_types = IndexMap::new();
+        api_types.insert(
+            Api::OpenAiCompletions.id().to_string(),
+            lofi_types::ApiTypeMapping {
+                path: None,
+                pricing_field_mappings: None,
+            },
+        );
+        let mut providers = IndexMap::new();
+        providers.insert(
+            "local".to_string(),
+            ProviderConfig {
+                api_type: Some(Api::OpenAiCompletions),
+                api_types,
+                base_url: Some(format!("http://{addr}/v1")),
+                pricing_convention: lofi_types::PricingConvention::PerToken,
+                pricing_field_mappings: lofi_types::PricingFieldMappings::default(),
+                env_name: None,
+                api_key: Some("test-key".to_string()),
+                headers: None,
+                models: IndexMap::new(),
+                auto_models: Some(AutoModelsConfig {
+                    enabled: true,
+                    auth: true,
+                    models_url: Some(format!("http://{addr}/v1/models")),
+                    path: "data".to_string(),
+                    api_type_field: None,
+                    api_type_mappings: HashMap::new(),
+                    field_mappings: FieldMappings::default(),
+                    thinking_levels: Vec::new(),
+                    thinking_level: None,
+                    service_tiers: Vec::new(),
+                    service_tier: None,
+                    ttl_seconds: Some(60),
+                }),
+                no_auth: false,
+                response_start_timeout_ms: 90_000,
+                body_idle_timeout_ms: 300_000,
+                thinking_level: None,
+                thinking_levels: Vec::new(),
+                service_tier: None,
+                service_tiers: Vec::new(),
+                auto_continue: lofi_types::AutoContinueConfig::default(),
+            },
+        );
+        Config {
+            providers,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn open_propagates_discovered_auto_models_to_factory_and_models_fn() {
+        let _env_lock = crate::state::STATE_ENV_LOCK.lock().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _restore = RestoreEnv(std::env::var_os("XDG_STATE_HOME"));
+        std::env::set_var("XDG_STATE_HOME", state_dir.path());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"data":[{"id":"fresh-one","name":"Fresh One"},{"id":"fresh-two","name":"Fresh Two"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let factory =
+            BackendFactory::new(auto_models_test_config(addr), root.path(), Vec::new()).unwrap();
+        assert!(factory.choices().is_empty(), "cache starts empty");
+
+        // Capture support + lofi.models() before open(), matching SessionBootstrap::prepare.
+        let support = factory.support();
+        let models_fn = support.models_fn();
+        assert_eq!(models_fn()["models"].as_array().unwrap().len(), 0);
+
+        let executor = factory.executor().unwrap();
+        let _backend = tokio::time::timeout(
+            Duration::from_secs(5),
+            factory.open(Some("local/fresh-one"), executor),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let _ = server.await;
+
+        let choice_ids: Vec<String> = factory
+            .choices()
+            .into_iter()
+            .map(|c| format!("{}/{}", c.provider, c.id))
+            .collect();
+        assert!(
+            choice_ids.contains(&"local/fresh-one".to_string())
+                && choice_ids.contains(&"local/fresh-two".to_string()),
+            "factory choices should contain freshly discovered models: {choice_ids:?}"
+        );
+
+        let hook_models: Vec<String> = models_fn()["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["model"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            hook_models.contains(&"local/fresh-one".to_string())
+                && hook_models.contains(&"local/fresh-two".to_string()),
+            "lofi.models() should reflect freshly discovered models: {hook_models:?}"
+        );
+    }
 }

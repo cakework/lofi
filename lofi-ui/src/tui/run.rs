@@ -327,7 +327,7 @@ pub(crate) async fn run_loop(guard: &mut TerminalGuard, launch: TuiLaunch) -> Re
     } = session;
     let model_choices = switcher
         .as_ref()
-        .map_or_else(Vec::new, |s| s.choices().to_vec());
+        .map_or_else(Vec::new, ModelSwitcher::choices);
     let mut app = App::new(
         model_label,
         thinking,
@@ -642,6 +642,7 @@ pub(crate) async fn run_loop(guard: &mut TerminalGuard, launch: TuiLaunch) -> Re
                         if let Some(switcher) = switcher.as_ref() {
                             match switcher.switch(agent.as_ref(), &q).await {
                                 Ok(new_agent) => {
+                                    app.model.choices = switcher.choices();
                                     let selection = new_agent.selection();
                                     let choice = new_agent.choice();
                                     let label =

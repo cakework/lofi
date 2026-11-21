@@ -159,6 +159,15 @@ impl ModelRegistry {
         &self.providers
     }
 
+    /// Merge refreshed provider configurations and models from another registry
+    /// without disturbing other providers or CLI backends.
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        for (name, pcfg) in &other.providers {
+            self.providers.insert(name.clone(), pcfg.clone());
+        }
+        self.models = static_models(&self.providers);
+    }
+
     #[must_use]
     pub fn auto_continue_policy(
         &self,

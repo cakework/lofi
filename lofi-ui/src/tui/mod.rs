@@ -94,16 +94,13 @@ use lofi_error::{Error, Result};
 /// or a backend, so the UI never branches on which one the user picked.
 pub(crate) struct ModelSwitcher {
     factory: BackendFactory,
-    choices: Vec<lofi_types::ModelChoice>,
     executor: Option<lofi_core::agent::ToolExecutor>,
 }
 
 impl ModelSwitcher {
     pub(crate) fn new(factory: BackendFactory) -> Self {
-        let choices = factory.choices();
         Self {
             factory,
-            choices,
             executor: None,
         }
     }
@@ -118,8 +115,8 @@ impl ModelSwitcher {
         self
     }
 
-    pub(crate) fn choices(&self) -> &[lofi_types::ModelChoice] {
-        &self.choices
+    pub(crate) fn choices(&self) -> Vec<lofi_types::ModelChoice> {
+        self.factory.choices()
     }
 
     /// Switch the running conversation to another model or another backend.
