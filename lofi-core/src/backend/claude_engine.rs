@@ -473,8 +473,8 @@ async fn run_exchange(
         // lineage or a rewritten history.
         let binding = binding.filter(|_| !matches!(sync, Some(CatchUp::Diverged)));
         transfer_history = binding.is_none() && work.has_prior;
-        // A child that never started consumed nothing, so the turn's retry
-        // ladder applies without discarding any output.
+        // CLI backends fail fast and resume on the next turn rather than
+        // auto-retrying inside a single turn.
         let opened = match open_external(
             config,
             root,

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,7 @@ impl Drop for FinishOnDrop {
 pub(super) struct Bridge {
     pub config: Value,
     active: Arc<Mutex<Option<(ToolExecutor, ToolCallContext)>>>,
+    pending_tool_ids: Arc<Mutex<VecDeque<String>>>,
     finished: Arc<AtomicBool>,
     done: Arc<Notify>,
     task: tokio::task::JoinHandle<Result<()>>,
@@ -122,9 +123,11 @@ impl Bridge {
         let config = json!({"name":"lofi", "command":executable, "args":["mcp", "serve"],
             "env":[{"name":"LOFI_EXEC_SOCKET","value":socket.path}, {"name":"LOFI_EXEC_TOKEN","value":token}]});
         let active = Arc::new(Mutex::new(None));
+        let pending_tool_ids = Arc::new(Mutex::new(VecDeque::new()));
         let finished = Arc::new(AtomicBool::new(false));
         let done = Arc::new(Notify::new());
         let state = active.clone();
+        let tool_ids = pending_tool_ids.clone();
         let task_finished = finished.clone();
         let task_done = done.clone();
         let task = tokio::spawn(async move {
@@ -149,11 +152,12 @@ impl Bridge {
                 }
             };
             drop(listener);
-            serve(&mut reader, writer, state).await
+            serve(&mut reader, writer, state, tool_ids).await
         });
         Ok(Self {
             config,
             active,
+            pending_tool_ids,
             finished,
             done,
             task,
@@ -168,7 +172,18 @@ impl Bridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((executor, context));
     }
 
+    pub fn enqueue_tool_id(&self, id: String) {
+        self.pending_tool_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(id);
+    }
+
     pub fn deactivate(&self) {
+        self.pending_tool_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         if let Some(context) = self
             .active
             .lock()
@@ -245,6 +260,7 @@ async fn serve(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
     mut writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     active: Arc<Mutex<Option<(ToolExecutor, ToolCallContext)>>>,
+    pending_tool_ids: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<()> {
     let (write_tx, mut write_rx) = mpsc::channel::<Value>(64);
     let writer_task = tokio::spawn(async move {
@@ -307,9 +323,15 @@ async fn serve(
                 drop(id_guard);
             }
             "tools/call" if ready => {
-                if let Some(handle) =
-                    dispatch_tool_call(id, request["params"].clone(), &active, &write_tx, id_guard)
-                        .await?
+                if let Some(handle) = dispatch_tool_call(
+                    id,
+                    request["params"].clone(),
+                    &active,
+                    &pending_tool_ids,
+                    &write_tx,
+                    id_guard,
+                )
+                .await?
                 {
                     children.0.retain(|h| !h.is_finished());
                     children.0.push(handle);
@@ -327,6 +349,7 @@ async fn dispatch_tool_call(
     id: Value,
     params: Value,
     active: &Arc<Mutex<Option<(ToolExecutor, ToolCallContext)>>>,
+    pending_tool_ids: &Arc<Mutex<VecDeque<String>>>,
     write_tx: &mpsc::Sender<Value>,
     id_guard: InFlightGuard,
 ) -> Result<Option<tokio::task::AbortHandle>> {
@@ -348,15 +371,24 @@ async fn dispatch_tool_call(
         drop(id_guard);
         return Ok(None);
     };
+    let streamed_id = pending_tool_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop_front();
     let reply_tx = write_tx.clone();
     let handle = tokio::spawn(async move {
         let _guard = id_guard;
-        let call_id = format!("exec-{}", uuid::Uuid::new_v4());
-        let response = match executor
-            .execute(&call_id, &params["arguments"], context)
-            .await
-            .and_then(tool_result)
-        {
+        let result = if let Some(call_id) = streamed_id {
+            executor
+                .execute_started(&call_id, &params["arguments"], context)
+                .await
+        } else {
+            let call_id = format!("exec-{}", uuid::Uuid::new_v4());
+            executor
+                .execute(&call_id, &params["arguments"], context)
+                .await
+        };
+        let response = match result.and_then(tool_result) {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
             Err(error) => rpc::error(&id, -32603, &error.to_string()),
         };

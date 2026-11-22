@@ -700,6 +700,13 @@ pub enum BackendConfig {
         /// not the turn; unset uses the wide default.
         #[serde(default)]
         frame_idle_timeout_ms: Option<u64>,
+        /// Default thinking effort for this backend when no `:level` suffix is
+        /// given. Overrides `[agent].thinking_level`.
+        #[serde(default)]
+        thinking_level: Option<ThinkingLevel>,
+        /// Per-backend overrides for `[agent.auto_continue]`.
+        #[serde(default)]
+        auto_continue: AutoContinueConfig,
     },
 }
 
@@ -722,6 +729,20 @@ impl BackendConfig {
     pub fn context_window(&self) -> Option<u64> {
         match self {
             Self::ClaudeCode { context_window, .. } => *context_window,
+        }
+    }
+
+    #[must_use]
+    pub fn thinking_level(&self) -> Option<&ThinkingLevel> {
+        match self {
+            Self::ClaudeCode { thinking_level, .. } => thinking_level.as_ref(),
+        }
+    }
+
+    #[must_use]
+    pub fn auto_continue(&self) -> AutoContinueConfig {
+        match self {
+            Self::ClaudeCode { auto_continue, .. } => *auto_continue,
         }
     }
 }

@@ -194,9 +194,11 @@ fn result_error_message_surfaces_subtype_and_detail() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn oneshot_surfaces_child_stderr_on_early_exit() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("failing-claude");
     std::fs::write(
@@ -225,9 +227,11 @@ async fn oneshot_surfaces_child_stderr_on_early_exit() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn session_prompt_surfaces_child_stderr_on_early_exit() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("failing-claude");
     std::fs::write(

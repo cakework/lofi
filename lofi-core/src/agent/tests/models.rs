@@ -1024,6 +1024,8 @@ fn claude_backend(model: Option<&str>, listed: &[&str]) -> lofi_types::BackendCo
         models: listed.iter().map(|id| (*id).to_string()).collect(),
         context_window: None,
         frame_idle_timeout_ms: None,
+        thinking_level: None,
+        auto_continue: lofi_types::AutoContinueConfig::default(),
     }
 }
 

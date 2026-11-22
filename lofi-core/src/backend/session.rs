@@ -142,8 +142,9 @@ pub(super) struct ExternalBackend {
     /// provider path does. Lofi owns the cap on this transport too, so the child
     /// is never asked to decide when the context is full.
     compaction: lofi_types::CompactionConfig,
-    /// The same retry ladder the native path applies to a failed request.
-    retry: crate::retry::RetryPolicy,
+    /// Resolved auto-continue policy from `[agent.auto_continue]` and backend
+    /// overrides.
+    auto_continue: lofi_types::AutoContinuePolicy,
 }
 
 impl ExternalBackend {
@@ -173,15 +174,17 @@ impl ExternalBackend {
             worker: Arc::new(Mutex::new(None)),
             context_window: Arc::new(Mutex::new(None)),
             compaction,
-            retry: crate::retry::RetryPolicy::default(),
+            auto_continue: lofi_types::AutoContinuePolicy::default(),
         }
     }
 
-    /// Apply the session retry ladder. The factory holds the config that
-    /// declares it; the backend only carries the resolved policy.
+    /// Apply the resolved auto-continue policy.
     #[must_use]
-    pub(super) fn with_retry(mut self, retry: crate::retry::RetryPolicy) -> Self {
-        self.retry = retry;
+    pub(super) fn with_auto_continue(
+        mut self,
+        auto_continue: lofi_types::AutoContinuePolicy,
+    ) -> Self {
+        self.auto_continue = auto_continue;
         self
     }
 
@@ -392,7 +395,7 @@ impl Backend for ExternalBackend {
             context_window: Arc::new(Mutex::new(None)),
             live: Arc::new(Mutex::new((model, thinking))),
             compaction: self.compaction.clone(),
-            retry: self.retry,
+            auto_continue: self.auto_continue,
         })
     }
 
@@ -416,8 +419,13 @@ impl Backend for ExternalBackend {
 
     fn turn_policy(&self) -> TurnPolicy {
         TurnPolicy {
-            auto_continue: lofi_types::AutoContinuePolicy::default(),
-            retry: self.retry,
+            auto_continue: self.auto_continue,
+            // Disconnected CLI turns stop and resume on the next turn rather
+            // than auto-retrying inside one turn.
+            retry: crate::retry::RetryPolicy {
+                max_retries: 0,
+                ..crate::retry::RetryPolicy::default()
+            },
             hard_cap: self.hard_compact_threshold(),
         }
     }
@@ -726,6 +734,83 @@ mod tests {
                     let _ = read_json_line(&mut bridge_out);
                     std::thread::sleep(std::time::Duration::from_millis(40));
                 }
+            } else if text == "stream tool" {
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "stream_event",
+                        "session_id": id,
+                        "event": {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": "toolu_stream_1",
+                                "name": "mcp__lofi__exec",
+                                "input": {}
+                            }
+                        }
+                    }),
+                );
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "stream_event",
+                        "session_id": id,
+                        "event": {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": "{\"code\":\"return "
+                            }
+                        }
+                    }),
+                );
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "stream_event",
+                        "session_id": id,
+                        "event": {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": "\\\"streamed\\\"\"}"
+                            }
+                        }
+                    }),
+                );
+                send_json_line(
+                    &mut output,
+                    &json!({
+                        "type": "stream_event",
+                        "session_id": id,
+                        "event": {
+                            "type": "content_block_stop",
+                            "index": 0
+                        }
+                    }),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                send_json_line(
+                    &mut bridge_in,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": next_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exec",
+                            "arguments": {
+                                "code": r#"return "streamed""#,
+                                "description": "streamed exec"
+                            }
+                        }
+                    }),
+                );
+                next_id += 1;
+                let _ = read_json_line(&mut bridge_out);
             } else if text.contains("A potential loop was detected") {
                 send_json_line(
                     &mut output,
@@ -774,6 +859,8 @@ mod tests {
                     models: vec!["test-model".into()],
                     context_window: Some(200_000),
                     frame_idle_timeout_ms: Some(10_000),
+                    thinking_level: None,
+                    auto_continue: lofi_types::AutoContinueConfig::default(),
                 },
                 dir.path().to_path_buf(),
                 executor,
@@ -883,6 +970,8 @@ mod tests {
                 models: vec!["test-model".into()],
                 context_window: Some(200_000),
                 frame_idle_timeout_ms: Some(10_000),
+                thinking_level: None,
+                auto_continue: lofi_types::AutoContinueConfig::default(),
             },
             dir.path().to_path_buf(),
             ToolExecutor::in_memory(dir.path()),
@@ -927,6 +1016,8 @@ mod tests {
                     models: vec!["test-model".into()],
                     context_window: Some(100),
                     frame_idle_timeout_ms: Some(10_000),
+                    thinking_level: None,
+                    auto_continue: lofi_types::AutoContinueConfig::default(),
                 },
                 dir.path().to_path_buf(),
                 ToolExecutor::in_memory(dir.path()),
@@ -993,6 +1084,8 @@ mod tests {
                     models: vec!["test-model".into()],
                     context_window: Some(200_000),
                     frame_idle_timeout_ms: Some(10_000),
+                    thinking_level: None,
+                    auto_continue: lofi_types::AutoContinueConfig::default(),
                 },
                 dir.path().to_path_buf(),
                 ToolExecutor::in_memory(dir.path()),
@@ -1060,6 +1153,8 @@ mod tests {
                     models: vec!["test-model".into()],
                     context_window: Some(200_000),
                     frame_idle_timeout_ms: Some(10_000),
+                    thinking_level: None,
+                    auto_continue: lofi_types::AutoContinueConfig::default(),
                 },
                 dir.path().to_path_buf(),
                 ToolExecutor::in_memory(dir.path()),
@@ -1102,6 +1197,88 @@ mod tests {
                 })
             });
             assert!(has_recovered, "turn should recover after loop interruption");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_streams_tool_input_deltas_and_correlates_single_tool_start() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let script = write_fake_claude_script(dir.path());
+            let backend: BackendRef = Arc::new(ExternalBackend::configure(
+                "claude".into(),
+                lofi_types::BackendConfig::ClaudeCode {
+                    command: script.display().to_string(),
+                    model: Some("test-model".into()),
+                    models: vec!["test-model".into()],
+                    context_window: Some(200_000),
+                    frame_idle_timeout_ms: Some(10_000),
+                    thinking_level: None,
+                    auto_continue: lofi_types::AutoContinueConfig::default(),
+                },
+                dir.path().to_path_buf(),
+                ToolExecutor::in_memory(dir.path()),
+                Some("test-model".into()),
+                lofi_types::ThinkingLevel::Off,
+                "You are lofi".into(),
+                lofi_types::CompactionConfig::default(),
+            ));
+
+            let mut messages = Vec::new();
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+            let collect = tokio::spawn(async move {
+                let mut events = Vec::new();
+                while let Some(ev) = ev_rx.recv().await {
+                    events.push(ev);
+                }
+                events
+            });
+            backend
+                .run_turn(
+                    &mut messages,
+                    TurnRequest::prompt("stream tool".into(), lofi_types::PromptKind::User),
+                    ev_tx,
+                    None,
+                    RunControls::default(),
+                )
+                .await
+                .unwrap();
+            let events = collect.await.unwrap();
+
+            let starts: Vec<&str> = events
+                .iter()
+                .filter_map(|ev| match ev {
+                    crate::agent::AgentEvent::ToolStart { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(starts, vec!["toolu_stream_1"]);
+
+            let deltas: String = events
+                .iter()
+                .filter_map(|ev| match ev {
+                    crate::agent::AgentEvent::ToolInputDelta { id, delta }
+                        if id == "toolu_stream_1" =>
+                    {
+                        Some(delta.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(deltas, r#"return "streamed""#);
+
+            assert!(
+                events.iter().any(|ev| matches!(
+                    ev,
+                    crate::agent::AgentEvent::ToolEnd { id, is_error: false, .. }
+                        if id == "toolu_stream_1"
+                )),
+                "ToolEnd should correlate with streamed tool_use id"
+            );
         })
         .await
         .unwrap();

@@ -277,7 +277,18 @@ impl BackendFactory {
             .backends
             .get(&parsed.provider)
             .ok_or_else(|| Error::Config(format!("unknown backend \"{}\"", parsed.provider)))?;
-        let thinking = parsed.level.clone().unwrap_or(ThinkingLevel::Off);
+        let thinking = parsed
+            .level
+            .clone()
+            .or_else(|| config.thinking_level().cloned())
+            .or_else(|| {
+                self.config
+                    .agent
+                    .thinking_level
+                    .clone()
+                    .filter(super::session::accepts)
+            })
+            .unwrap_or(ThinkingLevel::Off);
         super::session::check_selection(
             config,
             &parsed.provider,
@@ -285,6 +296,10 @@ impl BackendFactory {
             &thinking,
             &parsed.tier,
         )?;
+        let auto_continue = lofi_types::AutoContinuePolicy::resolve(&[
+            self.config.agent.auto_continue,
+            config.auto_continue(),
+        ]);
         let model = (parsed.model != "default").then_some(parsed.model.clone());
         let system_prompt = executor.system_prompt();
         Ok(Arc::new(
@@ -298,7 +313,7 @@ impl BackendFactory {
                 system_prompt,
                 self.config.compaction.clone(),
             )
-            .with_retry(self.config.retry.into()),
+            .with_auto_continue(auto_continue),
         ))
     }
 
@@ -656,5 +671,72 @@ mod tests {
                 && hook_models.contains(&"local/fresh-two".to_string()),
             "lofi.models() should reflect freshly discovered models: {hook_models:?}"
         );
+    }
+
+    #[test]
+    fn external_backend_inherits_agent_defaults_and_disables_dead_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let mut backends = IndexMap::new();
+        backends.insert(
+            "claude".to_string(),
+            lofi_types::BackendConfig::ClaudeCode {
+                command: "claude".into(),
+                model: Some("sonnet".into()),
+                models: vec!["sonnet".into()],
+                context_window: Some(200_000),
+                frame_idle_timeout_ms: None,
+                thinking_level: None,
+                auto_continue: lofi_types::AutoContinueConfig::default(),
+            },
+        );
+        backends.insert(
+            "claude-custom".to_string(),
+            lofi_types::BackendConfig::ClaudeCode {
+                command: "claude".into(),
+                model: Some("sonnet".into()),
+                models: vec!["sonnet".into()],
+                context_window: Some(200_000),
+                frame_idle_timeout_ms: None,
+                thinking_level: Some(ThinkingLevel::Medium),
+                auto_continue: lofi_types::AutoContinueConfig {
+                    intent: Some(false),
+                    lost_tool_call: None,
+                    byte_cap: None,
+                },
+            },
+        );
+        let config = Config {
+            backends,
+            agent: lofi_types::AgentConfig {
+                thinking_level: Some(ThinkingLevel::High),
+                auto_continue: lofi_types::AutoContinueConfig {
+                    intent: Some(true),
+                    lost_tool_call: Some(false),
+                    byte_cap: Some(false),
+                },
+                ..lofi_types::AgentConfig::default()
+            },
+            ..Config::default()
+        };
+        let factory = BackendFactory::new(config, root.path(), Vec::new()).unwrap();
+        let inherited = factory
+            .open_resolved(Some("claude/sonnet"), factory.executor().unwrap())
+            .unwrap();
+
+        assert_eq!(inherited.selection().thinking, ThinkingLevel::High);
+        let policy = inherited.turn_policy();
+        assert!(policy.auto_continue.intent);
+        assert!(!policy.auto_continue.lost_tool_call);
+        assert!(!policy.auto_continue.byte_cap);
+        assert_eq!(policy.retry.max_retries, 0);
+
+        let overridden = factory
+            .open_resolved(Some("claude-custom/sonnet"), factory.executor().unwrap())
+            .unwrap();
+        assert_eq!(overridden.selection().thinking, ThinkingLevel::Medium);
+        let custom_policy = overridden.turn_policy();
+        assert!(!custom_policy.auto_continue.intent);
+        assert!(!custom_policy.auto_continue.lost_tool_call);
+        assert!(!custom_policy.auto_continue.byte_cap);
     }
 }

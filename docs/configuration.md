@@ -82,6 +82,8 @@ If the `claude` binary is not on `PATH`, or if you want to pin a specific binary
 | `models` | string array | empty | Additional model aliases exposed in `lofi models` and `/model`. |
 | `context_window` | integer | `200000` | Initial context window in tokens until the child reports its own window. |
 | `frame_idle_timeout_ms` | positive integer | `7200000` | Maximum idle gap between child frames in milliseconds before Lofi stops the child and fails the turn. |
+| `thinking_level` | string | none | Default thinking effort for this backend when no `:level` suffix is given. Overrides `[agent].thinking_level`. |
+| `auto_continue` | table | none | Per-backend overrides for `[agent.auto_continue]` (`intent`, `lost_tool_call`, `byte_cap`). |
 
 ```toml
 [backends.claude]

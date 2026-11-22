@@ -252,7 +252,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn oneshot_drop_kills_descendant_process_group() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("descendant.pid");
         let script = write_script(
@@ -304,7 +306,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn oneshot_rejects_init_frame_advertising_tools_or_mcp_servers() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let bad_tools = write_script(
             dir.path(),
@@ -350,7 +354,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn oneshot_accepts_empty_init_frame() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ok_script = write_script(
             dir.path(),

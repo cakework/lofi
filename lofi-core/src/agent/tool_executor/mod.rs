@@ -422,6 +422,24 @@ impl ToolExecutor {
         {
             return Err(Error::Cancelled);
         }
+        self.execute_started(id, input, context).await
+    }
+
+    /// Execute an `exec` call whose `ToolStart` (and optional `ToolInputDelta`
+    /// stream) was already published by the transport under `id`.
+    pub(crate) async fn execute_started(
+        &self,
+        id: &str,
+        input: &serde_json::Value,
+        context: ToolCallContext,
+    ) -> Result<ContentBlock> {
+        if context
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
         if let Some(record) = &context.record_tool {
             record(ContentBlock::ToolUse {
                 id: id.into(),

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
@@ -287,6 +288,36 @@ enum InterruptReason {
     BridgeStopped,
 }
 
+struct ToolInputStream {
+    id: String,
+    raw: String,
+    decoder: crate::agent::CodePrefixDecoder,
+    emitted: usize,
+}
+
+impl ToolInputStream {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            raw: String::new(),
+            decoder: crate::agent::CodePrefixDecoder::default(),
+            emitted: 0,
+        }
+    }
+
+    fn push(&mut self, partial: &str) -> Option<String> {
+        self.raw.push_str(partial);
+        let decoded = self.decoder.update(&self.raw);
+        if decoded.len() > self.emitted {
+            let chunk = decoded[self.emitted..].to_string();
+            self.emitted = decoded.len();
+            Some(chunk)
+        } else {
+            None
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)] // transport state flags
 pub(super) struct ClaudeSession {
     child: Child,
@@ -330,6 +361,8 @@ pub(super) struct ClaudeSession {
     /// When the open thinking block started, so the banner can report how
     /// long the model reasoned before it answered.
     thinking_start: Option<Instant>,
+    /// Active streaming `tool_use` blocks keyed by stream content-block index.
+    tool_streams: HashMap<u64, ToolInputStream>,
     /// The prompt and the bridge token live in files; argv is public.
     _files: PrivateFiles,
 }
@@ -413,6 +446,7 @@ impl ClaudeSession {
             pending_cost: 0.0,
             reported: false,
             thinking_start: None,
+            tool_streams: HashMap::new(),
             _files: files,
         })
     }
@@ -447,6 +481,7 @@ impl ClaudeSession {
         self.activity = executor.activity.clone();
         self.prompt_written = false;
         self.reported = false;
+        self.tool_streams.clear();
         // Usage belongs to the turn that reported it: a turn that ends
         // before any frame must not re-report the call before it.
         self.round_usage = None;
@@ -602,10 +637,34 @@ impl ClaudeSession {
                 self.stop_reason = Some(stop_reason(reason));
             }
         }
-        if event["type"] == "content_block_start" && event["content_block"]["type"] == "thinking" {
-            self.thinking_start = Some(Instant::now());
+        if event["type"] == "content_block_start" {
+            let block = &event["content_block"];
+            if block["type"] == "thinking" {
+                self.thinking_start = Some(Instant::now());
+            } else if block["type"] == "tool_use" && block["name"] == EXEC {
+                if let (Some(index), Some(id)) = (
+                    event["index"].as_u64(),
+                    block["id"].as_str().filter(|id| !id.is_empty()),
+                ) {
+                    self.close_thinking(context).await?;
+                    if let Some(events) = &context.events {
+                        events
+                            .forward(AgentEvent::ToolStart {
+                                id: id.into(),
+                                name: "exec".into(),
+                            })
+                            .await?;
+                    }
+                    self.tool_streams
+                        .insert(index, ToolInputStream::new(id.into()));
+                    self.bridge.enqueue_tool_id(id.into());
+                }
+            }
         } else if event["type"] == "content_block_stop" {
             self.close_thinking(context).await?;
+            if let Some(index) = event["index"].as_u64() {
+                self.tool_streams.remove(&index);
+            }
         }
         if event["type"] == "content_block_delta" {
             let delta = &event["delta"];
@@ -616,6 +675,16 @@ impl ClaudeSession {
                 Some("thinking_delta") => delta["thinking"]
                     .as_str()
                     .map(|text| AgentEvent::Thinking(text.into())),
+                Some("input_json_delta") => event["index"]
+                    .as_u64()
+                    .and_then(|index| self.tool_streams.get_mut(&index))
+                    .and_then(|stream| {
+                        let chunk = stream.push(delta["partial_json"].as_str()?)?;
+                        Some(AgentEvent::ToolInputDelta {
+                            id: stream.id.clone(),
+                            delta: chunk,
+                        })
+                    }),
                 _ => None,
             };
             if let (Some(events), Some(update)) = (context.events.as_ref(), update) {
