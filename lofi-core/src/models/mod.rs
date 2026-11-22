@@ -305,7 +305,13 @@ impl ModelRegistry {
             lines.extend(
                 crate::backend::configured_models(name, backend, backend.model())
                     .into_iter()
-                    .map(|model| format!("{}/{} — {}", model.provider, model.id, model.name)),
+                    .map(|model| {
+                        let mut s = format!("{}/{} — {}", model.provider, model.id, model.name);
+                        if model.supports_image {
+                            s.push_str("  ·img");
+                        }
+                        s
+                    }),
             );
         }
         lines.sort();
@@ -750,6 +756,25 @@ mod tests {
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines[0], "openai/gpt-4o — GPT 4o  ·img");
         assert_eq!(lines[1], "openai/gpt-4o-mini — gpt-4o-mini");
+    }
+
+    #[test]
+    fn list_models_print_marks_backend_image_support() {
+        let mut cfg = Config::default();
+        cfg.backends.insert(
+            "claude".to_string(),
+            lofi_types::BackendConfig::ClaudeCode {
+                command: "claude".into(),
+                model: Some("sonnet".into()),
+                models: vec!["sonnet".into()],
+                context_window: Some(200_000),
+                frame_idle_timeout_ms: None,
+                thinking_level: None,
+                auto_continue: lofi_types::AutoContinueConfig::default(),
+            },
+        );
+        let reg = ModelRegistry::load(&cfg).unwrap();
+        assert_eq!(reg.list_models_print(), "claude/sonnet — sonnet  ·img");
     }
 
     #[test]

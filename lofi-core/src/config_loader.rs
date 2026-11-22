@@ -358,6 +358,38 @@ fn apply_env_overrides(doc: &mut toml::Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_config(config: &Config) -> Result<()> {
+    if config.backends.contains_key("native") {
+        return Err(Error::Config("native is a reserved backend name".into()));
+    }
+    for (name, backend) in &config.backends {
+        if config.providers.contains_key(name) {
+            return Err(Error::Config(format!(
+                "name \"{name}\" is configured in both [providers] and [backends]"
+            )));
+        }
+        match backend {
+            lofi_types::BackendConfig::ClaudeCode {
+                command,
+                frame_idle_timeout_ms,
+                ..
+            } => {
+                if command.trim().is_empty() {
+                    return Err(Error::Config(format!(
+                        "backends.{name}.command must not be empty"
+                    )));
+                }
+                if *frame_idle_timeout_ms == Some(0) {
+                    return Err(Error::Config(format!(
+                        "backends.{name}.frame_idle_timeout_ms must be greater than zero"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// # Errors
 /// - [`Error::Config`] if the file cannot be read, fails to parse as TOML, an
 ///   env override is malformed, or any value fails to resolve.
@@ -370,6 +402,7 @@ pub async fn load_config(path: &Path) -> Result<Config> {
     let mut cfg: Config = doc
         .try_into()
         .map_err(|e| Error::Config(format!("parse error: {e}")))?;
+    validate_config(&cfg)?;
     let policy_path = policy_config_path(path)?;
     cfg.shell_policy = load_policy_or_default(&policy_path)?;
     resolve_config(&mut cfg).await?;
@@ -391,10 +424,8 @@ pub fn load_backend_config(path: &Path) -> Result<Config> {
     let mut config: Config = doc
         .try_into()
         .map_err(|e: toml::de::Error| Error::Config(e.to_string()))?;
+    validate_config(&config)?;
     config.shell_policy = load_policy_or_default(&policy_config_path(path)?)?;
-    if config.backends.contains_key("native") {
-        return Err(Error::Config("native is a reserved backend name".into()));
-    }
     Ok(config)
 }
 
@@ -536,6 +567,7 @@ pub async fn load_config_or_default(path: &Path) -> Result<Config> {
             let mut cfg: Config = doc
                 .try_into()
                 .map_err(|e| Error::Config(format!("parse error: {e}")))?;
+            validate_config(&cfg)?;
             resolve_config(&mut cfg).await?;
             Ok(cfg)
         }
@@ -1088,5 +1120,49 @@ base_url = "https://model.example.invalid"
             direct.providers.get("mock").unwrap().default_api(),
             roundtrip.providers.get("mock").unwrap().default_api()
         );
+    }
+
+    #[tokio::test]
+    async fn validates_backend_names_and_settings_in_all_loaders() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "collision.toml",
+                "[providers.claude]\napi_type = \"openai-completions\"\nno_auth = true\n\n[backends.claude]\ntype = \"claude-code\"\n",
+                "both [providers] and [backends]",
+            ),
+            (
+                "native.toml",
+                "[backends.native]\ntype = \"claude-code\"\n",
+                "native is a reserved backend name",
+            ),
+            (
+                "blank-cmd.toml",
+                "[backends.claude]\ntype = \"claude-code\"\ncommand = \"   \"\n",
+                "command must not be empty",
+            ),
+            (
+                "zero-idle.toml",
+                "[backends.claude]\ntype = \"claude-code\"\nframe_idle_timeout_ms = 0\n",
+                "frame_idle_timeout_ms must be greater than zero",
+            ),
+        ];
+
+        for (file, body, expected) in cases {
+            let path = dir.path().join(file);
+            std::fs::write(&path, body).unwrap();
+
+            let err = load_backend_config(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(expected),
+                "load_backend_config({file}): expected {expected:?}, got {err:?}"
+            );
+
+            let err = load_config(&path).await.unwrap_err().to_string();
+            assert!(
+                err.contains(expected),
+                "load_config({file}): expected {expected:?}, got {err:?}"
+            );
+        }
     }
 }
