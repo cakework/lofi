@@ -10,10 +10,10 @@ use lofi_types::{ContentBlock, Message, Role, RunModel, ThinkingLevel};
 use tokio::sync::{mpsc, oneshot};
 
 use super::binding::{
-    block_role, catch_up, drop_checkpoint, ensure_frame_fits, read_binding, remove_checkpoint,
-    render_transfer, run_model_for, write_binding, Binding, BoundModel, CONTINUE_PROMPT,
+    block_role, catch_up, drop_checkpoint, read_binding, remove_checkpoint, render_transfer,
+    run_model_for, write_binding, Binding, BoundModel, CONTINUE_PROMPT,
 };
-use super::claude::{ClaudeSession, MidTurnStop, PromptControls, PromptOutcome};
+use super::driver::{CliDriver, CliSession, MidTurnStop, PromptControls, PromptOutcome};
 use crate::agent::turn_session::{
     EventSink, Exchange, ExchangeDriver, ExchangeFailure, Rollback, Settlement, ToolRecorder,
     TurnIo,
@@ -24,7 +24,7 @@ use crate::session::store::SessionCursor;
 
 pub(super) struct WorkerInit {
     pub(super) name: String,
-    pub(super) config: lofi_types::BackendConfig,
+    pub(super) driver: Arc<dyn CliDriver>,
     pub(super) root: PathBuf,
     pub(super) system_prompt: String,
     pub(super) live: Arc<Mutex<(Option<String>, ThinkingLevel)>>,
@@ -34,7 +34,7 @@ pub(super) struct WorkerInit {
 pub(super) fn spawn_worker(init: WorkerInit) -> Result<mpsc::Sender<Work>> {
     let WorkerInit {
         name,
-        config,
+        driver,
         root,
         system_prompt,
         live,
@@ -50,7 +50,7 @@ pub(super) fn spawn_worker(init: WorkerInit) -> Result<mpsc::Sender<Work>> {
                 return;
             };
             runtime.block_on(async move {
-                let mut session: Option<ClaudeSession> = None;
+                let mut session: Option<Box<dyn CliSession>> = None;
                 let mut owner = None;
                 let mut bound_model = BoundModel::Unchecked;
                 let mut history_len = 0;
@@ -109,7 +109,7 @@ pub(super) fn spawn_worker(init: WorkerInit) -> Result<mpsc::Sender<Work>> {
                     effort = work.effort.clone();
                     let out = run_exchange(
                         &name,
-                        &config,
+                        driver.as_ref(),
                         &root,
                         &system_prompt,
                         &mut session,
@@ -141,7 +141,7 @@ pub(super) fn spawn_worker(init: WorkerInit) -> Result<mpsc::Sender<Work>> {
 /// leaf no transcript holds, and the child carries the context it built.
 async fn abandon_exchange(
     work: &Work,
-    session: &mut Option<ClaudeSession>,
+    session: &mut Option<Box<dyn CliSession>>,
     owner: &mut Option<PathBuf>,
     bound_model: &mut BoundModel,
 ) {
@@ -153,38 +153,6 @@ async fn abandon_exchange(
     }
     *owner = None;
     *bound_model = BoundModel::Unchecked;
-}
-
-async fn open_external(
-    config: &lofi_types::BackendConfig,
-    root: &Path,
-    resume: Option<&str>,
-    selected_model: Option<&str>,
-    effort: ThinkingLevel,
-    system_prompt: &str,
-) -> Result<ClaudeSession> {
-    let executable = std::env::current_exe()?;
-    match config {
-        lofi_types::BackendConfig::ClaudeCode {
-            command,
-            frame_idle_timeout_ms,
-            ..
-        } => {
-            ClaudeSession::open(
-                super::claude::Launch {
-                    command,
-                    model: selected_model,
-                    effort,
-                    resume,
-                    system_prompt,
-                    frame_idle: frame_idle_timeout_ms.map(std::time::Duration::from_millis),
-                },
-                root,
-                &executable,
-            )
-            .await
-        }
-    }
 }
 
 /// The catch-up the exchange's child needs.
@@ -397,7 +365,7 @@ fn reply(
     exchange: std::result::Result<Exchange, ExchangeFailure>,
     fold: &Arc<Mutex<Fold>>,
     facts: Facts,
-    session: &mut Option<ClaudeSession>,
+    session: &mut Option<Box<dyn CliSession>>,
     reported: &Arc<Mutex<Option<RunModel>>>,
 ) -> Reply {
     Reply {
@@ -407,7 +375,7 @@ fn reply(
             .map(|mut fold| fold.take_appended())
             .unwrap_or_default(),
         facts,
-        window: session.as_ref().and_then(ClaudeSession::context_window),
+        window: session.as_deref().and_then(CliSession::context_window),
         reported: reported.lock().ok().and_then(|reported| reported.clone()),
     }
 }
@@ -416,10 +384,10 @@ fn reply(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_exchange(
     name: &str,
-    config: &lofi_types::BackendConfig,
+    driver: &dyn CliDriver,
     root: &Path,
     system_prompt: &str,
-    session: &mut Option<ClaudeSession>,
+    session: &mut Option<Box<dyn CliSession>>,
     owner: &mut Option<PathBuf>,
     bound_model: &mut BoundModel,
     work: &mut Work,
@@ -475,15 +443,15 @@ async fn run_exchange(
         transfer_history = binding.is_none() && work.has_prior;
         // CLI backends fail fast and resume on the next turn rather than
         // auto-retrying inside a single turn.
-        let opened = match open_external(
-            config,
-            root,
-            binding.as_ref().map(|binding| binding.session_id.as_str()),
-            work.model.as_deref(),
-            work.effort.clone(),
-            system_prompt,
-        )
-        .await
+        let opened = match driver
+            .open_session(
+                root,
+                binding.as_ref().map(|binding| binding.session_id.as_str()),
+                work.model.as_deref(),
+                work.effort.clone(),
+                system_prompt,
+            )
+            .await
         {
             Ok(opened) => opened,
             Err(error) => {
@@ -669,16 +637,6 @@ async fn run_exchange(
             &work.reported,
         );
     }
-    let frame = super::claude::content_value(&prompt, &images);
-    if let Err(error) = ensure_frame_fits(&frame) {
-        return reply(
-            Err(ExchangeFailure::stopped(error)),
-            &fold,
-            facts,
-            session,
-            &work.reported,
-        );
-    }
     // The child's events arrive on their own channel so the fold sees them
     // before the UI does: a message must reach the transcript and the screen
     // in the same order.
@@ -691,7 +649,7 @@ async fn run_exchange(
         hard_cap: io.hard_cap(),
         stop_rx: Some(stop_rx),
     };
-    let operation = child.prompt(frame, work.executor.clone(), context, controls);
+    let operation = child.prompt(&prompt, &images, work.executor.clone(), context, controls);
     let consumer = async {
         let mut failure = None;
         let mut stopping = false;
@@ -750,9 +708,9 @@ async fn run_exchange(
     if let Ok(mut fold) = fold.lock() {
         fold.flush(io);
     }
-    facts.initialized = session.as_ref().is_some_and(ClaudeSession::is_initialized);
-    facts.child_holds_turn = session.as_ref().is_some_and(ClaudeSession::prompt_written);
-    let stopped = session.as_ref().and_then(ClaudeSession::stop_reason);
+    facts.initialized = session.as_deref().is_some_and(CliSession::is_initialized);
+    facts.child_holds_turn = session.as_deref().is_some_and(CliSession::prompt_written);
+    let stopped = session.as_deref().and_then(CliSession::stop_reason);
     let mid_turn_stopped =
         matches!(&result, Ok(PromptOutcome::Stopped)) || stop_tx.borrow().is_some();
     if mid_turn_stopped {

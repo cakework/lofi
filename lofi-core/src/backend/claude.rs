@@ -6,12 +6,16 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use lofi_error::{Error, Result};
-use lofi_types::ThinkingLevel;
+use lofi_types::{ContentBlock, ThinkingLevel};
 use serde_json::{json, Value};
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use super::binding::ensure_frame_fits;
+use super::contract::{Completion, CompletionRequest};
+use super::driver::{CliDriver, CliSession, MidTurnStop, PromptControls, PromptOutcome};
 use super::{mcp::Bridge, rpc};
 
 #[cfg(test)]
@@ -260,26 +264,61 @@ pub(super) struct Launch<'a> {
     pub frame_idle: Option<Duration>,
 }
 
-/// Why a multi-round CLI turn was stopped cleanly by the engine consumer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MidTurnStop {
-    Preempt,
-    LoopDetected,
+/// Concrete CLI driver for Claude Code (`claude --print --output-format stream-json`).
+pub(super) struct ClaudeDriver {
+    command: String,
+    frame_idle: Option<Duration>,
 }
 
-/// How one CLI prompt exchange ended.
-#[derive(Debug)]
-pub(super) enum PromptOutcome {
-    Completed(String),
-    /// Stopped cleanly at a round boundary (hard context cap or preemption).
-    Stopped,
+impl ClaudeDriver {
+    pub(super) fn new(command: String, frame_idle: Option<Duration>) -> Self {
+        Self {
+            command,
+            frame_idle,
+        }
+    }
 }
 
-/// Mid-turn controls passed into one CLI prompt exchange.
-#[derive(Default)]
-pub(super) struct PromptControls {
-    pub hard_cap: Option<u64>,
-    pub stop_rx: Option<tokio::sync::watch::Receiver<Option<MidTurnStop>>>,
+#[async_trait]
+impl CliDriver for ClaudeDriver {
+    fn effort_levels(&self) -> Vec<ThinkingLevel> {
+        effort_levels()
+    }
+
+    async fn open_session(
+        &self,
+        root: &Path,
+        resume: Option<&str>,
+        model: Option<&str>,
+        effort: ThinkingLevel,
+        system_prompt: &str,
+    ) -> Result<Box<dyn CliSession>> {
+        let executable = std::env::current_exe()?;
+        let session = ClaudeSession::open(
+            Launch {
+                command: &self.command,
+                model,
+                effort,
+                resume,
+                system_prompt,
+                frame_idle: self.frame_idle,
+            },
+            root,
+            &executable,
+        )
+        .await?;
+        Ok(Box::new(session))
+    }
+
+    async fn complete(
+        &self,
+        root: &Path,
+        model: Option<&str>,
+        request: &CompletionRequest,
+    ) -> Result<Completion> {
+        // One-shot evaluation runs with thinking off, matching Agent::complete.
+        super::oneshot::complete(&self.command, root, model, &ThinkingLevel::Off, request).await
+    }
 }
 
 enum InterruptReason {
@@ -1047,6 +1086,58 @@ impl ClaudeSession {
         drop(self.group.take());
         self.child.wait().await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl CliSession for ClaudeSession {
+    fn session_id(&self) -> &str {
+        Self::session_id(self)
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        Self::context_window(self)
+    }
+
+    fn stop_reason(&self) -> Option<lofi_types::StopReason> {
+        Self::stop_reason(self)
+    }
+
+    fn is_closed(&mut self) -> bool {
+        Self::is_closed(self)
+    }
+
+    fn is_initialized(&self) -> bool {
+        Self::is_initialized(self)
+    }
+
+    fn prompt_written(&self) -> bool {
+        Self::prompt_written(self)
+    }
+
+    fn take_cost(&mut self) -> f64 {
+        Self::take_cost(self)
+    }
+
+    async fn set_model(&mut self, model: Option<&str>) -> Result<()> {
+        Self::set_model(self, model).await
+    }
+
+    async fn prompt(
+        &mut self,
+        prompt: &str,
+        images: &[ContentBlock],
+        executor: ToolExecutor,
+        context: ToolCallContext,
+        controls: PromptControls,
+    ) -> Result<PromptOutcome> {
+        let frame = content_value(prompt, images);
+        ensure_frame_fits(&frame)?;
+        Self::prompt(self, frame, executor, context, controls).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Self::close(self).await
     }
 }
 

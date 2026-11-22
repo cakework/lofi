@@ -286,7 +286,7 @@ impl BackendFactory {
                     .agent
                     .thinking_level
                     .clone()
-                    .filter(super::session::accepts)
+                    .filter(|level| super::session::accepts(config, level))
             })
             .unwrap_or(ThinkingLevel::Off);
         super::session::check_selection(
@@ -364,7 +364,9 @@ impl BackendFactory {
             // provider model may think at a level no CLI offers.
             let desired = match level.or(parsed.level) {
                 Some(level) => level,
-                None if super::session::accepts(&parent.thinking) => parent.thinking.clone(),
+                None if super::session::accepts(config, &parent.thinking) => {
+                    parent.thinking.clone()
+                }
                 None => ThinkingLevel::Off,
             };
             let tier = parsed.tier.unwrap_or(ServiceTier::Auto);

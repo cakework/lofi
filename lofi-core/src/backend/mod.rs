@@ -4,6 +4,7 @@ mod binding;
 mod claude;
 mod claude_engine;
 mod contract;
+mod driver;
 mod mcp;
 mod native;
 mod oneshot;

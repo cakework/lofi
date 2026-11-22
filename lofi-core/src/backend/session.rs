@@ -8,21 +8,25 @@ use tokio::sync::mpsc;
 
 use super::claude_engine::{spawn_worker, ClaudeEngine, Work, WorkerInit};
 use super::contract::{Backend, BackendRef, Completion, CompletionRequest, ModelSelection};
+use super::driver::{self, CliDriver};
 use crate::agent::turn_session::{ExchangeDriver, TurnPolicy};
 use crate::agent::ToolExecutor;
 
 /// The thinking levels one CLI backend accepts. The picker and the check read
 /// this one table, so they cannot disagree.
 #[must_use]
-fn levels() -> Vec<lofi_types::ThinkingLevel> {
-    super::claude::effort_levels()
+fn levels(config: &lofi_types::BackendConfig) -> Vec<lofi_types::ThinkingLevel> {
+    driver::effort_levels_for(config)
 }
 
 /// Whether a CLI backend runs at a level. Off always means "pass no effort
 /// flag", so it needs no entry in the table.
 #[must_use]
-pub(super) fn accepts(level: &lofi_types::ThinkingLevel) -> bool {
-    *level == lofi_types::ThinkingLevel::Off || levels().contains(level)
+pub(super) fn accepts(
+    config: &lofi_types::BackendConfig,
+    level: &lofi_types::ThinkingLevel,
+) -> bool {
+    *level == lofi_types::ThinkingLevel::Off || levels(config).contains(level)
 }
 
 /// Model choices of one CLI backend, in picker order: the configured model
@@ -47,7 +51,7 @@ pub fn configured_models(
             provider: name.into(),
             name: id.clone(),
             id,
-            thinking_levels: levels(),
+            thinking_levels: levels(config),
             service_tiers: Vec::new(),
             supports_image: true,
             // Learned from the child at turn end; the choice reads the cell.
@@ -105,8 +109,8 @@ pub(super) fn check_selection(
             tier.as_str()
         )));
     }
-    if !accepts(level) {
-        let allowed = levels();
+    if !accepts(config, level) {
+        let allowed = levels(config);
         let names: Vec<&str> = allowed
             .iter()
             .map(lofi_types::ThinkingLevel::as_str)
@@ -125,6 +129,7 @@ pub(super) struct ExternalBackend {
     name: String,
     model: Option<String>,
     config: lofi_types::BackendConfig,
+    driver: Arc<dyn CliDriver>,
     root: PathBuf,
     system_prompt: String,
     executor: ToolExecutor,
@@ -161,12 +166,14 @@ impl ExternalBackend {
         system_prompt: String,
         compaction: lofi_types::CompactionConfig,
     ) -> Self {
+        let driver = driver::for_config(&config);
         Self {
             live: Arc::new(Mutex::new((model.clone(), thinking.clone()))),
             // None means the backend default: the caller resolved the query.
             model,
             name,
             config,
+            driver,
             root,
             system_prompt,
             executor,
@@ -176,6 +183,13 @@ impl ExternalBackend {
             compaction,
             auto_continue: lofi_types::AutoContinuePolicy::default(),
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn with_driver(mut self, driver: Arc<dyn CliDriver>) -> Self {
+        self.driver = driver;
+        self
     }
 
     /// Apply the resolved auto-continue policy.
@@ -246,7 +260,7 @@ impl ExternalBackend {
         }
         let tx = spawn_worker(WorkerInit {
             name: self.name.clone(),
-            config: self.config.clone(),
+            driver: Arc::clone(&self.driver),
             root: self.root.clone(),
             // The child's system prompt comes from the backend, not from the
             // executor: a fork carries the role prompt its subagent was given.
@@ -281,7 +295,7 @@ impl Backend for ExternalBackend {
                 provider: self.name.clone(),
                 id: current.clone(),
                 name: current,
-                thinking_levels: levels(),
+                thinking_levels: self.driver.effort_levels(),
                 service_tiers: Vec::new(),
                 supports_image: true,
                 context_window: None,
@@ -385,6 +399,7 @@ impl Backend for ExternalBackend {
             name: self.name.clone(),
             model: model.clone(),
             config: self.config.clone(),
+            driver: Arc::clone(&self.driver),
             root: self.root.clone(),
             system_prompt: self.system_prompt.clone(),
             executor,
@@ -436,16 +451,9 @@ impl Backend for ExternalBackend {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
-        let lofi_types::BackendConfig::ClaudeCode { command, .. } = &self.config;
-        // One-shot evaluation runs with thinking off, matching Agent::complete.
-        super::oneshot::complete(
-            command,
-            &self.root,
-            self.model.as_deref(),
-            &lofi_types::ThinkingLevel::Off,
-            &request,
-        )
-        .await
+        self.driver
+            .complete(&self.root, self.model.as_deref(), &request)
+            .await
     }
 }
 
@@ -1278,6 +1286,279 @@ mod tests {
                         if id == "toolu_stream_1"
                 )),
                 "ToolEnd should correlate with streamed tool_use id"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[derive(Default)]
+    struct FakeDriverState {
+        opens: Mutex<Vec<(Option<String>, Option<String>)>>,
+        set_models: Mutex<Vec<Option<String>>>,
+        prompts: Mutex<Vec<String>>,
+        closed: std::sync::atomic::AtomicUsize,
+        block_next: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+    }
+
+    struct FakeDriver {
+        state: Arc<FakeDriverState>,
+    }
+
+    struct FakeSession {
+        id: String,
+        model: Option<String>,
+        closed: bool,
+        initialized: bool,
+        prompt_written: bool,
+        state: Arc<FakeDriverState>,
+    }
+
+    #[async_trait]
+    impl super::driver::CliSession for FakeSession {
+        fn session_id(&self) -> &str {
+            &self.id
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            Some(200_000)
+        }
+
+        fn stop_reason(&self) -> Option<lofi_types::StopReason> {
+            Some(lofi_types::StopReason::EndTurn)
+        }
+
+        fn is_closed(&mut self) -> bool {
+            self.closed
+        }
+
+        fn is_initialized(&self) -> bool {
+            self.initialized
+        }
+
+        fn prompt_written(&self) -> bool {
+            self.prompt_written
+        }
+
+        fn take_cost(&mut self) -> f64 {
+            0.0
+        }
+
+        async fn set_model(&mut self, model: Option<&str>) -> Result<()> {
+            let next = model.map(str::to_owned);
+            if self.model != next {
+                self.model.clone_from(&next);
+                self.state.set_models.lock().unwrap().push(next);
+            }
+            Ok(())
+        }
+
+        async fn prompt(
+            &mut self,
+            prompt: &str,
+            _images: &[lofi_types::ContentBlock],
+            _executor: ToolExecutor,
+            context: crate::agent::ToolCallContext,
+            _controls: super::driver::PromptControls,
+        ) -> Result<super::driver::PromptOutcome> {
+            self.initialized = true;
+            self.prompt_written = true;
+            self.state.prompts.lock().unwrap().push(prompt.to_string());
+            if self
+                .state
+                .block_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.state.entered.notify_waiters();
+                if let Some(cancel) = context.cancel {
+                    let notify = crate::agent::turn_session::lookup_cancel_notify(&cancel);
+                    crate::agent::turn_session::wait_cancel_flag(&cancel, notify.as_ref()).await;
+                }
+                return Err(Error::Cancelled);
+            }
+            if let Some(events) = &context.events {
+                events
+                    .forward(crate::agent::AgentEvent::Text("in-memory reply".into()))
+                    .await?;
+            }
+            Ok(super::driver::PromptOutcome::Completed("end_turn".into()))
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            if !self.closed {
+                self.closed = true;
+                self.state
+                    .closed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl super::driver::CliDriver for FakeDriver {
+        fn effort_levels(&self) -> Vec<lofi_types::ThinkingLevel> {
+            vec![
+                lofi_types::ThinkingLevel::Low,
+                lofi_types::ThinkingLevel::High,
+            ]
+        }
+
+        async fn open_session(
+            &self,
+            _root: &std::path::Path,
+            resume: Option<&str>,
+            model: Option<&str>,
+            _effort: lofi_types::ThinkingLevel,
+            _system_prompt: &str,
+        ) -> Result<Box<dyn super::driver::CliSession>> {
+            let mut opens = self.state.opens.lock().unwrap();
+            let id = format!("fake-session-{}", opens.len() + 1);
+            opens.push((resume.map(str::to_owned), model.map(str::to_owned)));
+            Ok(Box::new(FakeSession {
+                id,
+                model: model.map(str::to_owned),
+                closed: false,
+                initialized: false,
+                prompt_written: false,
+                state: Arc::clone(&self.state),
+            }))
+        }
+
+        async fn complete(
+            &self,
+            _root: &std::path::Path,
+            _model: Option<&str>,
+            _request: &CompletionRequest,
+        ) -> Result<Completion> {
+            Ok(Completion {
+                text: "fake-complete".into(),
+                usage: lofi_types::Usage::default(),
+                cost: None,
+            })
+        }
+    }
+
+    async fn run_simple_turn(
+        backend: &BackendRef,
+        messages: &mut Vec<lofi_types::Message>,
+        text: &str,
+        cursor: Option<&crate::session::store::SessionCursor>,
+    ) {
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(32);
+        let drain = tokio::spawn(async move { while ev_rx.recv().await.is_some() {} });
+        backend
+            .run_turn(
+                messages,
+                TurnRequest::prompt(text.into(), lofi_types::PromptKind::User),
+                ev_tx,
+                cursor,
+                RunControls::default(),
+            )
+            .await
+            .unwrap();
+        let _ = drain.await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_driver_exercises_reuse_transfer_and_abandonment() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(FakeDriverState::default());
+            let driver: Arc<dyn super::driver::CliDriver> = Arc::new(FakeDriver {
+                state: Arc::clone(&state),
+            });
+            let store = crate::session::store::SessionStore::new(dir.path().join("sessions"));
+            let cursor = store
+                .create_cursor(dir.path(), &"claude/model-a".into())
+                .unwrap();
+
+            let backend: BackendRef = Arc::new(
+                ExternalBackend::configure(
+                    "claude".into(),
+                    lofi_types::BackendConfig::ClaudeCode {
+                        command: "unused-in-memory".into(),
+                        model: Some("model-a".into()),
+                        models: vec!["model-a".into(), "model-b".into()],
+                        context_window: Some(200_000),
+                        frame_idle_timeout_ms: None,
+                        thinking_level: None,
+                        auto_continue: lofi_types::AutoContinueConfig::default(),
+                    },
+                    dir.path().to_path_buf(),
+                    ToolExecutor::in_memory(dir.path()),
+                    Some("model-a".into()),
+                    lofi_types::ThinkingLevel::Off,
+                    "You are lofi".into(),
+                    lofi_types::CompactionConfig::default(),
+                )
+                .with_driver(driver),
+            );
+
+            // Turn 1 opens session 1; turn 2 switches models in place on the same session.
+            let mut messages = Vec::new();
+            run_simple_turn(&backend, &mut messages, "turn 1", Some(&cursor)).await;
+            assert_eq!(state.opens.lock().unwrap().len(), 1);
+
+            let switched = backend.with_selection("claude/model-b").unwrap();
+            run_simple_turn(&switched, &mut messages, "turn 2", Some(&cursor)).await;
+            assert_eq!(state.opens.lock().unwrap().len(), 1);
+            assert_eq!(
+                *state.set_models.lock().unwrap(),
+                vec![Some("model-b".to_string())]
+            );
+
+            // Turn 3 on a new session cursor transfers prior conversation history.
+            let second_cursor = store
+                .create_cursor(dir.path(), &"claude/model-b".into())
+                .unwrap();
+            run_simple_turn(&switched, &mut messages, "turn 3", Some(&second_cursor)).await;
+            assert_eq!(state.opens.lock().unwrap().len(), 2);
+            let third_prompt = state.prompts.lock().unwrap()[2].clone();
+            assert!(
+                third_prompt.contains("<conversation_history>") && third_prompt.contains("turn 1"),
+                "expected history transfer in prompt: {third_prompt}"
+            );
+
+            // Turn 4 dropped mid-exchange closes the abandoned session and clears its binding.
+            let closed_before = state.closed.load(std::sync::atomic::Ordering::SeqCst);
+            state
+                .block_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let entered = state.entered.notified();
+            tokio::pin!(entered);
+            let abandoned = switched.clone();
+            let mut abandoned_messages = messages.clone();
+            let abandon_cursor = second_cursor.clone();
+            let turn_task = tokio::spawn(async move {
+                let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(32);
+                let _ = abandoned
+                    .run_turn(
+                        &mut abandoned_messages,
+                        TurnRequest::prompt("turn 4".into(), lofi_types::PromptKind::User),
+                        ev_tx,
+                        Some(&abandon_cursor),
+                        RunControls::default(),
+                    )
+                    .await;
+            });
+            entered.await;
+            turn_task.abort();
+            let _ = turn_task.await;
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while state.closed.load(std::sync::atomic::Ordering::SeqCst) <= closed_before {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                super::super::binding::read_binding(&second_cursor)
+                    .unwrap()
+                    .is_none(),
+                "abandoned turn should clear its saved binding"
             );
         })
         .await
