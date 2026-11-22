@@ -704,18 +704,10 @@ impl App {
             LifecycleResult::HardCompact(result) => {
                 match self.present_hard_compact_result(result) {
                     HardCompactOutcome::Compacted(_) => true,
-                    HardCompactOutcome::Cooldown => {
-                        self.notify(
-                            NotifyKind::Warn,
-                            "context exceeded the hard cap too soon after a compaction; cannot continue",
-                        );
-                        false
-                    }
-                    HardCompactOutcome::NotEnoughHistory => {
-                        self.notify(
-                            NotifyKind::Warn,
-                            "could not compact at the hard cap; cannot continue",
-                        );
+                    other => {
+                        if let Some(reason) = other.blocked_reason() {
+                            self.notify(NotifyKind::Warn, reason);
+                        }
                         false
                     }
                 }

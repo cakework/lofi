@@ -978,3 +978,130 @@ fn unresolved_explicit_values_fail_naming_the_provider_and_field() {
     }
     assert_eq!(server.request_count(), 0);
 }
+
+#[test]
+fn print_mode_hard_compacts_and_continues_mid_turn() {
+    use crate::support::{text_response_with_usage, tool_response_with_usage};
+    let filler = "p".repeat(400);
+    let server = MockServer::start(vec![
+        tool_response_with_usage("c1", &format!("return '{filler}-1';"), 200),
+        tool_response_with_usage("c2", &format!("return '{filler}-2';"), 400),
+        tool_response_with_usage("c3", &format!("return '{filler}-3';"), 850),
+        text_response_with_usage("print continued after compact", 250),
+    ]);
+    let fixture = Fixture::new(&server);
+    let base = std::fs::read_to_string(&fixture.config).unwrap().replacen(
+        "context_window = 100000",
+        "context_window = 1000",
+        1,
+    );
+    std::fs::write(
+        &fixture.config,
+        format!(
+            "{base}\n[compaction]\nreserved_context_tokens = 200\nmin_messages_between_hard_compacts = 2\n"
+        ),
+    )
+    .unwrap();
+    let summary_path = fixture.workspace.join("hard-compact-summary.json");
+
+    let output = fixture.output(&[
+        "--print",
+        "do multi-step work",
+        "--summary",
+        summary_path.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "print mode must compact and continue instead of failing: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("print continued after compact"),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("compacted"),
+        "stderr should note compaction: {stderr}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+    assert_eq!(summary["ok"], serde_json::json!(true), "{summary}");
+    assert_eq!(
+        summary["status"],
+        serde_json::json!("completed"),
+        "{summary}"
+    );
+    assert_eq!(summary["rounds"], serde_json::json!(4), "{summary}");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[3].body.contains("This summary captures work done"),
+        "post-compaction request must send the compacted summary: {}",
+        requests[3].body
+    );
+}
+
+#[test]
+fn print_mode_session_soft_auto_compacts_for_continue() {
+    use crate::support::{text_response_with_usage, tool_response_with_usage};
+    let filler = "q".repeat(400);
+    let server = MockServer::start(vec![
+        tool_response_with_usage("c1", &format!("return '{filler}-1';"), 150),
+        tool_response_with_usage("c2", &format!("return '{filler}-2';"), 250),
+        tool_response_with_usage("c3", &format!("return '{filler}-3';"), 350),
+        text_response_with_usage("first print turn done", 600),
+        text_response_with_usage("continued print turn done", 200),
+    ]);
+    let fixture = Fixture::new(&server);
+    let base = std::fs::read_to_string(&fixture.config).unwrap().replacen(
+        "context_window = 100000",
+        "context_window = 1000",
+        1,
+    );
+    std::fs::write(
+        &fixture.config,
+        format!(
+            "{base}\n[compaction]\nreserved_context_tokens = 200\n\n[compaction.auto]\nenable = true\nmax_context_tokens = 500\n"
+        ),
+    )
+    .unwrap();
+
+    let first = fixture.output(&["--print", "first task", "--session"]);
+    assert!(
+        first.status.success(),
+        "first turn failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("first print turn done"),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let raw_events = fixture.events();
+    let events = event_types(&raw_events);
+    assert!(
+        events.contains(&"compaction"),
+        "expected soft auto-compaction record in session transcript: {events:?}"
+    );
+
+    let second = fixture.output(&["--print", "follow up", "--continue"]);
+    assert!(
+        second.status.success(),
+        "continued turn failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("continued print turn done"),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests[4].body.contains("This summary captures work done"),
+        "continued print turn must see soft-compacted summary: {}",
+        requests[4].body
+    );
+}

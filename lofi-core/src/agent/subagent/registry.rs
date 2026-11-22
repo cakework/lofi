@@ -789,6 +789,8 @@ pub(in crate::agent) struct Rollup {
     cache_write: u64,
     pub(super) cost: f64,
     turn_cost: f64,
+    last_usage: Option<lofi_types::Usage>,
+    context_window: Option<u64>,
 }
 
 impl Rollup {
@@ -812,11 +814,29 @@ impl Rollup {
         // billed on top of the run's other turns.
         self.cost += cost - self.turn_cost;
         self.turn_cost = cost;
+        self.last_usage = Some(*usage);
     }
 
     /// Start another turn of the same run: its cost counts from zero again.
     pub(super) fn start_turn(&mut self) {
         self.turn_cost = 0.0;
+        self.last_usage = None;
+    }
+
+    pub(super) fn note_last_usage(&mut self, usage: lofi_types::Usage) {
+        self.last_usage = Some(usage);
+    }
+
+    pub(super) fn last_usage(&self) -> Option<lofi_types::Usage> {
+        self.last_usage
+    }
+
+    pub(super) fn set_context_window(&mut self, window: u64) {
+        self.context_window = Some(window);
+    }
+
+    pub(super) fn context_window(&self) -> Option<u64> {
+        self.context_window
     }
 
     /// Total tokens across every category the provider reports.
@@ -928,6 +948,8 @@ impl From<&lofi_types::RunSpend> for Rollup {
             cache_write: spent.usage.cache_write_tokens,
             cost: spent.cost,
             turn_cost: 0.0,
+            last_usage: None,
+            context_window: None,
         }
     }
 }

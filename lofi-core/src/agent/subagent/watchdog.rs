@@ -195,7 +195,7 @@ pub(super) async fn run_under_watchdog(
     tx: mpsc::Sender<AgentEvent>,
     cursor: Option<&SessionCursor>,
     cancel: &Arc<AtomicBool>,
-    prompt: String,
+    request: TurnRequest,
     progress: &Arc<RunProgress>,
     limits: &Deadlines,
 ) -> (Result<TurnOutcome>, Option<(Expiry, Option<String>)>) {
@@ -214,7 +214,6 @@ pub(super) async fn run_under_watchdog(
     // prompt, so it would sit in the transcript and replay stale on a resume.
     // The watchdog enforces them, and the settle report names the one that
     // fired.
-    let request = TurnRequest::prompt(prompt, PromptKind::Task);
     let turn = backend.run_turn(
         messages,
         // The task is parent-written, so it must not read as user

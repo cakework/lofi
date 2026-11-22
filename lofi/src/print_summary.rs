@@ -47,6 +47,9 @@ pub(crate) struct PrintSummary {
     usage: Usage,
     /// The turn's accumulated USD cost, as last reported.
     cost: f64,
+    /// USD cost accumulated in earlier segments of this run before a
+    /// `TurnContinue` reset the per-turn cost counter to zero.
+    prior_cost: f64,
     /// Child spend, as deltas over the run.
     subagents: Usage,
     subagent_cost: f64,
@@ -81,10 +84,13 @@ impl PrintSummary {
 
     pub(crate) fn note(&mut self, event: &AgentEvent) {
         match event {
+            AgentEvent::TurnContinue => {
+                self.prior_cost = self.cost;
+            }
             AgentEvent::RoundUsage { cost, usage } => {
                 self.rounds += 1;
                 add_usage(&mut self.usage, usage);
-                self.cost = *cost;
+                self.cost = self.prior_cost + *cost;
             }
             AgentEvent::ToolStart { .. } => self.tool_calls += 1,
             AgentEvent::RetryStart { .. } => self.retries += 1,
@@ -100,7 +106,7 @@ impl PrintSummary {
             } => {
                 self.model = Some(model.clone());
                 self.status = Status::Completed;
-                self.cost = *cost;
+                self.cost = self.prior_cost + *cost;
                 self.stop_reason = *stop_reason;
             }
             AgentEvent::TurnFailed {
@@ -108,23 +114,23 @@ impl PrintSummary {
             } => {
                 self.model = Some(model.clone());
                 self.status = Status::Failed;
-                self.cost = *cost;
+                self.cost = self.prior_cost + *cost;
                 self.error = Some(error.clone());
             }
             AgentEvent::TurnCancelled { model, cost, .. } => {
                 self.model = Some(model.clone());
                 self.status = Status::Cancelled;
-                self.cost = *cost;
+                self.cost = self.prior_cost + *cost;
             }
             // The turn stopped at the context cap without settling: the
             // record keeps the spend so far, and names the run complete only
             // when the model had already stopped on its own.
             AgentEvent::ContextPressure { resume, cost, .. } => {
-                self.cost = *cost;
+                self.cost = self.prior_cost + *cost;
                 // A turn that stopped on its own had nothing left to continue:
                 // the cap only kept its kept context from being compacted, and
-                // the run is complete. A turn that asked to resume is cut
-                // short, and the caller fails it.
+                // the run is complete. A turn that asked to resume continues
+                // after compaction or fails if compaction is ineligible.
                 if !resume {
                     self.status = Status::Completed;
                 }
@@ -397,5 +403,57 @@ mod tests {
         assert_eq!(record["ok"], json!(false), "{record}");
         assert_eq!(record["status"], json!("incomplete"), "{record}");
         assert_eq!(record["rounds"], json!(1), "{record}");
+    }
+
+    #[test]
+    fn continuation_after_context_pressure_accumulates_cost() {
+        let mut summary = summary();
+        summary.note(&AgentEvent::RoundUsage {
+            cost: 0.05,
+            usage: Usage {
+                input_tokens: 500,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        });
+        summary.note(&AgentEvent::ContextPressure {
+            resume: true,
+            elapsed_ms: 20,
+            cost: 0.05,
+            usage: Usage {
+                input_tokens: 500,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        });
+        summary.note(&AgentEvent::TurnContinue);
+        summary.note(&AgentEvent::RoundUsage {
+            cost: 0.03,
+            usage: Usage {
+                input_tokens: 200,
+                output_tokens: 25,
+                ..Usage::default()
+            },
+        });
+        summary.note(&AgentEvent::TurnEnd {
+            model: model(),
+            elapsed_ms: 15,
+            cost: 0.03,
+            usage: Usage {
+                input_tokens: 200,
+                output_tokens: 25,
+                ..Usage::default()
+            },
+            stop_reason: Some(StopReason::EndTurn),
+        });
+
+        let record = summary.record(35);
+        assert_eq!(record["ok"], json!(true), "{record}");
+        assert_eq!(record["status"], json!("completed"), "{record}");
+        assert_eq!(record["rounds"], json!(2), "{record}");
+        assert_eq!(record["usage"]["input_tokens"], json!(700), "{record}");
+        assert_eq!(record["usage"]["output_tokens"], json!(75), "{record}");
+        let cost = record["cost"].as_f64().unwrap();
+        assert!((cost - 0.08).abs() < 1e-9, "expected 0.08, got {cost}");
     }
 }

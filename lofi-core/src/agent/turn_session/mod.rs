@@ -74,6 +74,14 @@ impl TurnRequest {
             notices: Vec::new(),
         }
     }
+
+    #[must_use]
+    pub fn continue_turn() -> Self {
+        Self {
+            input: TurnInput::Continue,
+            notices: Vec::new(),
+        }
+    }
 }
 
 #[derive(Default)]

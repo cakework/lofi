@@ -204,12 +204,22 @@ fn fresh_transcript(
     })
 }
 
-/// Runs one non-interactive turn and folds its events into `summary`.
-#[allow(clippy::too_many_lines)]
+/// Result of running one turn segment in print mode.
+struct SegmentOutcome {
+    turn: lofi_core::session::recorder::TurnOutcome,
+    last_usage: Option<lofi_types::Usage>,
+    observed_window: Option<u64>,
+}
+
+/// Runs one non-interactive turn (compacting and continuing on hard-cap
+/// context pressure just like the interactive TUI) and folds its events into
+/// `summary`.
 async fn run_print_turn(
     opts: &PrintOptions,
     summary: &std::cell::RefCell<PrintSummary>,
 ) -> Result<()> {
+    use lofi_core::session::recorder::TurnOutcome;
+
     let env = lofi_core::config_loader::parse_env_specs(&opts.env)?;
     // A subagent started by this run keeps no transcript of its own: the
     // parent's record carries its spend, and no one resumes a child.
@@ -237,21 +247,76 @@ async fn run_print_turn(
         summary.borrow_mut().set_session(id);
     }
 
+    let mut lifecycle =
+        lofi_core::AgentLifecycle::new(agent.compaction(), agent.context_window().unwrap_or(0));
+    lifecycle.set_workspace_root(opts.root.clone());
+
+    let cursor = transcript.as_ref().map(PrintTranscript::cursor);
+    let mut request =
+        lofi_core::TurnRequest::prompt(opts.prompt.clone(), lofi_types::PromptKind::User);
+    loop {
+        let segment =
+            run_print_segment(agent.as_ref(), &mut messages, request, cursor, summary).await?;
+        match lifecycle.after_turn_segment(
+            &mut messages,
+            &segment.turn,
+            segment.observed_window,
+            cursor,
+            agent.system_prompt(),
+            false,
+        ) {
+            lofi_core::CompactionAction::Continue(compaction) => {
+                eprintln!("compacted {} messages", compaction.summarized_count);
+                request = lofi_core::TurnRequest::continue_turn();
+            }
+            lofi_core::CompactionAction::Failed(error) => {
+                let _ = std::io::stdout().write_all(b"\n");
+                eprintln!("error: {error}");
+                return Err(error);
+            }
+            lofi_core::CompactionAction::Done => {
+                // Only persisted print sessions have a next turn (--continue or
+                // --resume); ephemeral runs exit immediately after this return.
+                let should_settle = cursor.is_some()
+                    || matches!(segment.turn, TurnOutcome::ContextPressure { resume: false });
+                if should_settle {
+                    let settled = lifecycle.settle_compaction(
+                        &mut messages,
+                        &segment.turn,
+                        segment.last_usage,
+                        cursor,
+                        agent.system_prompt(),
+                        false,
+                    );
+                    if let Some(compaction) = settled.compaction {
+                        eprintln!("compacted {} messages", compaction.summarized_count);
+                    }
+                    if let Some(warning) = settled.warning {
+                        eprintln!("warning: {warning}");
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Drive one backend turn and its stdio consumer concurrently on the current task.
+#[allow(clippy::too_many_lines)]
+async fn run_print_segment(
+    agent: &dyn lofi_core::backend::Backend,
+    messages: &mut Vec<lofi_types::Message>,
+    request: lofi_core::TurnRequest,
+    cursor: Option<&lofi_core::session::store::SessionCursor>,
+    summary: &std::cell::RefCell<PrintSummary>,
+) -> Result<SegmentOutcome> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
 
-    let prompt = opts.prompt.clone();
     let agent_run = agent.run_turn(
-        &mut messages,
-        lofi_core::TurnRequest {
-            input: lofi_core::TurnInput::Prompt {
-                text: prompt,
-                kind: lofi_types::PromptKind::User,
-                attachments: Vec::new(),
-            },
-            notices: Vec::new(),
-        },
+        messages,
+        request,
         tx,
-        transcript.as_ref().map(PrintTranscript::cursor),
+        cursor,
         lofi_core::RunControls {
             cancel: None,
             preempt: None,
@@ -265,7 +330,8 @@ async fn run_print_turn(
     let consumer = async {
         let mut stdout = std::io::stdout().lock();
         let mut stderr = std::io::stderr().lock();
-        let mut context_pressure = false;
+        let mut last_usage: Option<lofi_types::Usage> = None;
+        let mut observed_window: Option<u64> = None;
         loop {
             let Some(ev) = rx.recv().await else {
                 break;
@@ -273,6 +339,16 @@ async fn run_print_turn(
             summary.borrow_mut().note(&ev);
             let write_res: std::io::Result<()> = match ev {
                 AgentEvent::Text(delta) => stdout.write_all(delta.as_bytes()),
+                AgentEvent::RoundUsage { usage, .. } => {
+                    last_usage = Some(usage);
+                    Ok(())
+                }
+                AgentEvent::ContextReported { context } => {
+                    if let Some(window) = context.and_then(|c| c.size) {
+                        observed_window = Some(window);
+                    }
+                    Ok(())
+                }
                 AgentEvent::Thinking(_)
                 | AgentEvent::ThinkingEnd { .. }
                 | AgentEvent::ToolEnd { .. }
@@ -281,10 +357,8 @@ async fn run_print_turn(
                 | AgentEvent::ToolInputDelta { .. }
                 | AgentEvent::RoundCommitted { .. }
                 | AgentEvent::TurnCommitted { .. }
-                | AgentEvent::RoundUsage { .. }
                 | AgentEvent::TurnUsage { .. }
                 | AgentEvent::SubagentUsage { .. }
-                | AgentEvent::ContextReported { .. }
                 | AgentEvent::ModelReported { .. }
                 | AgentEvent::RetryEnd { .. }
                 | AgentEvent::RunStart
@@ -296,16 +370,11 @@ async fn run_print_turn(
                 | AgentEvent::UserShell { .. } => Ok(()),
                 AgentEvent::ContextPressure { resume, .. } => {
                     if resume {
-                        context_pressure = true;
-                        let _ = stdout.write_all(b"\n");
-                        writeln!(
-                            stderr,
-                            "error: context limit reached; use the interactive TUI to compact and continue"
-                        )
-                    } else {
-                        // The turn already stopped on its own: a one-shot
-                        // run has nothing to continue.
+                        // Outer loop compacts and continues silently.
                         Ok(())
+                    } else {
+                        // The turn already finished with its final text.
+                        stdout.write_all(b"\n")
                     }
                 }
                 AgentEvent::RetryStart {
@@ -321,7 +390,10 @@ async fn run_print_turn(
                 AgentEvent::Error(msg) => writeln!(stderr, "error: {msg}"),
                 AgentEvent::ToolStart { name, .. } => writeln!(stderr, "[{name}]"),
                 AgentEvent::ToolInput { code, .. } => writeln!(stderr, "{code}"),
-                AgentEvent::TurnEnd { .. } => stdout.write_all(b"\n"),
+                AgentEvent::TurnEnd { usage, .. } => {
+                    last_usage = Some(usage);
+                    stdout.write_all(b"\n")
+                }
                 AgentEvent::TurnFailed { error, .. } => {
                     let _ = stdout.write_all(b"\n");
                     writeln!(stderr, "error: {error}")
@@ -341,12 +413,7 @@ async fn run_print_turn(
         }
         stdout.flush()?;
         stderr.flush()?;
-        if context_pressure {
-            return Err(Error::State(
-                "context limit reached in non-interactive mode".to_string(),
-            ));
-        }
-        Ok::<(), Error>(())
+        Ok::<(Option<lofi_types::Usage>, Option<u64>), Error>((last_usage, observed_window))
     };
 
     // Drive agent and consumer concurrently. The agent future is not `Send`,
@@ -357,10 +424,17 @@ async fn run_print_turn(
     // the consumer so buffered events flush before returning.
     tokio::pin!(agent_run, consumer);
     // Neither branch returns early: a failed run still writes its record.
-    let result = tokio::select! {
+    tokio::select! {
         biased;
         consumer_res = &mut consumer => match consumer_res {
-            Ok(()) => (&mut agent_run).await.map(|_| ()),
+            Ok((last_usage, observed_window)) => {
+                let turn = (&mut agent_run).await?;
+                Ok(SegmentOutcome {
+                    turn,
+                    last_usage,
+                    observed_window,
+                })
+            }
             Err(e) => Err(e),
         },
         agent_res = &mut agent_run => {
@@ -368,7 +442,14 @@ async fn run_print_turn(
             // Propagate the consumer result so a failed terminal write or
             // flush is not silently swallowed.
             match (&mut consumer).await {
-                Ok(()) => agent_res.map(|_| ()),
+                Ok((last_usage, observed_window)) => {
+                    let turn = agent_res?;
+                    Ok(SegmentOutcome {
+                        turn,
+                        last_usage,
+                        observed_window,
+                    })
+                }
                 // A run that failed after the drain is reported with its own
                 // error: the consumer's latch states the stop that came first,
                 // and would hide the failure that ended the run behind it.
@@ -378,6 +459,5 @@ async fn run_print_turn(
                 },
             }
         }
-    };
-    result
+    }
 }

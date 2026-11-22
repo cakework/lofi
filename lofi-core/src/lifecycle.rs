@@ -11,7 +11,7 @@ use crate::compact::{compact, compacted_history, CompactOptions, Compaction};
 use crate::recall::{
     recall, recall_cursor, CompactionTarget, RecallOutcome, RecallRequest, RecallScope,
 };
-use crate::session::recorder::SessionRecord;
+use crate::session::recorder::{SessionRecord, TurnOutcome};
 use crate::session::replay::OutstandingJob;
 use crate::session::store::{CompactionCounts, SessionCursor, SessionIndexEntry};
 use crate::session::view::SessionView;
@@ -24,6 +24,11 @@ use crate::{CodeCompactionHook, Error, Result};
 pub struct AgentLifecycle {
     history: Arc<Mutex<Vec<Message>>>,
     leased_stats: Arc<Mutex<Option<HistoryStats>>>,
+    /// Assistant message count retained by the most recent in-memory compaction.
+    /// `SessionView::from_memory` synthesizes message events without compaction
+    /// markers, so this floor enforces `min_messages_between_hard_compacts`
+    /// when no durable `SessionCursor` is attached.
+    in_memory_compact_assistant_floor: Arc<Mutex<Option<usize>>>,
     generation: Arc<AtomicU64>,
     compaction: CompactionConfig,
     context_window: u64,
@@ -80,6 +85,41 @@ pub enum HardCompactOutcome {
     NotEnoughHistory,
 }
 
+impl HardCompactOutcome {
+    /// Human-readable reason hard compaction did not proceed, or `None` when
+    /// history was compacted.
+    #[must_use]
+    pub fn blocked_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Compacted(_) => None,
+            Self::Cooldown => {
+                Some("context exceeded the hard cap too soon after a compaction; cannot continue")
+            }
+            Self::NotEnoughHistory => Some("could not compact at the hard cap; cannot continue"),
+        }
+    }
+}
+
+/// Decision after one turn segment ends, telling a host whether to continue
+/// with `TurnRequest::continue_turn()`, finish the loop, or fail.
+#[derive(Debug)]
+pub enum CompactionAction {
+    /// Mid-turn hard compaction succeeded; continue from the rewritten history.
+    Continue(Compaction),
+    /// No continuation is required (the turn settled or stopped for another reason).
+    Done,
+    /// The turn requested continuation (`resume: true`) but compaction was
+    /// blocked or failed.
+    Failed(Error),
+}
+
+/// Result of post-turn compaction after a turn settles cleanly.
+#[derive(Debug, Default)]
+pub struct SettledCompaction {
+    pub compaction: Option<Compaction>,
+    pub warning: Option<String>,
+}
+
 /// Estimated retained allocations for the core-owned conversation history.
 ///
 /// This accounts for collection and string capacities owned by messages. It
@@ -103,6 +143,7 @@ impl AgentLifecycle {
         Self {
             history: Arc::new(Mutex::new(Vec::new())),
             leased_stats: Arc::new(Mutex::new(None)),
+            in_memory_compact_assistant_floor: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             compaction,
             context_window,
@@ -182,6 +223,9 @@ impl AgentLifecycle {
         self.generation.fetch_add(1, Ordering::Release);
         if let Ok(mut cached) = self.leased_stats.lock() {
             *cached = None;
+        }
+        if let Ok(mut floor) = self.in_memory_compact_assistant_floor.lock() {
+            *floor = None;
         }
         if history.capacity() >= messages.len() {
             history.clear();
@@ -292,6 +336,9 @@ impl AgentLifecycle {
         if let Ok(mut cached) = self.leased_stats.lock() {
             *cached = None;
         }
+        if let Ok(mut floor) = self.in_memory_compact_assistant_floor.lock() {
+            *floor = None;
+        }
         history.clear();
         Ok(())
     }
@@ -399,6 +446,15 @@ impl AgentLifecycle {
         if let Ok(mut cached) = self.leased_stats.lock() {
             *cached = None;
         }
+        if cursor.is_none() {
+            let kept_assistants = new_history
+                .iter()
+                .filter(|message| message.role == Role::Assistant)
+                .count();
+            if let Ok(mut floor) = self.in_memory_compact_assistant_floor.lock() {
+                *floor = Some(kept_assistants);
+            }
+        }
         *history = new_history;
         drop(history);
         // /compact can finish with no following agent run.
@@ -457,6 +513,26 @@ impl AgentLifecycle {
         let Some(events) = self.compaction_events(None)? else {
             return Ok(HardCompactOutcome::NotEnoughHistory);
         };
+        if let Some(floor) = self
+            .in_memory_compact_assistant_floor
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+        {
+            let assistants = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.kind,
+                        SessionEventKind::Message(message) if message.role == Role::Assistant
+                    )
+                })
+                .count();
+            if assistants.saturating_sub(floor) < self.compaction.min_messages_between_hard_compacts
+            {
+                return Ok(HardCompactOutcome::Cooldown);
+            }
+        }
         if assistant_messages_since_last_compact(&events)
             < self.compaction.min_messages_between_hard_compacts
         {
@@ -468,6 +544,120 @@ impl AgentLifecycle {
                 None => HardCompactOutcome::NotEnoughHistory,
             },
         )
+    }
+
+    /// Evaluate mid-turn hard-cap compaction after one turn segment finishes.
+    ///
+    /// Updates the tracked context window when reported, compacts `messages`
+    /// in place when `outcome` is `TurnOutcome::ContextPressure { resume: true }`,
+    /// and returns whether the host should continue with
+    /// `TurnRequest::continue_turn()`, stop looping, or fail.
+    pub fn after_turn_segment(
+        &mut self,
+        messages: &mut Vec<Message>,
+        outcome: &TurnOutcome,
+        observed_window: Option<u64>,
+        cursor: Option<&SessionCursor>,
+        system_prompt: &str,
+        strip_leading_system: bool,
+    ) -> CompactionAction {
+        if let Some(window) = observed_window {
+            self.set_context_window(window);
+        }
+        if !matches!(outcome, TurnOutcome::ContextPressure { resume: true }) {
+            return CompactionAction::Done;
+        }
+        match self.compact_messages_with(messages, strip_leading_system, |lifecycle| {
+            lifecycle.hard_compact(cursor, system_prompt)
+        }) {
+            Ok(HardCompactOutcome::Compacted(compaction)) => CompactionAction::Continue(compaction),
+            Ok(outcome) => CompactionAction::Failed(Error::State(
+                outcome.blocked_reason().unwrap_or_default().to_string(),
+            )),
+            Err(error) => CompactionAction::Failed(error),
+        }
+    }
+
+    /// Apply post-turn compaction after a turn settles cleanly: hard compaction
+    /// for `ContextPressure { resume: false }`, or soft auto-compaction for
+    /// `TurnOutcome::Finished` when `last_usage` crosses the soft threshold.
+    pub fn settle_compaction(
+        &mut self,
+        messages: &mut Vec<Message>,
+        outcome: &TurnOutcome,
+        last_usage: Option<Usage>,
+        cursor: Option<&SessionCursor>,
+        system_prompt: &str,
+        strip_leading_system: bool,
+    ) -> SettledCompaction {
+        match outcome {
+            TurnOutcome::ContextPressure { resume: false } => {
+                match self.compact_messages_with(messages, strip_leading_system, |lifecycle| {
+                    lifecycle.hard_compact(cursor, system_prompt)
+                }) {
+                    Ok(HardCompactOutcome::Compacted(compaction)) => SettledCompaction {
+                        compaction: Some(compaction),
+                        warning: None,
+                    },
+                    Ok(outcome) => SettledCompaction {
+                        compaction: None,
+                        warning: outcome.blocked_reason().map(str::to_string),
+                    },
+                    Err(error) => SettledCompaction {
+                        compaction: None,
+                        warning: Some(error.to_string()),
+                    },
+                }
+            }
+            TurnOutcome::Finished => {
+                let Some(usage) = last_usage else {
+                    return SettledCompaction::default();
+                };
+                if !self.should_auto_compact(usage) {
+                    return SettledCompaction::default();
+                }
+                match self.compact_messages_with(messages, strip_leading_system, |lifecycle| {
+                    lifecycle.auto_compact(usage, cursor, system_prompt)
+                }) {
+                    Ok(compaction) => SettledCompaction {
+                        compaction,
+                        warning: None,
+                    },
+                    Err(error) => SettledCompaction {
+                        compaction: None,
+                        warning: Some(format!("auto-compaction failed: {error}")),
+                    },
+                }
+            }
+            _ => SettledCompaction::default(),
+        }
+    }
+
+    /// Move caller-owned `messages` through `lease_history` so compaction
+    /// preserves in-memory cooldown state without cloning the vector.
+    fn compact_messages_with<T>(
+        &mut self,
+        messages: &mut Vec<Message>,
+        strip_leading_system: bool,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        {
+            let mut lease = self.lease_history();
+            *lease = std::mem::take(messages);
+        }
+        let outcome = run(self);
+        {
+            let mut lease = self.lease_history();
+            *messages = std::mem::take(&mut *lease);
+        }
+        if strip_leading_system
+            && messages
+                .first()
+                .is_some_and(|message| message.role == Role::System)
+        {
+            messages.remove(0);
+        }
+        outcome
     }
 
     /// Execute recall against the durable session when present, otherwise the
@@ -1439,6 +1629,193 @@ mod tests {
         assert!(
             cleared.estimated_retained_bytes < stats.estimated_retained_bytes,
             "clearing drops nested allocations while retaining at most the outer vector: {cleared:?}"
+        );
+    }
+
+    #[test]
+    fn in_memory_hard_compact_enforces_cooldown() {
+        let compaction = CompactionConfig {
+            min_messages_between_hard_compacts: 2,
+            ..CompactionConfig::default()
+        };
+        let mut lifecycle = AgentLifecycle::new(compaction, 1_000);
+        for turn in 0..5 {
+            lifecycle
+                .push_message(Message {
+                    origin: None,
+                    role: Role::User,
+                    blocks: vec![ContentBlock::Text {
+                        text: format!("user turn {turn} with enough text to compact"),
+                    }],
+                    kind: PromptKind::default(),
+                })
+                .unwrap();
+            lifecycle
+                .push_message(Message {
+                    origin: None,
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::Text {
+                        text: format!("assistant reply {turn} with enough text to compact"),
+                    }],
+                    kind: PromptKind::default(),
+                })
+                .unwrap();
+        }
+
+        assert!(
+            matches!(
+                lifecycle.hard_compact(None, "").unwrap(),
+                HardCompactOutcome::Compacted(_)
+            ),
+            "first in-memory hard compact should succeed"
+        );
+
+        // One new assistant message is below min_messages_between_hard_compacts (2).
+        lifecycle
+            .push_message(Message {
+                origin: None,
+                role: Role::User,
+                blocks: vec![ContentBlock::Text {
+                    text: "follow-up 1".to_string(),
+                }],
+                kind: PromptKind::default(),
+            })
+            .unwrap();
+        lifecycle
+            .push_message(Message {
+                origin: None,
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "reply 1".to_string(),
+                }],
+                kind: PromptKind::default(),
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                lifecycle.hard_compact(None, "").unwrap(),
+                HardCompactOutcome::Cooldown
+            ),
+            "second in-memory hard compact before cooldown must be rejected"
+        );
+
+        // A second new assistant message satisfies the cooldown (2 >= 2).
+        for turn in 2..=5 {
+            lifecycle
+                .push_message(Message {
+                    origin: None,
+                    role: Role::User,
+                    blocks: vec![ContentBlock::Text {
+                        text: format!("follow-up {turn} with enough text to compact"),
+                    }],
+                    kind: PromptKind::default(),
+                })
+                .unwrap();
+            lifecycle
+                .push_message(Message {
+                    origin: None,
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::Text {
+                        text: format!("reply {turn} with enough text to compact"),
+                    }],
+                    kind: PromptKind::default(),
+                })
+                .unwrap();
+        }
+        assert!(
+            matches!(
+                lifecycle.hard_compact(None, "").unwrap(),
+                HardCompactOutcome::Compacted(_)
+            ),
+            "hard compact after cooldown should succeed again"
+        );
+    }
+
+    #[test]
+    fn after_turn_segment_and_settle_compaction_share_policy() {
+        let compaction = CompactionConfig {
+            reserved_context_tokens: 200,
+            min_messages_between_hard_compacts: 2,
+            auto: lofi_types::AutoCompactConfig {
+                enable: true,
+                max_context_tokens: Some(500),
+                context_ratio: None,
+            },
+            ..CompactionConfig::default()
+        };
+        let mut lifecycle = AgentLifecycle::new(compaction, 1_000);
+        let mut messages = Vec::new();
+        for turn in 0..5 {
+            messages.push(Message {
+                origin: None,
+                role: Role::User,
+                blocks: vec![ContentBlock::Text {
+                    text: format!("user turn {turn} with enough text to compact"),
+                }],
+                kind: PromptKind::default(),
+            });
+            messages.push(Message {
+                origin: None,
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: format!("assistant reply {turn} with enough text to compact"),
+                }],
+                kind: PromptKind::default(),
+            });
+        }
+
+        // Mid-turn hard cap compacts and strips leading system prompt when asked.
+        let action = lifecycle.after_turn_segment(
+            &mut messages,
+            &TurnOutcome::ContextPressure { resume: true },
+            Some(1_000),
+            None,
+            "sys",
+            true,
+        );
+        assert!(
+            matches!(action, CompactionAction::Continue(_)),
+            "{action:?}"
+        );
+        assert!(
+            messages.first().is_some_and(|m| m.role != Role::System),
+            "strip_leading_system must omit leading System message"
+        );
+
+        // Immediate repeat hits cooldown and fails with the shared message.
+        let action = lifecycle.after_turn_segment(
+            &mut messages,
+            &TurnOutcome::ContextPressure { resume: true },
+            None,
+            None,
+            "sys",
+            true,
+        );
+        match action {
+            CompactionAction::Failed(error) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains(HardCompactOutcome::Cooldown.blocked_reason().unwrap()),
+                    "{error}"
+                );
+            }
+            other => panic!("expected Failed on cooldown, got {other:?}"),
+        }
+
+        // Settled ContextPressure { resume: false } during cooldown warns without failing.
+        let settled = lifecycle.settle_compaction(
+            &mut messages,
+            &TurnOutcome::ContextPressure { resume: false },
+            None,
+            None,
+            "sys",
+            true,
+        );
+        assert!(settled.compaction.is_none());
+        assert_eq!(
+            settled.warning.as_deref(),
+            HardCompactOutcome::Cooldown.blocked_reason()
         );
     }
 }

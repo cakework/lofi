@@ -553,14 +553,11 @@ pub(crate) async fn run_loop(guard: &mut TerminalGuard, launch: TuiLaunch) -> Re
                                                 );
                                             }
                                         }
-                                        HardCompactOutcome::Cooldown => app.notify(
-                                            NotifyKind::Warn,
-                                            "context exceeded the hard cap too soon after a compaction; cannot continue",
-                                        ),
-                                        HardCompactOutcome::NotEnoughHistory => app.notify(
-                                            NotifyKind::Warn,
-                                            "could not compact at the hard cap; cannot continue",
-                                        ),
+                                        other => {
+                                            if let Some(reason) = other.blocked_reason() {
+                                                app.notify(NotifyKind::Warn, reason);
+                                            }
+                                        }
                                     }
                                 }
                             } else {

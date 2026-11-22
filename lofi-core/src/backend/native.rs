@@ -123,6 +123,10 @@ impl Backend for Agent {
         self.model.context_window
     }
 
+    fn compaction(&self) -> lofi_types::CompactionConfig {
+        self.compaction.clone()
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
         let mut model = self.model.clone();
         model.thinking = ThinkingLevel::Off;

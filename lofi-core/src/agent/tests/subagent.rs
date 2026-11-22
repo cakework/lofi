@@ -3862,3 +3862,289 @@ async fn a_prompt_watch_reports_the_time_it_waited() {
     let closed = watch.waited();
     assert!(closed >= std::time::Duration::from_millis(20));
 }
+
+fn exec_round_with_usage(id: &str, code: &str, usage: Usage) -> Vec<StreamingEvent> {
+    vec![
+        StreamingEvent::ToolUseStart {
+            id: id.to_string(),
+            name: "exec".to_string(),
+        },
+        StreamingEvent::ToolUseInputDelta {
+            id: id.to_string(),
+            delta: json!({ "code": code, "description": "run code" }).to_string(),
+        },
+        StreamingEvent::ToolUseEnd { id: id.to_string() },
+        StreamingEvent::Done {
+            usage,
+            stop_reason: Some(lofi_types::StopReason::ToolUse),
+        },
+    ]
+}
+
+fn text_round_with_usage(text: &str, usage: Usage) -> Vec<StreamingEvent> {
+    vec![
+        StreamingEvent::TextDelta(text.to_string()),
+        StreamingEvent::Done {
+            usage,
+            stop_reason: Some(lofi_types::StopReason::EndTurn),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn subagent_hard_compacts_and_continues_mid_turn() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let filler = "x".repeat(400);
+    let provider = Arc::new(MockProvider::recording(vec![
+        exec_round_with_usage(
+            "c1",
+            &format!("return '{filler}-1';"),
+            Usage {
+                input_tokens: 200,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        ),
+        exec_round_with_usage(
+            "c2",
+            &format!("return '{filler}-2';"),
+            Usage {
+                input_tokens: 400,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        ),
+        exec_round_with_usage(
+            "c3",
+            &format!("return '{filler}-3';"),
+            Usage {
+                input_tokens: 850,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        ),
+        text_round_with_usage(
+            "continued after compact",
+            Usage {
+                input_tokens: 250,
+                output_tokens: 40,
+                ..Usage::default()
+            },
+        ),
+    ]));
+    let mut agent = agent_with(vec![], dir.path()).with_subagent_support(support(dir.path()));
+    agent.provider = provider.clone();
+    agent.model.context_window = Some(1_000);
+    agent.model.input_price = Some(1_000.0);
+    agent.model.output_price = Some(1_000.0);
+    agent.compaction = lofi_types::CompactionConfig {
+        reserved_context_tokens: 200,
+        min_messages_between_hard_compacts: 2,
+        ..lofi_types::CompactionConfig::default()
+    };
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "do multi-step work" })).await;
+    assert_eq!(out["status"], json!("completed"), "{out}");
+    assert_eq!(out["result"], json!("continued after compact"), "{out}");
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected 3 pre-compact rounds + 1 post-compact continuation"
+    );
+    let post_compact = &requests[3];
+    assert!(
+        post_compact
+            .iter()
+            .any(|m| m.role == Role::User
+                && first_text(m).contains("This summary captures work done")),
+        "continuation request must contain compacted summary: {post_compact:?}"
+    );
+    // Spend across both pre- and post-compaction turns must accumulate.
+    let input_tokens = out["usage"]["input_tokens"].as_u64().unwrap();
+    assert_eq!(input_tokens, 200 + 400 + 850 + 250, "{out}");
+    let cost = out["usage"]["cost"].as_f64().unwrap();
+    let expected_cost = (200.0 + 400.0 + 850.0 + 250.0 + 50.0 + 50.0 + 50.0 + 40.0) / 1_000.0;
+    assert!(
+        (cost - expected_cost).abs() < 1e-6,
+        "expected cost {expected_cost}, got {cost} ({out})"
+    );
+}
+
+#[tokio::test]
+async fn subagent_hard_compact_cooldown_fails_instead_of_looping() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let filler = "y".repeat(400);
+    let provider = Arc::new(MockProvider::recording(vec![
+        exec_round_with_usage(
+            "c1",
+            &format!("return '{filler}-1';"),
+            Usage {
+                input_tokens: 200,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        ),
+        exec_round_with_usage(
+            "c2",
+            &format!("return '{filler}-2';"),
+            Usage {
+                input_tokens: 400,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        ),
+        exec_round_with_usage(
+            "c3",
+            &format!("return '{filler}-3';"),
+            Usage {
+                input_tokens: 850,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        ),
+        // Immediately crosses hard cap again after compaction (only 1 new
+        // assistant message < min_messages_between_hard_compacts = 3).
+        exec_round_with_usage(
+            "c4",
+            &format!("return '{filler}-4';"),
+            Usage {
+                input_tokens: 850,
+                output_tokens: 50,
+                ..Usage::default()
+            },
+        ),
+    ]));
+    // Disable persistence to exercise in-memory cooldown as well.
+    let mut agent = agent_with(vec![], dir.path())
+        .with_subagent_support(support(dir.path()).with_persistence(false));
+    agent.provider = provider.clone();
+    agent.model.context_window = Some(1_000);
+    agent.compaction = lofi_types::CompactionConfig {
+        reserved_context_tokens: 200,
+        min_messages_between_hard_compacts: 3,
+        ..lofi_types::CompactionConfig::default()
+    };
+    let hook = agent.subagent_hook().unwrap();
+
+    let out = hook(SubagentOp::Run, json!({ "prompt": "keep blowing cap" })).await;
+    assert_eq!(out["status"], json!("failed"), "{out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("too soon after a compaction"),
+        "expected cooldown error, got: {out}"
+    );
+    assert_eq!(provider.requests().len(), 4);
+}
+
+#[tokio::test]
+async fn subagent_soft_auto_compacts_between_turns_for_resume() {
+    let _env = env_lock();
+    let _state = StateEnv::new();
+    let dir = tempdir().unwrap();
+    let filler = "z".repeat(400);
+    for persist in [true, false] {
+        let provider = Arc::new(MockProvider::recording(vec![
+            exec_round_with_usage(
+                "c1",
+                &format!("return '{filler}-1';"),
+                Usage {
+                    input_tokens: 150,
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            ),
+            exec_round_with_usage(
+                "c2",
+                &format!("return '{filler}-2';"),
+                Usage {
+                    input_tokens: 250,
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            ),
+            exec_round_with_usage(
+                "c3",
+                &format!("return '{filler}-3';"),
+                Usage {
+                    input_tokens: 350,
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            ),
+            // Settles cleanly above soft threshold (500) and below hard cap (800).
+            text_round_with_usage(
+                "first done",
+                Usage {
+                    input_tokens: 600,
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            ),
+            text_round_with_usage(
+                "resumed done",
+                Usage {
+                    input_tokens: 200,
+                    output_tokens: 20,
+                    ..Usage::default()
+                },
+            ),
+        ]));
+        let mut agent = agent_with(vec![], dir.path())
+            .with_subagent_support(support(dir.path()).with_persistence(persist));
+        agent.provider = provider.clone();
+        agent.model.context_window = Some(1_000);
+        agent.compaction = lofi_types::CompactionConfig {
+            reserved_context_tokens: 200,
+            auto: lofi_types::AutoCompactConfig {
+                enable: true,
+                max_context_tokens: Some(500),
+                context_ratio: None,
+            },
+            ..lofi_types::CompactionConfig::default()
+        };
+        let hook = agent.subagent_hook().unwrap();
+
+        let first = hook(SubagentOp::Run, json!({ "prompt": "turn one" })).await;
+        assert_eq!(
+            first["status"],
+            json!("completed"),
+            "persist={persist}: {first}"
+        );
+        assert_eq!(
+            first["result"],
+            json!("first done"),
+            "persist={persist}: {first}"
+        );
+        let id = first["id"].as_str().unwrap().to_string();
+
+        let resumed = hook(SubagentOp::Run, json!({ "id": id, "prompt": "turn two" })).await;
+        assert_eq!(
+            resumed["status"],
+            json!("completed"),
+            "persist={persist}: {resumed}"
+        );
+        assert_eq!(
+            resumed["result"],
+            json!("resumed done"),
+            "persist={persist}: {resumed}"
+        );
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        let resumed_req = &requests[4];
+        assert!(
+            resumed_req.iter().any(|m| m.role == Role::User
+                && first_text(m).contains("This summary captures work done")),
+            "persist={persist}: resumed subagent must see soft-compacted summary: {resumed_req:?}"
+        );
+    }
+}

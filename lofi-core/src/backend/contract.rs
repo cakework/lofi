@@ -143,6 +143,11 @@ pub trait Backend: AsBackend + Send + Sync {
         None
     }
 
+    /// Compaction policy for this backend's sessions and subagents.
+    fn compaction(&self) -> lofi_types::CompactionConfig {
+        lofi_types::CompactionConfig::default()
+    }
+
     /// Run one turn: record the input, drive the exchanges, settle.
     ///
     /// The body of every implementation is one call to

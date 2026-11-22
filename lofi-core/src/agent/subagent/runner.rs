@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use lofi_error::{Error, Result};
-use lofi_types::{ContentBlock, Message, Role};
+use lofi_types::{ContentBlock, Message, PromptKind, Role};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -12,8 +12,9 @@ use super::registry::{Rollup, SubagentRegistry};
 use super::settled::{carried_spend, outcome_json, record_settled, terminal_notice, RunOutcome};
 use super::watchdog::{run_started, run_under_watchdog, wrap_up, Deadlines, Expiry, RunProgress};
 use super::{Status, SubagentSupport, DEFAULT_OUTPUT_LIMIT, EVENT_TEXT_CAP};
-use crate::agent::{close_unanswered_tool_uses, lock, AgentEvent};
+use crate::agent::{close_unanswered_tool_uses, lock, AgentEvent, TurnRequest};
 use crate::backend::BackendRef;
+use crate::lifecycle::{AgentLifecycle, CompactionAction};
 use crate::session::recorder::TurnOutcome;
 use crate::session::store::SessionCursor;
 
@@ -477,6 +478,15 @@ pub(super) fn spawn_event_drain(
                     if token_budget.is_some_and(|budget| spent > budget) {
                         crate::agent::signal_cancel(&cancel);
                     }
+                } else if let AgentEvent::ContextReported {
+                    context: Some(context),
+                } = event
+                {
+                    if let Some(window) = context.size {
+                        lock(&totals).set_context_window(window);
+                    }
+                } else if let AgentEvent::TurnEnd { usage, .. } = event {
+                    lock(&totals).note_last_usage(*usage);
                 }
                 match event {
                     AgentEvent::Text(text) => {
@@ -609,7 +619,7 @@ async fn run_turn_with_timeout(
     cancel: Arc<AtomicBool>,
     registry: SubagentRegistry,
     id: String,
-    base_len: usize,
+    mut base_len: usize,
     limits: Deadlines,
     prompt: String,
     output_limit: usize,
@@ -626,36 +636,27 @@ async fn run_turn_with_timeout(
         backend.tool_executor().confirm_watch.clone(),
         backend.tool_executor().activity.clone(),
     ));
-    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
-    // The child events have no consumer: the parent transcript records the
-    // tool call, not the child stream. Collect the usage so the spend is
-    // still visible in the tool result; drain the rest.
-    let (stop_tx, drain) = spawn_event_drain(
-        rx,
-        totals.clone(),
-        cancel.clone(),
-        token_budget,
-        registry.clone(),
-        id.clone(),
-        progress.clone(),
-    );
+    let mut lifecycle =
+        AgentLifecycle::new(backend.compaction(), backend.context_window().unwrap_or(0));
+    lifecycle.set_workspace_root(backend.tool_executor().root.clone());
     // A watchdog, not one timeout: a child that keeps producing events is
     // working, and a child waiting on the user is not idle at all.
-    let (outcome, expired) = run_under_watchdog(
+    let (outcome, expired) = run_subagent_turn_loop(
         &backend,
+        &mut lifecycle,
         messages,
-        tx,
+        &mut base_len,
         cursor.as_ref(),
         &cancel,
-        prompt.clone(),
+        &registry,
+        &id,
         &progress,
         &limits,
+        prompt,
+        token_budget,
+        &totals,
     )
     .await;
-    // Sender clones may outlive the turn, so the channel may never close:
-    // stop the drain explicitly; it flushes the buffer before exiting.
-    let _ = stop_tx.send(());
-    let _ = drain.await;
     // A stopped run is wrapped up: one short turn asks what it reached, so
     // the parent reads a summary. A run stopped while the user owed it an
     // answer never reaches its model.
@@ -707,35 +708,32 @@ async fn run_turn_with_timeout(
     // A kill, an Esc or a dropped caller that landed while the summary ran
     // is a cancellation, not the deadline that had already passed.
     let stopped_by_caller = cancel.load(Ordering::SeqCst) && budget_over.is_none();
-    let (mut status, mut error) = match (&expired, budget_over) {
-        (None, _) => classify_outcome(outcome, budget_over, &id, kept),
-        // The summary's own spend can cross the budget: a stopped run keeps
-        // the failure contract of an ordinary turn.
-        (Some(_), Some((spent, budget))) => budget_failure(spent, budget, &id, kept),
-        (Some(_), None) if stopped_by_caller => (Status::Cancelled, Some("cancelled".to_string())),
-        (Some(_), None) if wrapped => (Status::Completed, None),
-        (Some((reason, _)), None) => deadline_status(*reason, blocked.as_deref(), &id, kept),
-    };
-    let (result, full_bytes) = if status == Status::Completed {
-        last_text(&messages[base_len..], output_limit)
-            .map_or((None, None), |(text, full)| (Some(text), full))
-    } else {
-        (None, None)
-    };
-    // A completed run without a final text is a failure: reporting
-    // an empty string as a successful result would hide it. A summary that
-    // came back empty is no summary, so a stopped run keeps the deadline
-    // status and its resume hint instead.
-    if status == Status::Completed && result.is_none() {
-        match &expired {
-            Some((reason, _)) => {
-                (status, error) = deadline_status(*reason, blocked.as_deref(), &id, kept);
-            }
-            None => {
-                (status, error) = (
-                    Status::Failed,
-                    Some("subagent completed without a text result".to_string()),
-                );
+    let settled_turn_outcome = outcome.as_ref().ok().cloned();
+    let (status, error, result, full_bytes) = resolve_subagent_outcome(
+        outcome,
+        expired.as_ref(),
+        blocked.as_deref(),
+        wrapped,
+        budget_over,
+        stopped_by_caller,
+        &id,
+        kept,
+        &messages[base_len..],
+        output_limit,
+    );
+    if status == Status::Completed && expired.is_none() {
+        if let Some(turn_outcome) = settled_turn_outcome.as_ref() {
+            let last_usage = lock(&totals).last_usage();
+            let settled = lifecycle.settle_compaction(
+                messages,
+                turn_outcome,
+                last_usage,
+                cursor.as_ref(),
+                backend.system_prompt(),
+                true,
+            );
+            if let Some(compaction) = settled.compaction {
+                note_subagent_compaction(&registry, &id, &compaction);
             }
         }
     }
@@ -753,6 +751,149 @@ async fn run_turn_with_timeout(
         usage,
         progress: Some(reported),
         stopped: expired.map(|(reason, _)| reason.as_str().to_string()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_subagent_outcome(
+    outcome: Result<TurnOutcome>,
+    expired: Option<&(Expiry, Option<String>)>,
+    blocked: Option<&str>,
+    wrapped: bool,
+    budget_over: Option<(u64, u64)>,
+    stopped_by_caller: bool,
+    id: &str,
+    kept: bool,
+    run_messages: &[Message],
+    output_limit: usize,
+) -> (Status, Option<String>, Option<String>, Option<usize>) {
+    let (mut status, mut error) = match (expired, budget_over) {
+        (None, _) => classify_outcome(outcome, budget_over, id, kept),
+        // The summary's own spend can cross the budget: a stopped run keeps
+        // the failure contract of an ordinary turn.
+        (Some(_), Some((spent, budget))) => budget_failure(spent, budget, id, kept),
+        (Some(_), None) if stopped_by_caller => (Status::Cancelled, Some("cancelled".to_string())),
+        (Some(_), None) if wrapped => (Status::Completed, None),
+        (Some((reason, _)), None) => deadline_status(*reason, blocked, id, kept),
+    };
+    let (result, full_bytes) = if status == Status::Completed {
+        last_text(run_messages, output_limit)
+            .map_or((None, None), |(text, full)| (Some(text), full))
+    } else {
+        (None, None)
+    };
+    // A completed run without a final text is a failure: reporting
+    // an empty string as a successful result would hide it. A summary that
+    // came back empty is no summary, so a stopped run keeps the deadline
+    // status and its resume hint instead.
+    if status == Status::Completed && result.is_none() {
+        match expired {
+            Some((reason, _)) => {
+                (status, error) = deadline_status(*reason, blocked, id, kept);
+            }
+            None => {
+                (status, error) = (
+                    Status::Failed,
+                    Some("subagent completed without a text result".to_string()),
+                );
+            }
+        }
+    }
+    (status, error, result, full_bytes)
+}
+
+/// Drive a subagent turn under the watchdog, compacting and continuing on
+/// mid-turn hard-cap pressure the same way the interactive TUI does.
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_turn_loop(
+    backend: &BackendRef,
+    lifecycle: &mut AgentLifecycle,
+    messages: &mut Vec<Message>,
+    base_len: &mut usize,
+    cursor: Option<&SessionCursor>,
+    cancel: &Arc<AtomicBool>,
+    registry: &SubagentRegistry,
+    id: &str,
+    progress: &Arc<RunProgress>,
+    limits: &Deadlines,
+    prompt: String,
+    token_budget: Option<u64>,
+    totals: &Arc<std::sync::Mutex<Rollup>>,
+) -> (Result<TurnOutcome>, Option<(Expiry, Option<String>)>) {
+    let mut request = TurnRequest::prompt(prompt, PromptKind::Task);
+    loop {
+        let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+        // The child events have no consumer: the parent transcript records the
+        // tool call, not the child stream. Collect the usage so the spend is
+        // still visible in the tool result; drain the rest.
+        let (stop_tx, drain) = spawn_event_drain(
+            rx,
+            totals.clone(),
+            cancel.clone(),
+            token_budget,
+            registry.clone(),
+            id.to_string(),
+            progress.clone(),
+        );
+        let (outcome, expired) = run_under_watchdog(
+            backend, messages, tx, cursor, cancel, request, progress, limits,
+        )
+        .await;
+        // Sender clones may outlive the turn, so the channel may never close:
+        // stop the drain explicitly; it flushes the buffer before exiting.
+        let _ = stop_tx.send(());
+        let _ = drain.await;
+
+        let observed_window = lock(totals).context_window();
+        if expired.is_some()
+            || cancel.load(Ordering::SeqCst)
+            || breach(totals, token_budget).is_some()
+        {
+            if let Some(window) = observed_window {
+                lifecycle.set_context_window(window);
+            }
+            return (outcome, expired);
+        }
+
+        let Ok(turn_outcome) = &outcome else {
+            return (outcome, expired);
+        };
+
+        match lifecycle.after_turn_segment(
+            messages,
+            turn_outcome,
+            observed_window,
+            cursor,
+            backend.system_prompt(),
+            true,
+        ) {
+            CompactionAction::Continue(compaction) => {
+                note_subagent_compaction(registry, id, &compaction);
+                // Compaction rewrites the history buffer; only messages
+                // appended by the continuation count as this run's final text.
+                *base_len = messages.len();
+                lock(totals).start_turn();
+                request = TurnRequest::continue_turn();
+            }
+            CompactionAction::Failed(error) => return (Err(error), None),
+            CompactionAction::Done => return (outcome, expired),
+        }
+    }
+}
+
+fn note_subagent_compaction(
+    registry: &SubagentRegistry,
+    id: &str,
+    compaction: &crate::compact::Compaction,
+) {
+    if let Some(entry) = lock(&registry.entries).get_mut(id) {
+        entry.events.push(
+            "compaction",
+            json!({
+                "summarized": compaction.summarized_count,
+                "kept": compaction.kept_count,
+            }),
+        );
     }
 }
 

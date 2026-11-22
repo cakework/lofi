@@ -450,6 +450,10 @@ impl Backend for ExternalBackend {
             .or_else(|| self.config.context_window())
     }
 
+    fn compaction(&self) -> lofi_types::CompactionConfig {
+        self.compaction.clone()
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
         self.driver
             .complete(&self.root, self.model.as_deref(), &request)
@@ -1299,6 +1303,8 @@ mod tests {
         prompts: Mutex<Vec<String>>,
         closed: std::sync::atomic::AtomicUsize,
         block_next: std::sync::atomic::AtomicBool,
+        hard_cap_first_turn: std::sync::atomic::AtomicBool,
+        context_window: Mutex<Option<u64>>,
         entered: tokio::sync::Notify,
     }
 
@@ -1322,7 +1328,7 @@ mod tests {
         }
 
         fn context_window(&self) -> Option<u64> {
-            Some(200_000)
+            self.state.context_window.lock().unwrap().or(Some(200_000))
         }
 
         fn stop_reason(&self) -> Option<lofi_types::StopReason> {
@@ -1358,7 +1364,7 @@ mod tests {
             &mut self,
             prompt: &str,
             _images: &[lofi_types::ContentBlock],
-            _executor: ToolExecutor,
+            executor: ToolExecutor,
             context: crate::agent::ToolCallContext,
             _controls: super::driver::PromptControls,
         ) -> Result<super::driver::PromptOutcome> {
@@ -1376,6 +1382,40 @@ mod tests {
                     crate::agent::turn_session::wait_cancel_flag(&cancel, notify.as_ref()).await;
                 }
                 return Err(Error::Cancelled);
+            }
+            if self
+                .state
+                .hard_cap_first_turn
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let filler = "k".repeat(400);
+                for i in 1..=3usize {
+                    let id = format!("cli_c{i}");
+                    let _ = executor
+                        .execute(
+                            &id,
+                            &json!({
+                                "code": format!("return '{filler}-{i}';"),
+                                "description": "run code",
+                            }),
+                            context.clone(),
+                        )
+                        .await?;
+                    if let Some(events) = &context.events {
+                        let input_tokens = if i == 3 { 850 } else { 200 * i as u64 };
+                        events
+                            .forward(crate::agent::AgentEvent::RoundUsage {
+                                cost: 0.01 * i as f64,
+                                usage: lofi_types::Usage {
+                                    input_tokens,
+                                    output_tokens: 50,
+                                    ..lofi_types::Usage::default()
+                                },
+                            })
+                            .await?;
+                    }
+                }
+                return Ok(super::driver::PromptOutcome::Stopped);
             }
             if let Some(events) = &context.events {
                 events
@@ -1559,6 +1599,79 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "abandoned turn should clear its saved binding"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn subagent_on_cli_backend_hard_compacts_and_continues() {
+        let _env = crate::state::STATE_ENV_LOCK.lock().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(FakeDriverState::default());
+            *state.context_window.lock().unwrap() = Some(1_000);
+            state
+                .hard_cap_first_turn
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let driver: Arc<dyn super::driver::CliDriver> = Arc::new(FakeDriver {
+                state: Arc::clone(&state),
+            });
+            let support = crate::agent::SubagentSupport::new(
+                crate::models::ModelRegistry::default(),
+                lofi_types::Config::default(),
+                dir.path().to_path_buf(),
+            )
+            .with_persistence(false);
+            let executor = ToolExecutor::in_memory(dir.path()).with_subagent_support(support);
+            let backend: BackendRef = Arc::new(
+                ExternalBackend::configure(
+                    "claude".into(),
+                    lofi_types::BackendConfig::ClaudeCode {
+                        command: "unused-in-memory".into(),
+                        model: Some("model-a".into()),
+                        models: vec!["model-a".into()],
+                        context_window: Some(1_000),
+                        frame_idle_timeout_ms: None,
+                        thinking_level: None,
+                        auto_continue: lofi_types::AutoContinueConfig::default(),
+                    },
+                    dir.path().to_path_buf(),
+                    executor,
+                    Some("model-a".into()),
+                    lofi_types::ThinkingLevel::Off,
+                    "You are lofi".into(),
+                    lofi_types::CompactionConfig {
+                        reserved_context_tokens: 200,
+                        min_messages_between_hard_compacts: 2,
+                        ..lofi_types::CompactionConfig::default()
+                    },
+                )
+                .with_driver(driver),
+            );
+            let hook = backend.subagent_hook().unwrap();
+            let out = hook(
+                lofi_code::SubagentOp::Run,
+                json!({ "prompt": "do heavy cli subagent work" }),
+            )
+            .await;
+            assert_eq!(out["status"], json!("completed"), "{out}");
+            assert_eq!(out["result"], json!("in-memory reply"), "{out}");
+
+            assert_eq!(
+                state.opens.lock().unwrap().len(),
+                2,
+                "CLI subagent must open a fresh child session after hard compaction"
+            );
+            let prompts = state.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 2);
+            assert!(
+                prompts[1].contains("<conversation_history>")
+                    && prompts[1].contains("This summary captures work done"),
+                "second CLI child must receive compacted summary transfer: {}",
+                prompts[1]
             );
         })
         .await

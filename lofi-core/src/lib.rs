@@ -25,7 +25,10 @@ pub use agent::{
     SubagentRegistry, SubagentRunning, TurnInput, TurnRequest,
 };
 pub use compact::Compaction;
-pub use lifecycle::{AgentLifecycle, HardCompactOutcome, LineageJobReconciliation};
+pub use lifecycle::{
+    AgentLifecycle, CompactionAction, HardCompactOutcome, LineageJobReconciliation,
+    SettledCompaction,
+};
 pub(crate) use lofi_code::compact_hook::CodeCompactionHook;
 pub use lofi_code::policy::{default_mode as default_approval_mode, PolicyOverride};
 pub use lofi_code::tools::{

@@ -144,7 +144,7 @@ pub struct Agent {
     retry: crate::retry::RetryPolicy,
     pub(crate) system_prompt: String,
     max_output_tokens: Option<u64>,
-    compaction: lofi_types::CompactionConfig,
+    pub(crate) compaction: lofi_types::CompactionConfig,
     auto_continue: lofi_types::AutoContinuePolicy,
     /// The config and registry this backend was opened from. Model selection
     /// rebuilds the transport from here, so no caller keeps a second copy.

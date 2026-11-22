@@ -443,7 +443,7 @@ output = "responses_pricing.output"
 
 ## Compaction
 
-The `[compaction]` section governs context-window compaction identically on HTTP providers and CLI backends, and `/compact` triggers the same pass manually. On Claude Code, compacting rewrites the Lofi transcript and opens a new Claude child on the next turn so old context stays unused:
+The `[compaction]` section governs context-window compaction identically across interactive sessions, `--print` runs, and subagents on both HTTP providers and CLI backends, and `/compact` triggers the same pass manually. On Claude Code, compacting rewrites the Lofi transcript and opens a new Claude child on the next turn so old context stays unused:
 
 ```toml
 [compaction]
